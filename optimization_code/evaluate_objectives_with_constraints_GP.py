@@ -1,0 +1,105 @@
+import numpy as np
+from evaluate_objectives_GP import evaluate_objectives_gp
+
+# --- 금지 구역 검사를 위한 내부 헬퍼 함수들 ---
+def _direction(p, q, r):
+    val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
+    if abs(val) < 1e-10: return 0
+    return 1 if val > 0 else 2
+
+def _on_segment(p, q, r):
+    return (q[0] <= max(p[0], r[0]) and q[0] >= min(p[0], r[0]) and
+            q[1] <= max(p[1], r[1]) and q[1] >= min(p[1], r[1]))
+
+def _segments_intersect(p1, p2, q1, q2):
+    d1, d2, d3, d4 = _direction(q1, q2, p1), _direction(q1, q2, p2), _direction(p1, p2, q1), _direction(p1, p2, q2)
+    if d1 != d2 and d3 != d4: return True
+    if d1 == 0 and _on_segment(q1, p1, q2): return True
+    if d2 == 0 and _on_segment(q1, p2, q2): return True
+    if d3 == 0 and _on_segment(p1, q1, p2): return True
+    if d4 == 0 and _on_segment(p1, q2, p2): return True
+    return False
+
+def _is_inside_rect(p, rect):
+    xmin, xmax, ymin, ymax = rect
+    return (xmin <= p[0] <= xmax) and (ymin <= p[1] <= ymax)
+
+def _violates_forbidden_zone(p1, p2, rect):
+    if _is_inside_rect(p1, rect) or _is_inside_rect(p2, rect): return True
+    xmin, xmax, ymin, ymax = rect
+    edges = [(np.array([xmin, ymin]), np.array([xmax, ymin])), (np.array([xmax, ymin]), np.array([xmax, ymax])),
+             (np.array([xmax, ymax]), np.array([xmin, ymax])), (np.array([xmin, ymax]), np.array([xmin, ymin]))]
+    for q1, q2 in edges:
+        if _segments_intersect(p1[:2], p2[:2], q1, q2): return True
+    return False
+
+
+# --- 메인 함수 (최종 수정본) ---
+def evaluate_objectives_with_constraints_gp(path, 
+                                             # 위험도 데이터
+                                             Norm_RT, 
+                                             AirRisk, 
+                                             # 제약 및 평가 파라미터
+                                             use_heading_map, 
+                                             flight_dist_limit, 
+                                             forbidden_zones, 
+                                             delta_z_max, 
+                                             altitude_levels, 
+                                             cell_size, 
+                                             refine_scales, 
+                                             w_ground, 
+                                             w_air, 
+                                             lat_lim, 
+                                             lon_lim):
+    """
+    경로의 제약 조건(거리, 고도 변화, 금지구역)을 평가하고, 만족 시 목적 함수를 계산합니다.
+    (main 스크립트의 호출에 맞게 인자 개수를 수정한 최종 버전)
+
+    Args:
+        path (np.ndarray): N x 3 형태의 경로 [lat, lon, alt].
+        Norm_RT (np.ndarray): 정규화된 지상/인구 위험도 텐서.
+        AirRisk (np.ndarray): 정규화된 공중 위험도 텐서.
+        use_heading_map (bool): 헤딩맵 사용 여부.
+        flight_dist_limit (float): 노드 간 최대 2D 비행 거리 (원본 MATLAB 로직에 따라 위경도 차이값 기준).
+        forbidden_zones (np.ndarray): 금지 구역 목록.
+        delta_z_max (float): 인접 노드 간 최대 허용 고도 변화량.
+        altitude_levels, cell_size, refine_scales: evaluate_objectives_gp에 필요한 파라미터.
+        w_ground, w_air: 지상/공중 위험도 가중치.
+        lat_lim, lon_lim: 좌표계 변환을 위한 위경도 범위.
+
+    Returns:
+        tuple: (f_val, feasible)
+            f_val (np.ndarray): [거리, 통합 위험도] 값. 제약 위반 시 페널티.
+            feasible (bool): 제약 조건 만족 여부.
+    """
+    penalty_cost = 1e6
+    
+    if path.shape[0] < 2:
+        return np.array([penalty_cost, penalty_cost]), False
+
+    diffs = np.diff(path, axis=0)
+
+    # 1) 노드 간 2D 거리 체크 (원본 MATLAB 로직과 동일하게 위경도 차이값으로 비교)
+    dists_2d_deg = np.linalg.norm(diffs[:, :2], axis=1)
+    if np.any(dists_2d_deg > flight_dist_limit):
+        return np.array([penalty_cost, penalty_cost]), False
+
+    # 2) 노드 간 고도 변화 체크
+    if np.any(np.abs(diffs[:, 2]) > delta_z_max):
+        return np.array([penalty_cost, penalty_cost]), False
+
+    # 3) 금지 구역 체크 (현재는 비활성화, 필요 시 로직 추가)
+    if forbidden_zones is not None and forbidden_zones.shape[0] > 0:
+        for i in range(path.shape[0] - 1):
+            p1 = path[i, :]
+            p2 = path[i+1, :]
+            for rect in forbidden_zones:
+                if _violates_forbidden_zone(p1, p2, rect):
+                    return np.array([penalty_cost, penalty_cost]), False
+
+    # 4) 모든 제약 만족 시, 실제 목적 함수 계산
+    f_val = evaluate_objectives_gp(path, Norm_RT, AirRisk, use_heading_map,
+                                   altitude_levels, cell_size, refine_scales,
+                                   w_ground, w_air, lat_lim, lon_lim)
+    
+    return f_val, True
