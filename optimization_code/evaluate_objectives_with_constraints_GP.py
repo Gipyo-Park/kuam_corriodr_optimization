@@ -11,26 +11,31 @@ def _on_segment(p, q, r):
     return (q[0] <= max(p[0], r[0]) and q[0] >= min(p[0], r[0]) and
             q[1] <= max(p[1], r[1]) and q[1] >= min(p[1], r[1]))
 
-def _segments_intersect(p1, p2, q1, q2):
-    d1, d2, d3, d4 = _direction(q1, q2, p1), _direction(q1, q2, p2), _direction(p1, p2, q1), _direction(p1, p2, q2)
-    if d1 != d2 and d3 != d4: return True
-    if d1 == 0 and _on_segment(q1, p1, q2): return True
-    if d2 == 0 and _on_segment(q1, p2, q2): return True
-    if d3 == 0 and _on_segment(p1, q1, p2): return True
-    if d4 == 0 and _on_segment(p1, q2, p2): return True
+def _segments_intersect(p1, q1, p2, q2):
+    o1 = _direction(p1, q1, p2); o2 = _direction(p1, q1, q2)
+    o3 = _direction(p2, q2, p1); o4 = _direction(p2, q2, q1)
+    if o1 != o2 and o3 != o4: return True
+    if o1 == 0 and _on_segment(p1, p2, q1): return True
+    if o2 == 0 and _on_segment(p1, q2, q1): return True
+    if o3 == 0 and _on_segment(p2, p1, q2): return True
+    if o4 == 0 and _on_segment(p2, q1, q2): return True
     return False
 
-def _is_inside_rect(p, rect):
-    xmin, xmax, ymin, ymax = rect
-    return (xmin <= p[0] <= xmax) and (ymin <= p[1] <= ymax)
+def _is_inside_rect_latlon(point, rect):
+    lon, lat = point[1], point[0]
+    min_lon, max_lon, min_lat, max_lat = rect
+    return (min_lon <= lon <= max_lon) and (min_lat <= lat <= max_lat)
 
-def _violates_forbidden_zone(p1, p2, rect):
-    if _is_inside_rect(p1, rect) or _is_inside_rect(p2, rect): return True
-    xmin, xmax, ymin, ymax = rect
-    edges = [(np.array([xmin, ymin]), np.array([xmax, ymin])), (np.array([xmax, ymin]), np.array([xmax, ymax])),
-             (np.array([xmax, ymax]), np.array([xmin, ymax])), (np.array([xmin, ymax]), np.array([xmin, ymin]))]
-    for q1, q2 in edges:
-        if _segments_intersect(p1[:2], p2[:2], q1, q2): return True
+def _violates_forbidden_zone_latlon(p1, p2, rect):
+    if _is_inside_rect_latlon(p1, rect) or _is_inside_rect_latlon(p2, rect):
+        return True
+    min_lon, max_lon, min_lat, max_lat = rect
+    seg_p1, seg_p2 = (p1[1], p1[0]), (p2[1], p2[0])
+    edges = [((min_lon, min_lat), (max_lon, min_lat)), ((max_lon, min_lat), (max_lon, max_lat)),
+             ((max_lon, max_lat), (min_lon, max_lat)), ((min_lon, max_lat), (min_lon, min_lat))]
+    for edge_p1, edge_p2 in edges:
+        if _segments_intersect(seg_p1, seg_p2, edge_p1, edge_p2):
+            return True
     return False
 
 
@@ -47,6 +52,7 @@ def evaluate_objectives_with_constraints_gp(path,
                                              altitude_levels, 
                                              cell_size, 
                                              refine_scales, 
+                                             air_risk_threshold, 
                                              w_ground, 
                                              w_air, 
                                              lat_lim, 
@@ -91,15 +97,15 @@ def evaluate_objectives_with_constraints_gp(path,
     # 3) 금지 구역 체크 (현재는 비활성화, 필요 시 로직 추가)
     if forbidden_zones is not None and forbidden_zones.shape[0] > 0:
         for i in range(path.shape[0] - 1):
-            p1 = path[i, :]
-            p2 = path[i+1, :]
+            p1 = path[i, :]   # [lat, lon, alt]
+            p2 = path[i+1, :] # [lat, lon, alt]
             for rect in forbidden_zones:
-                if _violates_forbidden_zone(p1, p2, rect):
+                if _violates_forbidden_zone_latlon(p1, p2, rect):
                     return np.array([penalty_cost, penalty_cost]), False
 
     # 4) 모든 제약 만족 시, 실제 목적 함수 계산
     f_val = evaluate_objectives_gp(path, Norm_RT, AirRisk, use_heading_map,
                                    altitude_levels, cell_size, refine_scales,
-                                   w_ground, w_air, lat_lim, lon_lim)
+                                   air_risk_threshold, w_ground, w_air, lat_lim, lon_lim)
     
     return f_val, True

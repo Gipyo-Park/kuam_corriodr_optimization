@@ -25,7 +25,7 @@ from evaluate_objectives_with_constraints_GP import evaluate_objectives_with_con
 # Local functions for MAIN script
 # =============================================================================
 
-def generate_nodes_3d_segment(p1, p2, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx):
+def generate_nodes_3d_segment(p1, p2, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones):
     """
     두 점 사이에 W_buf 폭을 갖는 복도를 설정하고, 그 안에 일정한 간격의 격자 노드를 생성합니다.
     """
@@ -86,6 +86,29 @@ def generate_nodes_3d_segment(p1, p2, W_buf, node_grid_resolution_m, lat_lim, lo
     all_nodes_alt = np.full_like(all_nodes_lat, p1[2])
     
     all_grid_nodes = np.vstack([all_nodes_lat, all_nodes_lon, all_nodes_alt]).T
+
+    # [수정] 금지 구역(NFZ)에 포함된 노드 필터링
+    if forbidden_zones is not None and forbidden_zones.shape[0] > 0 and all_grid_nodes.shape[0] > 0:
+        lats = all_grid_nodes[:, 0]
+        lons = all_grid_nodes[:, 1]
+        
+        # 모든 노드에 대해 초기에 유효하다고 가정
+        is_valid_node = np.ones(all_grid_nodes.shape[0], dtype=bool)
+        
+        for rect in forbidden_zones:
+            min_lon, max_lon, min_lat, max_lat = rect
+            
+            # 현재 금지 구역 내에 있는 노드를 찾음
+            in_rect = (lons >= min_lon) & (lons <= max_lon) & \
+                      (lats >= min_lat) & (lats <= max_lat)
+            
+            # 금지 구역 내 노드를 유효하지 않음으로 표시
+            is_valid_node[in_rect] = False
+            
+        # 유효한 노드만 선택
+        nodes = all_grid_nodes[is_valid_node]
+    else:
+        nodes = all_grid_nodes
     
     nodes = all_grid_nodes
     
@@ -155,9 +178,38 @@ def variation_nsga3(pop, nodes, ratio):
         offspring.append(mutation_gp(child, nodes))
     return offspring
 
-def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones, Nmax, N_pop, ratio, H, gx, alt, cs, scales, dz, w_g, w_a, lat_lim, lon_lim):
+def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones, Nmax, N_pop, ratio, H, gx, alt, cs, scales, air_risk_threshold, dz, w_g, w_a, lat_lim, lon_lim, MAX_INIT_ATTEMPTS):
+    # [수정] 재시도 로직 추가
+    population = []
+    
+    for attempt in range(MAX_INIT_ATTEMPTS):
+        # 1. 초기 경로 집단 생성
+        temp_population = generate_initial_population_gp(N_pop, nodes, p1, p2)
+        if not temp_population: continue
+
+        # 2. 생성된 초기 집단이 실행 가능한 해를 포함하는지 즉시 검사
+        is_any_feasible = False
+        for path in temp_population:
+            _, feasible = evaluate_objectives_with_constraints_gp(path, Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, air_risk_threshold, w_g, w_a, lat_lim, lon_lim)
+            if feasible:
+                is_any_feasible = True
+                break
+        
+        # 3. 실행 가능한 해를 찾았으면, 이 집단으로 최적화 시작
+        if is_any_feasible:
+            print(f"Found a feasible initial population on attempt {attempt + 1}.")
+            population = temp_population
+            break
+        else:
+            print(f"Attempt {attempt + 1}: Initial population has no feasible solutions. Retrying...")
+    
+    # 모든 시도 후에도 실행 가능한 집단을 못 찾았으면 최적화 중단
+    if not population:
+        print("Failed to generate a feasible initial population after all attempts.")
+        return [], np.array([])
+
     # nodes 인자에는 이제 필터링된 'safe_nodes'가 전달됨
-    population = generate_initial_population_gp(N_pop, nodes, p1, p2)
+    # population = generate_initial_population_gp(N_pop, nodes, p1, p2) # <- 기존 코드는 삭제
     ref_points = generate_reference_points_2obj(H)
     h_paths = []
     for gen in range(1, Nmax + 1):
@@ -165,7 +217,7 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
         Np = len(population)
         f_vals, feasible = np.zeros((Np, 2)), np.zeros((Np), dtype=bool)
         for i in range(Np):
-            f_vals[i, :], feasible[i] = evaluate_objectives_with_constraints_gp(population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, w_g, w_a, lat_lim, lon_lim)
+            f_vals[i, :], feasible[i] = evaluate_objectives_with_constraints_gp(population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, air_risk_threshold, w_g, w_a, lat_lim, lon_lim)
         if gx:
             for line in h_paths: line.remove()
             h_paths.clear()
@@ -188,7 +240,7 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
 
     f_vals_final = np.zeros((len(population), 2))
     for i in range(len(population)):
-        f_vals_final[i,:], _ = evaluate_objectives_with_constraints_gp(population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, w_g, w_a, lat_lim, lon_lim)
+        f_vals_final[i,:], _ = evaluate_objectives_with_constraints_gp(population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, air_risk_threshold, w_g, w_a, lat_lim, lon_lim)
     if gx:
         for line in h_paths: line.remove()
     return population, f_vals_final
@@ -216,19 +268,23 @@ def main():
     w_ground, w_air = 0.5, 1.0
     # altitude_levels, use_heading_map = np.array([400,500,600,700]), True
     altitude_levels, use_heading_map = np.array([500]), True
-    W_buf = 1000.0
+    W_buf = 5000.0
     node_grid_resolution_m = 100.0
+    air_risk_threshold = 0.5
     
-    # # <<< [수정 시작] 적응형 안전 노드 탐색을 위한 파라미터 >>>
-    # # 기존 SAFE_NODE_PERCENTILE 변수를 아래 두 변수로 대체
+    # 적응형 안전 노드 탐색을 위한 파라미터 
+    # 기존 SAFE_NODE_PERCENTILE 변수를 아래 두 변수로 대체
+    MIN_SAFE_NODES_TARGET = 500  # 최소 목표 안전 노드 개수
+    SAFE_NODE_PERCENTILE_LIST = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]  # 탐색할 백분위수 목록
+    MAX_INIT_ATTEMPTS = 100  # 초기 집단 생성 최대 시도 횟수
 
-    MIN_SAFE_NODES_TARGET = 50  # 최소 목표 안전 노드 개수
-    SAFE_NODE_PERCENTILE_LIST = [20.0, 30.0, 40.0, 50.0]  # 탐색할 백분위수 목록
-    # # <<< [수정 종료] >>>
     
     cell_size, refine_scales, delta_z_max = 100.0, np.array([1.0, 0.5, 0.2, 0.1]), 100.0
     final_pick = {'risk': 5, 'dist': 5, 'pareto': 5}
-    Nmax, N_pop, offspring_ratio, H_ref_points = 50, 50, 2.0, 20
+    Nmax = 100     # 유전 알고리즘이 최적의 해를 찾기 위해 반복하는 최대 세대 수
+    N_pop = 100     # 초기 집단의 개체 수
+    offspring_ratio = 2.0  # 자식 개체 수 / 부모 개체 수 비율
+    H_ref_points = 50  # 참조 포인트 수
     flight_dist_limit = 100.0
 
     # --- 1. Load and Preprocess Risk Maps ---
@@ -282,14 +338,15 @@ def main():
     print('Air risk map loaded and aligned.')
 
     # --- 2. Define Vertiport and Corridor Points ---
-    # vertiport = np.array([35.6033361, 129.0776917, 500])
-    vertiport = np.array([35.5845361, 129.1076472, 500])
-    # corridor_lat = np.array([35.5845917, 35.6026528, 35.6326806, 35.6249583, 35.6034750, 35.5845361, 35.5692361, 35.5546444, 35.5586722, 35.5784750, 35.5843722, 35.6163861, 35.6212528, 35.6109972])
-    # corridor_lon = np.array([129.0936472, 129.1130667, 129.1238583, 129.1335528, 129.1268194, 129.1076472, 129.1085306, 129.0936972, 129.0816611, 129.0916889, 129.0770000, 129.0613944, 129.0725444, 129.0711889])
-    corridor_lat = np.array([35.6249583])
-    corridor_lon = np.array([129.1335528])
+    vertiport = np.array([35.6033361, 129.0776917, 500])
+    # vertiport = np.array([35.5845361, 129.1076472, 500])
+    corridor_lat = np.array([35.5845917, 35.6026528, 35.6326806, 35.6249583, 35.6034750, 35.5845361, 35.5692361, 35.5546444, 35.5586722, 35.5784750, 35.5843722, 35.6163861, 35.6212528, 35.6109972])
+    corridor_lon = np.array([129.0936472, 129.1130667, 129.1238583, 129.1335528, 129.1268194, 129.1076472, 129.1085306, 129.0936972, 129.0816611, 129.0916889, 129.0770000, 129.0613944, 129.0725444, 129.0711889])
+    # corridor_lat = np.array([35.6249583])
+    # corridor_lon = np.array([129.1335528])
     points = np.vstack([vertiport, np.column_stack([corridor_lat, corridor_lon, 500*np.ones_like(corridor_lat)]), vertiport])
-    forbidden_zones = np.array([])
+    # forbidden_zones = np.array([[129.08, 129.10, 35.59, 35.61], [129.11, 129.12, 35.62, 35.63], [129.12, 129.13, 35.59, 35.615]])
+    forbidden_zones = np.array([[129.08, 129.10, 35.59, 35.61], [129.11, 129.12, 35.59, 35.63], [129.12, 129.13, 35.62, 35.63]])
     emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889]); emergency_lon = np.array([129.1191806, 129.106728, 129.0751972])
     
     # <<< [수정] 지도 범위를 동적으로 계산하는 대신, 최대 범위를 기준으로 고정합니다.
@@ -314,6 +371,18 @@ def main():
         gx1.scatter(points[1:-1, 1], points[1:-1, 0], s=50, c='c', marker='o', transform=ccrs.Geodetic(), label='Corridor Points', zorder=5, edgecolors='k')
         gx1.plot(vertiport[1], vertiport[0], 'mp', markersize=15, transform=ccrs.Geodetic(), label='VertiPort', zorder=5)
         gx1.scatter(emergency_lon, emergency_lat, s=80, c='b', marker='^', transform=ccrs.Geodetic(), label='Emergency Landing', zorder=5)
+        
+        # [수정] 금지 구역(NFZ) 시각화
+        if forbidden_zones is not None and forbidden_zones.shape[0] > 0:
+            for i, rect in enumerate(forbidden_zones):
+                min_lon, max_lon, min_lat, max_lat = rect
+                lons = [min_lon, max_lon, max_lon, min_lon, min_lon]
+                lats = [min_lat, min_lat, max_lat, max_lat, min_lat]
+                label = 'Forbidden Zone' if i == 0 else ""
+                gx1.plot(lons, lats, color='red', linestyle='-', transform=ccrs.Geodetic(), zorder=6)
+                gx1.fill(lons, lats, color='red', alpha=0.3, transform=ccrs.Geodetic(), label=label, zorder=6)
+
+
         gx1.legend(loc='best'); plt.pause(0.1)
 
     # --- 4. Per-Segment NSGA-III Optimization ---
@@ -327,8 +396,16 @@ def main():
         print(f'\nProcessing Segment {k+1}/{num_segments}...')
         
         # 1. 전체 후보 노드 생성
-        nodes, _ = generate_nodes_3d_segment(p1, p2, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx)
+        nodes, all_grid_nodes = generate_nodes_3d_segment(p1, p2, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones)
         
+        # MIN_SAFE_NODES_TARGET 동적 조정
+        # all_grid_nodes 개수의 절반과 사용자 설정값 중 더 큰 값을 이번 세그먼트의 목표로 설정
+        half_all_nodes = all_grid_nodes.shape[0] // 2
+        base_target = int(max(MIN_SAFE_NODES_TARGET, half_all_nodes))
+        current_min_safe_nodes_target = min(base_target, nodes.shape[0])
+        print(f"Dynamic MIN_SAFE_NODES_TARGET for this segment: {current_min_safe_nodes_target} (user_set: {int(MIN_SAFE_NODES_TARGET)}, half_all_nodes: {half_all_nodes}, available: {nodes.shape[0]})")
+
+
         # 2. 시각화: 전체 노드를 위험도에 따라 Heatmap처럼 표시
         if gx1:
             if h_nodes: h_nodes.remove()
@@ -387,21 +464,20 @@ def main():
         safe_nodes = np.array([])
         print("Starting adaptive search for safe nodes...")
         if nodes.shape[0] > 0:
+            # 루프를 돌면서 safe_nodes를 계속 갱신하고, 목표 달성 시 중단
             for percentile in SAFE_NODE_PERCENTILE_LIST:
                 risk_threshold = np.percentile(node_risks, percentile)
                 current_safe_nodes_mask = node_risks <= risk_threshold
-                current_safe_nodes = nodes[current_safe_nodes_mask]
+                safe_nodes = nodes[current_safe_nodes_mask] # 매번 safe_nodes를 갱신
                 
-                print(f'  - At {percentile}% percentile, found {current_safe_nodes.shape[0]} nodes.')
+                print(f'  - At {percentile}% percentile, found {safe_nodes.shape[0]} nodes.')
                 
-                if current_safe_nodes.shape[0] >= MIN_SAFE_NODES_TARGET:
-                    safe_nodes = current_safe_nodes
-                    print(f'-> Target of {MIN_SAFE_NODES_TARGET} nodes met. Selecting {safe_nodes.shape[0]} nodes.')
+                if safe_nodes.shape[0] >= current_min_safe_nodes_target:
+                    print(f'-> Target of {current_min_safe_nodes_target} nodes met. Selecting {safe_nodes.shape[0]} nodes.')
                     break
             
-            # 루프가 끝날 때까지 목표를 달성하지 못한 경우, 가장 마지막에 찾은 노드들을 사용
-            if safe_nodes.shape[0] == 0 and 'current_safe_nodes' in locals():
-                safe_nodes = current_safe_nodes
+            # 루프가 break 없이 끝났을 경우 (목표 미달)
+            else:
                 print(f'-> Target not met. Using nodes from the last percentile ({percentile}%): {safe_nodes.shape[0]} nodes.')
 
         # 필터링 후에도 노드가 전혀 없는 경우에 대한 최종 안전장치
@@ -412,7 +488,7 @@ def main():
 
         # 4. 최적화: '안전 노드'만을 대상으로 NSGA-III 실행
         print(f'Starting optimization with {safe_nodes.shape[0]} nodes...')
-        population, f_vals = run_nsga3_segment(safe_nodes, p1, p2, Norm_RiskTensor, AirRisk, use_heading_map, flight_dist_limit, forbidden_zones, Nmax, N_pop, offspring_ratio, H_ref_points, gx1, altitude_levels, cell_size, refine_scales, delta_z_max, w_ground, w_air, lat_lim, lon_lim)
+        population, f_vals = run_nsga3_segment(safe_nodes, p1, p2, Norm_RiskTensor, AirRisk, use_heading_map, flight_dist_limit, forbidden_zones, Nmax, N_pop, offspring_ratio, H_ref_points, gx1, altitude_levels, cell_size, refine_scales, air_risk_threshold, delta_z_max, w_ground, w_air, lat_lim, lon_lim, MAX_INIT_ATTEMPTS)
         
         solutions = select_final_solutions(population, f_vals, final_pick, H_ref_points)
         full_paths[k] = solutions
@@ -451,6 +527,17 @@ def main():
         gx2.scatter(points[1:-1, 1], points[1:-1, 0], s=50, c='c', marker='o', transform=ccrs.Geodetic(), zorder=5, edgecolors='k')
         gx2.plot(vertiport[1], vertiport[0], 'mp', markersize=15, transform=ccrs.Geodetic(), zorder=5)
         gx2.scatter(emergency_lon, emergency_lat, s=80, c='b', marker='^', transform=ccrs.Geodetic(), zorder=5)
+        
+        # 금지 구역(NFZ) 시각화
+        if forbidden_zones is not None and forbidden_zones.shape[0] > 0:
+            for i, rect in enumerate(forbidden_zones):
+                min_lon, max_lon, min_lat, max_lat = rect
+                lons = [min_lon, max_lon, max_lon, min_lon, min_lon]
+                lats = [min_lat, min_lat, max_lat, max_lat, min_lat]
+                label = 'Forbidden Zone' if i == 0 else ""
+                gx2.plot(lons, lats, color='red', linestyle='-', transform=ccrs.Geodetic(), zorder=6)
+                gx2.fill(lons, lats, color='red', alpha=0.3, transform=ccrs.Geodetic(), label=label, zorder=6)
+
         final_routes = [np.vstack([p[i] for p in representative_paths if p[i] is not None and len(p[i])>0]) for i in range(3)]
         if final_routes and final_routes[0].shape[0] > 0: gx2.plot(final_routes[0][:, 1], final_routes[0][:, 0], 'r-', linewidth=2.5, transform=ccrs.Geodetic(), label='Overall Minimum Risk Route')
         if final_routes and final_routes[1].shape[0] > 0: gx2.plot(final_routes[1][:, 1], final_routes[1][:, 0], 'b-', linewidth=2.5, transform=ccrs.Geodetic(), label='Overall Shortest Distance Route')

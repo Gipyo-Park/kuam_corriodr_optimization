@@ -12,6 +12,7 @@ def evaluate_objectives_gp(path,
                            altitude_levels, 
                            cell_size, 
                            refine_scales, 
+                           air_risk_threshold, # [수정] 비용 함수 임계값 인자 추가
                            w_ground, 
                            w_air, 
                            lat_lim, 
@@ -87,17 +88,25 @@ def evaluate_objectives_gp(path,
         coords = np.vstack((Jq, Iq))
 
         # 통합 위험도 계산
+        # 1. 지상/인구 위험도 보간
         ground_risk_map = Norm_RT[alt_idx, head_idx, :, :]
         interp_ground_risks = map_coordinates(ground_risk_map, coords, order=1, cval=0.0)
         
+        # 2. 공중 위험도 보간
         air_risk_map = AirRisk[:, :, alt_idx]
         interp_air_risks = map_coordinates(air_risk_map, coords, order=1, cval=0.0)
+
+        # 3. 임계값을 기준으로 추가 공중 위험도 계산
+        additive_air_risk = np.where(interp_air_risks > air_risk_threshold, interp_air_risks, 0)
+        
         
         # [코드 수정] 위험도 계산 방식을 가중합에서 곱셈(Expected Risk)으로 변경
         # 기존: combined_interp_risks = (w_ground * interp_ground_risks) + (w_air * interp_air_risks)
         # 변경 후: 공중 위험도(확률) * 지상 위험도(피해)
         # combined_interp_risks = (w_ground * interp_ground_risks) + (w_air * interp_air_risks)
-        combined_interp_risks = interp_ground_risks * interp_air_risks
+        # combined_interp_risks = interp_ground_risks * interp_air_risks
+        combined_interp_risks = (interp_ground_risks * interp_air_risks) + additive_air_risk
+
         
         cumulative_risk += np.sum(combined_interp_risks)
 
