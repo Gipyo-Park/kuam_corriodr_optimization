@@ -178,13 +178,13 @@ def variation_nsga3(pop, nodes, ratio):
         offspring.append(mutation_gp(child, nodes))
     return offspring
 
-def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones, Nmax, N_pop, ratio, H, gx, alt, cs, scales, air_risk_threshold, dz, w_g, w_a, lat_lim, lon_lim, MAX_INIT_ATTEMPTS):
+def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones, Nmax, N_pop, ratio, H, gx, alt, cs, scales, air_risk_threshold, dz, w_g, w_a, lat_lim, lon_lim, MAX_INIT_ATTEMPTS, min_inter_nodes, max_inter_nodes):
     # [수정] 재시도 로직 추가
     population = []
     
     for attempt in range(MAX_INIT_ATTEMPTS):
         # 1. 초기 경로 집단 생성
-        temp_population = generate_initial_population_gp(N_pop, nodes, p1, p2)
+        temp_population = generate_initial_population_gp(N_pop, nodes, p1, p2, min_inter_nodes, max_inter_nodes)
         if not temp_population: continue
 
         # 2. 생성된 초기 집단이 실행 가능한 해를 포함하는지 즉시 검사
@@ -272,6 +272,10 @@ def main():
     node_grid_resolution_m = 100.0
     air_risk_threshold = 0.5
     
+    # [추가] 초기 경로 생성을 위한 중간 노드 개수 파라미터
+    MIN_INTER_NODES = 3  # 경로의 최소 중간 노드 개수
+    MAX_INTER_NODES = 8  # 경로의 최대 중간 노드 개수
+
     # 적응형 안전 노드 탐색을 위한 파라미터 
     # 기존 SAFE_NODE_PERCENTILE 변수를 아래 두 변수로 대체
     MIN_SAFE_NODES_TARGET = 500  # 최소 목표 안전 노드 개수
@@ -280,11 +284,11 @@ def main():
 
     
     cell_size, refine_scales, delta_z_max = 100.0, np.array([1.0, 0.5, 0.2, 0.1]), 100.0
-    final_pick = {'risk': 5, 'dist': 5, 'pareto': 5}
-    Nmax = 100     # 유전 알고리즘이 최적의 해를 찾기 위해 반복하는 최대 세대 수
-    N_pop = 100     # 초기 집단의 개체 수
+    final_pick = {'risk': 50, 'dist': 50, 'pareto': 50}
+    Nmax = 500     # 유전 알고리즘이 최적의 해를 찾기 위해 반복하는 최대 세대 수
+    N_pop = 50     # 초기 집단의 개체 수
     offspring_ratio = 2.0  # 자식 개체 수 / 부모 개체 수 비율
-    H_ref_points = 50  # 참조 포인트 수
+    H_ref_points = 100  # 참조 포인트 수
     flight_dist_limit = 100.0
 
     # --- 1. Load and Preprocess Risk Maps ---
@@ -338,15 +342,15 @@ def main():
     print('Air risk map loaded and aligned.')
 
     # --- 2. Define Vertiport and Corridor Points ---
-    vertiport = np.array([35.6033361, 129.0776917, 500])
-    # vertiport = np.array([35.5845361, 129.1076472, 500])
-    corridor_lat = np.array([35.5845917, 35.6026528, 35.6326806, 35.6249583, 35.6034750, 35.5845361, 35.5692361, 35.5546444, 35.5586722, 35.5784750, 35.5843722, 35.6163861, 35.6212528, 35.6109972])
-    corridor_lon = np.array([129.0936472, 129.1130667, 129.1238583, 129.1335528, 129.1268194, 129.1076472, 129.1085306, 129.0936972, 129.0816611, 129.0916889, 129.0770000, 129.0613944, 129.0725444, 129.0711889])
-    # corridor_lat = np.array([35.6249583])
-    # corridor_lon = np.array([129.1335528])
+    # vertiport = np.array([35.6033361, 129.0776917, 500])
+    vertiport = np.array([35.5845361, 129.1076472, 500])
+    # corridor_lat = np.array([35.5845917, 35.6026528, 35.6326806, 35.6249583, 35.6034750, 35.5845361, 35.5692361, 35.5546444, 35.5586722, 35.5784750, 35.5843722, 35.6163861, 35.6212528, 35.6109972])
+    # corridor_lon = np.array([129.0936472, 129.1130667, 129.1238583, 129.1335528, 129.1268194, 129.1076472, 129.1085306, 129.0936972, 129.0816611, 129.0916889, 129.0770000, 129.0613944, 129.0725444, 129.0711889])
+    corridor_lat = np.array([35.6249583])
+    corridor_lon = np.array([129.1335528])
     points = np.vstack([vertiport, np.column_stack([corridor_lat, corridor_lon, 500*np.ones_like(corridor_lat)]), vertiport])
-    # forbidden_zones = np.array([[129.08, 129.10, 35.59, 35.61], [129.11, 129.12, 35.62, 35.63], [129.12, 129.13, 35.59, 35.615]])
-    forbidden_zones = np.array([[129.08, 129.10, 35.59, 35.61], [129.11, 129.12, 35.59, 35.63], [129.12, 129.13, 35.62, 35.63]])
+    forbidden_zones = np.array([[129.08, 129.10, 35.59, 35.61], [129.11, 129.12, 35.62, 35.63], [129.12, 129.13, 35.59, 35.6]])
+    # forbidden_zones = np.array([[129.08, 129.10, 35.59, 35.61], [129.11, 129.12, 35.59, 35.63], [129.12, 129.13, 35.62, 35.63]])
     emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889]); emergency_lon = np.array([129.1191806, 129.106728, 129.0751972])
     
     # <<< [수정] 지도 범위를 동적으로 계산하는 대신, 최대 범위를 기준으로 고정합니다.
@@ -488,7 +492,7 @@ def main():
 
         # 4. 최적화: '안전 노드'만을 대상으로 NSGA-III 실행
         print(f'Starting optimization with {safe_nodes.shape[0]} nodes...')
-        population, f_vals = run_nsga3_segment(safe_nodes, p1, p2, Norm_RiskTensor, AirRisk, use_heading_map, flight_dist_limit, forbidden_zones, Nmax, N_pop, offspring_ratio, H_ref_points, gx1, altitude_levels, cell_size, refine_scales, air_risk_threshold, delta_z_max, w_ground, w_air, lat_lim, lon_lim, MAX_INIT_ATTEMPTS)
+        population, f_vals = run_nsga3_segment(safe_nodes, p1, p2, Norm_RiskTensor, AirRisk, use_heading_map, flight_dist_limit, forbidden_zones, Nmax, N_pop, offspring_ratio, H_ref_points, gx1, altitude_levels, cell_size, refine_scales, air_risk_threshold, delta_z_max, w_ground, w_air, lat_lim, lon_lim, MAX_INIT_ATTEMPTS, MIN_INTER_NODES, MAX_INTER_NODES)
         
         solutions = select_final_solutions(population, f_vals, final_pick, H_ref_points)
         full_paths[k] = solutions
