@@ -1,0 +1,13 @@
+{
+  "ts": "2025-10-17T16:45:37.479889",
+  "endpoint": "/point-risk",
+  "request": {
+    "point": [
+      35.5920898372885,
+      129.08726588261828,
+      180.0
+    ],
+    "heading": 305.73214150650296
+  },
+  "error": "HTTPConnectionPool(host='10.74.11.159', port=8000): Max retries exceeded with url: /point-risk (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x0000022241A39FD0>: Failed to establish a new connection: [WinError 10061] 대상 컴퓨터에서 연결을 거부했으므로 연결하지 못했습니다'))"
+}
