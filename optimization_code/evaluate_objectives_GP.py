@@ -13,6 +13,7 @@ def evaluate_objectives_gp(path,
                            cell_size, 
                            refine_scales, 
                            air_risk_threshold, # [수정] 비용 함수 임계값 인자 추가
+                           w_dist, # [추가] 거리 가중치
                            w_ground, 
                            w_air, 
                            lat_lim, 
@@ -29,6 +30,7 @@ def evaluate_objectives_gp(path,
         altitude_levels (np.ndarray): 비행 고도 레벨 목록.
         cell_size (float): 그리드 한 칸의 크기 (m).
         refine_scales (np.ndarray): 경로 보간 정밀도.
+        w_dist (float): 거리 가중치.
         w_ground (float): 지상/인구 위험도 가중치.
         w_air (float): 공중 위험도 가중치.
         lat_lim (list): 지도의 위도 범위 [min, max].
@@ -38,10 +40,12 @@ def evaluate_objectives_gp(path,
         np.ndarray: [총 3D 거리, 누적 통합 위험도] 값을 담은 배열.
     """
     # 1) 총 3D 거리 계산
-    total_dist = np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1))
+    total_dist = np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)) * w_dist
 
-    # 2) 누적 통합 위험도 계산
+    # 2) 누적 위험도 계산을 위한 변수 초기화
     cumulative_risk = 0.0
+    cumulative_ground_risk = 0.0
+    cumulative_air_risk = 0.0
     
     # 위경도 좌표를 그리드 인덱스로 변환하기 위한 준비
     _, _, Ny, Nx = Norm_RT.shape
@@ -109,5 +113,18 @@ def evaluate_objectives_gp(path,
 
         
         cumulative_risk += np.sum(combined_interp_risks)
+        cumulative_ground_risk += np.sum(interp_ground_risks)
+        cumulative_air_risk += np.sum(interp_air_risks)
 
-    return np.array([total_dist, cumulative_risk])
+    # --- 최종 반환 값 ---
+    # 사용자가 원하는 목표 조합을 아래 배열에 담아 반환합니다.
+    # 주석을 수정하여 원하는 목표를 활성화/비활성화할 수 있습니다.
+    
+    # 예시 1: [거리, 통합위험] (기존 2개 목표)
+    # return np.array([total_dist, cumulative_risk])
+    
+    # 예시 2: [거리, 지상위험, 공중위험] (요청된 3개 목표)
+    return np.array([total_dist, cumulative_ground_risk, cumulative_air_risk])
+    
+    # 예시 3: [거리, 통합위험, 지상위험, 공중위험] (모든 정보 반환)
+    # return np.array([total_dist, cumulative_risk, cumulative_ground_risk, cumulative_air_risk])

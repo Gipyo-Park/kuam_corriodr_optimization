@@ -53,6 +53,7 @@ def evaluate_objectives_with_constraints_gp(path,
                                              cell_size, 
                                              refine_scales, 
                                              air_risk_threshold, 
+                                             w_dist, # [추가] 거리 가중치
                                              w_ground, 
                                              w_air, 
                                              lat_lim, 
@@ -70,7 +71,7 @@ def evaluate_objectives_with_constraints_gp(path,
         forbidden_zones (np.ndarray): 금지 구역 목록.
         delta_z_max (float): 인접 노드 간 최대 허용 고도 변화량.
         altitude_levels, cell_size, refine_scales: evaluate_objectives_gp에 필요한 파라미터.
-        w_ground, w_air: 지상/공중 위험도 가중치.
+        w_dist, w_ground, w_air: 거리/지상/공중 위험도 가중치.
         lat_lim, lon_lim: 좌표계 변환을 위한 위경도 범위.
 
     Returns:
@@ -80,32 +81,39 @@ def evaluate_objectives_with_constraints_gp(path,
     """
     penalty_cost = 1e6
     
+    # 먼저 목적 함수를 호출하여 반환될 값의 개수를 확인합니다.
+    # 이 값은 아직 제약조건이 검사되지 않았으므로 최종 결과가 아닙니다.
+    temp_f_val = evaluate_objectives_gp(path, Norm_RT, AirRisk, use_heading_map,
+                                        altitude_levels, cell_size, refine_scales,
+                                        air_risk_threshold, w_dist, w_ground, w_air, lat_lim, lon_lim)
+    
+    # 제약 위반 시 반환될 페널티 배열을 동적으로 생성합니다.
+    num_objectives = len(temp_f_val)
+    penalty_cost_array = np.full(num_objectives, penalty_cost)
+
+    # --- 이제 제약 조건을 검사합니다. ---
     if path.shape[0] < 2:
-        return np.array([penalty_cost, penalty_cost]), False
+        return penalty_cost_array, False
 
     diffs = np.diff(path, axis=0)
 
-    # 1) 노드 간 2D 거리 체크 (원본 MATLAB 로직과 동일하게 위경도 차이값으로 비교)
+    # 1) 노드 간 2D 거리 체크
     dists_2d_deg = np.linalg.norm(diffs[:, :2], axis=1)
     if np.any(dists_2d_deg > flight_dist_limit):
-        return np.array([penalty_cost, penalty_cost]), False
+        return penalty_cost_array, False
 
     # 2) 노드 간 고도 변화 체크
     if np.any(np.abs(diffs[:, 2]) > delta_z_max):
-        return np.array([penalty_cost, penalty_cost]), False
+        return penalty_cost_array, False
 
-    # 3) 금지 구역 체크 (현재는 비활성화, 필요 시 로직 추가)
+    # 3) 금지 구역 체크
     if forbidden_zones is not None and forbidden_zones.shape[0] > 0:
         for i in range(path.shape[0] - 1):
-            p1 = path[i, :]   # [lat, lon, alt]
-            p2 = path[i+1, :] # [lat, lon, alt]
+            p1 = path[i, :]
+            p2 = path[i+1, :]
             for rect in forbidden_zones:
                 if _violates_forbidden_zone_latlon(p1, p2, rect):
-                    return np.array([penalty_cost, penalty_cost]), False
+                    return penalty_cost_array, False
 
-    # 4) 모든 제약 만족 시, 실제 목적 함수 계산
-    f_val = evaluate_objectives_gp(path, Norm_RT, AirRisk, use_heading_map,
-                                   altitude_levels, cell_size, refine_scales,
-                                   air_risk_threshold, w_ground, w_air, lat_lim, lon_lim)
-    
-    return f_val, True
+    # 4) 모든 제약을 만족했으므로, 아까 계산해 둔 목적 함수 값을 반환합니다.
+    return temp_f_val, True
