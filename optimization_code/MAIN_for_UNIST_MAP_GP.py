@@ -415,8 +415,8 @@ def main():
     # --- Stage 1: Initial Solution Finding ---
     # [설명] 1단계: 초기 해 탐색 (비상착륙장 활용)
     # 목적: 넓은 범위에서 대략적인 경로를 빠르게 찾고, 실행 가능한 초기 해를 확보합니다.
-    N_pop_stage1 = 5          # 인구 크기 (해 집단 크기)
-    Nmax_stage1 = 10          # 최대 세대 수 (반복 횟수)
+    N_pop_stage1 = 50          # 인구 크기 (해 집단 크기)
+    Nmax_stage1 = 100          # 최대 세대 수 (반복 횟수)
     offspring_ratio_stage1 = 1.0 # 자식 해 생성 비율
     H_ref_points_stage1 = 4   # 참조점 생성 파라미터 (3개 목표에 대해)
     MIN_INTER_NODES_stage1 = 1 # 비상착륙장 중 최소 1개 경유
@@ -439,7 +439,7 @@ def main():
     node_grid_resolution_m = 100.0 # 노드 간격 (m). 이 값이 크면 노드가 듬성듬성 생성됩니다.
     
     # 경로 노드 개수 제약
-    MIN_INTER_NODES_stage2 = 3  # 최소 중간 노드 개수
+    MIN_INTER_NODES_stage2 = 5  # 최소 중간 노드 개수
     MAX_INTER_NODES_stage2 = 10 # 최대 중간 노드 개수
     
     # 안전 노드 필터링 파라미터
@@ -526,11 +526,15 @@ def main():
     points = np.vstack([vertiport, np.column_stack([corridor_lat, corridor_lon, 500*np.ones_like(corridor_lat)]), vertiport])
     
     # 비행 금지 구역 (No-Fly Zones) 정의 [min_lon, max_lon, min_lat, max_lat]
-    forbidden_zones = np.array([[129.08, 129.10, 35.59, 35.61], [129.11, 129.12, 35.62, 35.63], [129.12, 129.13, 35.59, 35.6]])
+    forbidden_zones = np.array([[129.08, 129.10, 35.59, 35.61], [129.11, 129.118, 35.62, 35.63], [129.12, 129.13, 35.59, 35.6]])
     # forbidden_zones = np.array([[129.08, 129.10, 35.59, 35.61], [129.11, 129.12, 35.59, 35.63], [129.12, 129.13, 35.62, 35.63]])
-    
+    # forbidden_zones = np.array([[129.11, 129.118, 35.62, 35.63]])
+
+
     # 비상착륙장 위치 정의
-    emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889]); emergency_lon = np.array([129.1191806, 129.106728, 129.0751972])
+    # emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889]); emergency_lon = np.array([129.1191806, 129.106728, 129.0751972])
+    emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889, 35.58, 35.625, 35.62, 35.624, 35.56]); emergency_lon = np.array([129.1191806, 129.106728, 129.0751972, 129.12, 129.115, 129.09, 129.065, 129.065])
+    # emergency_lat = np.array([35.56]); emergency_lon = np.array([129.065])
     emergency_points = np.column_stack([emergency_lat, emergency_lon, np.full_like(emergency_lat, vertiport[2])])
 
     # <<< [수정] 지도 범위를 동적으로 계산하는 대신, 최대 범위를 기준으로 고정합니다.
@@ -551,7 +555,7 @@ def main():
         
         # Figure 1: Stage 1 (Initial) - 초기 해 탐색 과정 시각화
         fig1 = plt.figure('Figure 1: Stage 1 - Initial Solution Finding', figsize=(12, 10))
-        fig1.subplots_adjust(right=0.75) # 범례 공간 확보
+        fig1.subplots_adjust(left=0.2, right=0.95) # [수정] 범례(좌측) 공간 확보 (Figure 2와 동일하게 left=0.2)
         request = cimgt.OSM() # OpenStreetMap 배경 사용
         gx1 = fig1.add_subplot(1, 1, 1, projection=request.crs)
         gx1.set_extent([lon_lim[0], lon_lim[1], lat_lim[0], lat_lim[1]])
@@ -651,6 +655,8 @@ def main():
             if gx1:
                 # [수정] 핸들 저장 및 pause 시간 단축
                 stage1_current_lines = plot_solutions(gx1, initial_solutions, ['m-'], 1.2, k+1, labels=["Initial Sol."])
+                # [추가] 범례 표시 (Figure 2와 동일한 위치)
+                gx1.legend(loc='upper right', bbox_to_anchor=(-0.1, 1), borderaxespad=0.)
                 plt.pause(0.1)
         else:
             all_stage1_solutions_history.append([]) # [추가] 빈 리스트 저장
@@ -751,7 +757,7 @@ def main():
                 s_risks = s_a_risks # [수정] 시각화도 공중 위험도(Air Risk) 기준으로 변경
                 
                 # [수정] scatter 객체 저장
-                stage2_current_scatter = gx2.scatter(s_lons, s_lats, c=s_risks, cmap='jet', vmin=0.0, vmax=1.0, s=10, alpha=0.8, transform=ccrs.Geodetic(), zorder=3)
+                stage2_current_scatter = gx2.scatter(s_lons, s_lats, c=s_risks, cmap='jet', vmin=0.0, vmax=1.0, s=10, alpha=0.5, transform=ccrs.Geodetic(), zorder=3)
                 
                 if cbar2 is None:
                     cbar2 = fig2.colorbar(stage2_current_scatter, ax=gx2, fraction=0.046, pad=0.04)
@@ -846,7 +852,8 @@ def main():
         for handle, label in zip(handles, labels):
             if label not in unique_labels:
                 unique_labels[label] = handle
-        gx1.legend(unique_labels.values(), unique_labels.keys(), loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+        # [수정] 범례 위치를 좌측으로 변경 (Figure 2와 동일)
+        gx1.legend(unique_labels.values(), unique_labels.keys(), loc='upper right', bbox_to_anchor=(-0.1, 1), borderaxespad=0.)
         
         plt.pause(0.1)
 
