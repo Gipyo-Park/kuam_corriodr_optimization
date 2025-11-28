@@ -367,7 +367,7 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
                 if feasible[idx]:
                     line, = gx.plot(population[idx][:, 1], population[idx][:, 0], '-', color=[0.5, 0.5, 0.5, 0.3], transform=ccrs.Geodetic())
                     h_paths.append(line)
-            plt.pause(0.01)
+            plt.pause(10) # 여기를 수정하면 plot이 천천히 된다
             
         # 환경 선택 (Selection): 우수한 해 선택
         new_pop = selection_nsga3(population, f_vals, feasible, N_pop, ref_points)
@@ -515,12 +515,12 @@ def main():
 
     # --- 2. Define Vertiport and Corridor Points ---
     # [설명] 버티포트(이착륙장)와 회랑(Corridor)의 주요 지점들을 정의합니다.
-    vertiport = np.array([35.6033361, 129.0776917, 500])
-    # vertiport = np.array([35.5845361, 129.1076472, 500])
-    corridor_lat = np.array([35.5845917, 35.6026528, 35.6326806, 35.6249583, 35.6034750, 35.5845361, 35.5692361, 35.5546444, 35.5586722, 35.5784750, 35.5843722, 35.6163861, 35.6212528, 35.6109972])
-    corridor_lon = np.array([129.0936472, 129.1130667, 129.1238583, 129.1335528, 129.1268194, 129.1076472, 129.1085306, 129.0936972, 129.0816611, 129.0916889, 129.0770000, 129.0613944, 129.0725444, 129.0711889])
-    # corridor_lat = np.array([35.6249583])
-    # corridor_lon = np.array([129.1335528])
+    # vertiport = np.array([35.6033361, 129.0776917, 500])
+    vertiport = np.array([35.5545361, 129.0876472, 500])
+    # corridor_lat = np.array([35.5845917, 35.6026528, 35.6326806, 35.6249583, 35.6034750, 35.5845361, 35.5692361, 35.5546444, 35.5586722, 35.5784750, 35.5843722, 35.6163861, 35.6212528, 35.6109972])
+    # corridor_lon = np.array([129.0936472, 129.1130667, 129.1238583, 129.1335528, 129.1268194, 129.1076472, 129.1085306, 129.0936972, 129.0816611, 129.0916889, 129.0770000, 129.0613944, 129.0725444, 129.0711889])
+    corridor_lat = np.array([35.6249583])
+    corridor_lon = np.array([129.1335528])
     
     # 전체 경로 포인트 구성 (Start -> Waypoints -> End)
     points = np.vstack([vertiport, np.column_stack([corridor_lat, corridor_lon, 500*np.ones_like(corridor_lat)]), vertiport])
