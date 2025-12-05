@@ -4,6 +4,7 @@ from scipy.spatial.distance import cdist
 from scipy.ndimage import map_coordinates
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
 import cartopy.crs as ccrs
 import cartopy.io.img_tiles as cimgt
 import time
@@ -25,6 +26,73 @@ from evaluate_objectives_with_constraints_GP import evaluate_objectives_with_con
 # =============================================================================
 # Local functions for MAIN script
 # =============================================================================
+
+def generate_valid_nodes_near_vertiport(vertiport, num_nodes, search_radius_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones):
+    """
+    버티포트 중심으로 MOC(Minimum Obstacle Clearance) 기준으로 이착륙 가능한
+    Valid Nodes를 랜덤으로 생성합니다.
+    (추후 경운대에서 제공할 실제 Valid Nodes로 대체 가능)
+    
+    Args:
+        vertiport: 버티포트 위치 [lat, lon, alt]
+        num_nodes: 생성할 노드 개수
+        search_radius_m: 탐색 반경 (미터)
+        lat_lim, lon_lim: 지도 범위
+        Ny, Nx: 지도 그리드 크기
+        forbidden_zones: 금지 구역 정보
+    
+    Returns:
+        valid_nodes: 생성된 유효 노드들 [N x 3]
+    """
+    print(f"  -> Generating {num_nodes} valid nodes near vertiport (radius: {search_radius_m}m)...")
+    
+    # 위경도 -> 미터 변환 스케일
+    mean_lat_rad = np.deg2rad(vertiport[0])
+    meters_per_lat_deg = 111000
+    meters_per_lon_deg = 111000 * np.cos(mean_lat_rad)
+    
+    # 미터 -> 위경도 변환
+    search_radius_lat = search_radius_m / meters_per_lat_deg
+    search_radius_lon = search_radius_m / meters_per_lon_deg
+    
+    valid_nodes = []
+    max_attempts = num_nodes * 100  # 최대 시도 횟수
+    
+    for attempt in range(max_attempts):
+        if len(valid_nodes) >= num_nodes:
+            break
+            
+        # 랜덤한 거리와 각도로 노드 생성
+        angle = np.random.uniform(0, 2 * np.pi)
+        distance_ratio = np.sqrt(np.random.uniform(0, 1))  # 균등 분포를 위한 sqrt
+        
+        dlat = search_radius_lat * distance_ratio * np.sin(angle)
+        dlon = search_radius_lon * distance_ratio * np.cos(angle)
+        
+        node_lat = vertiport[0] + dlat
+        node_lon = vertiport[1] + dlon
+        node_alt = vertiport[2]
+        
+        # 지도 범위 체크
+        if not (lat_lim[0] <= node_lat <= lat_lim[1] and lon_lim[0] <= node_lon <= lon_lim[1]):
+            continue
+        
+        # NFZ 체크
+        is_in_nfz = False
+        if forbidden_zones is not None and forbidden_zones.shape[0] > 0:
+            for rect in forbidden_zones:
+                min_lon, max_lon, min_lat, max_lat = rect
+                if (min_lon <= node_lon <= max_lon) and (min_lat <= node_lat <= max_lat):
+                    is_in_nfz = True
+                    break
+        
+        if not is_in_nfz:
+            valid_nodes.append([node_lat, node_lon, node_alt])
+    
+    result = np.array(valid_nodes) if valid_nodes else np.empty((0, 3))
+    print(f"  -> Generated {result.shape[0]} valid nodes.")
+    return result
+
 
 def generate_nodes_3d_segment(p1, p2, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones):
     """
@@ -133,6 +201,74 @@ def generate_nodes_3d_segment(p1, p2, W_buf, node_grid_resolution_m, lat_lim, lo
     return nodes, all_grid_nodes
 
 
+def plot_corridor_width(gx, path, W_half, color='yellow', alpha=0.2, lat_lim=None, lon_lim=None):
+    """
+    경로의 회랑폭을 시각화합니다.
+    
+    Args:
+        gx: Matplotlib Axes 객체
+        path: 경로 [N x 3] (lat, lon, alt)
+        W_half: 회랑 반폭 (미터)
+        color: 색상
+        alpha: 투명도
+        lat_lim, lon_lim: 좌표계 변환을 위한 지도 범위
+    """
+    if path is None or path.shape[0] < 2:
+        return None
+    
+    # 미터 -> 위경도 변환
+    mean_lat_rad = np.deg2rad(np.mean(path[:, 0]))
+    meters_per_lat_deg = 111000
+    meters_per_lon_deg = 111000 * np.cos(mean_lat_rad)
+    
+    W_half_lat = W_half / meters_per_lat_deg
+    W_half_lon = W_half / meters_per_lon_deg
+    
+    # 경로 양측으로 폭 생성
+    left_points = []
+    right_points = []
+    
+    for i in range(len(path)):
+        if i == 0:
+            # 첫 점: 다음 점과의 방향 사용
+            vec = path[i+1][:2] - path[i][:2]
+        elif i == len(path) - 1:
+            # 마지막 점: 이전 점과의 방향 사용
+            vec = path[i][:2] - path[i-1][:2]
+        else:
+            # 중간 점: 평균 방향 사용
+            vec = path[i+1][:2] - path[i-1][:2]
+        
+        # 수직 벡터 계산
+        norm = np.linalg.norm(vec)
+        if norm < 1e-10:
+            continue
+        
+        perp = np.array([-vec[1], vec[0]]) / norm
+        
+        # 좌우 점 생성 (위경도 단위)
+        offset_lat = perp[0] * W_half_lat
+        offset_lon = perp[1] * W_half_lon
+        
+        left_points.append([path[i, 0] + offset_lat, path[i, 1] + offset_lon])
+        right_points.append([path[i, 0] - offset_lat, path[i, 1] - offset_lon])
+    
+    if len(left_points) < 2:
+        return None
+    
+    # Polygon 생성 (left -> right 역순)
+    polygon_points = left_points + right_points[::-1]
+    polygon_array = np.array(polygon_points)
+    
+    # Cartopy 좌표계로 변환하여 그리기
+    poly = Polygon(polygon_array[:, [1, 0]], closed=True, 
+                   facecolor=color, edgecolor='none', alpha=alpha,
+                   transform=ccrs.Geodetic(), zorder=2)
+    gx.add_patch(poly)
+    
+    return poly
+
+
 def plot_solutions(gx, solutions, styles, width, seg_num=None, labels=None, custom_color=None):
     """
     최적화된 경로들을 지도 위에 시각화합니다.
@@ -236,7 +372,7 @@ def variation_nsga3(pop, nodes, ratio):
         offspring.append(mutation_gp(child, nodes))
     return offspring
 
-def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones, Nmax, N_pop, ratio, H, gx, alt, cs, scales, air_risk_threshold, dz, w_d, w_g, w_a, lat_lim, lon_lim, MAX_INIT_ATTEMPTS, min_inter_nodes, max_inter_nodes, is_initial_stage=False, initial_population=None):
+def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones, Nmax, N_pop, ratio, H, gx, alt, cs, scales, air_risk_threshold, dz, w_d, w_g, w_a, lat_lim, lon_lim, MAX_INIT_ATTEMPTS, min_inter_nodes, max_inter_nodes, is_initial_stage=False, initial_population=None, W_half=None, ground_speed_mps=None, bank_angle_deg=25.0, min_turn_radius_m=296.0, check_corridor_nfz=False, check_turn_radius=False, check_heading_continuity=False, prev_segment_heading=None, draw_final_corridor_width=True):
     """
     한 세그먼트(두 지점 사이)에 대해 NSGA-III 알고리즘을 실행하여 최적 경로를 탐색합니다.
     
@@ -263,13 +399,33 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
         min_inter_nodes, max_inter_nodes: 경로 중간 노드 개수 범위
         is_initial_stage: 초기 단계(Stage 1) 여부
         initial_population: 초기 해 집단 (Stage 2에서 Stage 1의 결과를 사용할 때 입력)
+        W_half: 회랑 반폭 (미터)
+        ground_speed_mps: 지상 속도 (m/s)
+        bank_angle_deg: 뱅크각 (도)
+        min_turn_radius_m: 최소 회전반경 (미터)
+        check_corridor_nfz: 회랑폭 NFZ 검사 활성화
+        check_turn_radius: 회전반경 검사 활성화
+        prev_segment_heading: 이전 세그먼트 종료 헤딩 (라디안)
     """
     
     # --- 1. Determine Number of Objectives and Reference Points ---
     # [설명] 목적 함수의 개수를 동적으로 파악하고, 이에 맞는 참조점(Reference Points)을 생성합니다.
     # 임시 경로로 목적 함수를 한번 호출하여 목표 개수를 동적으로 파악
     dummy_path = np.vstack([p1, p2])
-    temp_f_val, _ = evaluate_objectives_with_constraints_gp(dummy_path, Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim)
+    temp_result = evaluate_objectives_with_constraints_gp(
+        dummy_path, Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, 
+        air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim,
+        W_half=W_half, ground_speed_mps=ground_speed_mps, bank_angle_deg=bank_angle_deg,
+        min_turn_radius_m=min_turn_radius_m, check_corridor_nfz=check_corridor_nfz,
+        check_turn_radius=check_turn_radius, prev_segment_heading=prev_segment_heading
+    )
+    
+    # 반환값 처리 (하위 호환성)
+    if len(temp_result) == 3:
+        temp_f_val, _, _ = temp_result
+    else:
+        temp_f_val, _ = temp_result
+    
     num_objectives = len(temp_f_val)
     
     # [수정] 사용자 요청: 목표 개수에 따라 H값 동적 설정 (H = 목표 개수 + 1)
@@ -310,13 +466,22 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
             continue
 
         # 2. 생성된 초기 집단이 실행 가능한 해를 포함하는지 즉시 검사
-        # [설명] 유효성 검사(Feasibility Check):
-        # 생성된 경로가 금지 구역(NFZ)을 침범하지 않는지, 회전 반경 등 제약 조건을 만족하는지 확인합니다.
-        # evaluate_objectives_with_constraints_gp 함수는 (목적함수값, 유효성여부)를 반환합니다.
-        # 여기서 feasible이 True여야 실제 비행 가능한 경로입니다.
         is_any_feasible = False
         for path in temp_full_pop:
-            _, feasible = evaluate_objectives_with_constraints_gp(path, Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim)
+            eval_result = evaluate_objectives_with_constraints_gp(
+                path, Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales,
+                air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim,
+                W_half=W_half, ground_speed_mps=ground_speed_mps, bank_angle_deg=bank_angle_deg,
+                min_turn_radius_m=min_turn_radius_m, check_corridor_nfz=check_corridor_nfz,
+                check_turn_radius=check_turn_radius, check_heading_continuity=check_heading_continuity,
+                prev_segment_heading=prev_segment_heading
+            )
+            
+            if len(eval_result) == 3:
+                _, feasible, _ = eval_result
+            else:
+                _, feasible = eval_result
+            
             if feasible:
                 is_any_feasible = True
                 break
@@ -332,18 +497,18 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
         else:
             if attempt % 10 == 0:
                 print(f"    -> Attempt {attempt + 1}: Initial population has no feasible solutions. Retrying...")
-            # 실패 시, 랜덤 생성된 부분은 버리고 다시 시도 (seeds는 유지)
-            # 만약 seeds 자체가 실행 불가능하다면? -> seeds는 유지하되 랜덤 부분에서 실행 가능한 해가 나오길 기대
             pass
 
     # 유효성 검사 및 재시도 (공통)
     if not population:
         print("Failed to generate or receive a valid initial population.")
-        return [], np.array([])
+        return [], np.array([]), None
 
     # --- 3. NSGA-III Main Loop ---
     # [설명] 정해진 세대 수(Nmax)만큼 진화를 반복합니다.
     h_paths = []
+    final_heading = None
+    
     for gen in range(1, Nmax + 1):
         if gen % 10 == 0 or gen == 1:
             print(f'  - Generation {gen}/{Nmax}')
@@ -352,10 +517,24 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
         Np = len(population)
         f_vals = np.zeros((Np, num_objectives))
         feasible = np.zeros(Np, dtype=bool)
+        headings = [None] * Np
         
         # 현재 세대의 모든 해에 대해 목적 함수 평가
         for i in range(Np):
-            f_vals[i, :], feasible[i] = evaluate_objectives_with_constraints_gp(population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim)
+            eval_result = evaluate_objectives_with_constraints_gp(
+                population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales,
+                air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim,
+                W_half=W_half, ground_speed_mps=ground_speed_mps, bank_angle_deg=bank_angle_deg,
+                min_turn_radius_m=min_turn_radius_m, check_corridor_nfz=check_corridor_nfz,
+                check_turn_radius=check_turn_radius, check_heading_continuity=check_heading_continuity,
+                prev_segment_heading=prev_segment_heading
+            )
+            
+            if len(eval_result) == 3:
+                f_vals[i, :], feasible[i], headings[i] = eval_result
+            else:
+                f_vals[i, :], feasible[i] = eval_result
+                headings[i] = None
         
         # 시각화: Stage 2(Main)이거나, Stage 1이라도 가끔 업데이트
         if gx and (gen % 20 == 0 or gen == 1): 
@@ -367,7 +546,67 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
                 if feasible[idx]:
                     line, = gx.plot(population[idx][:, 1], population[idx][:, 0], '-', color=[0.5, 0.5, 0.5, 0.3], transform=ccrs.Geodetic())
                     h_paths.append(line)
-            plt.pause(10) # 여기를 수정하면 plot이 천천히 된다
+            
+            # [추가] Stage 2에서만 파레토 해들의 회랑폭 시각화 (얇은 점선)
+            if not is_initial_stage and W_half is not None and W_half > 0:
+                # 파레토 최전선 찾기
+                feasible_indices = [i for i in range(Np) if feasible[i]]
+                if feasible_indices:
+                    feasible_f_vals = f_vals[feasible_indices, :]
+                    F_vis = fast_non_dominated_sort(feasible_f_vals)
+                    
+                    if F_vis and F_vis[0]:
+                        # 파레토 최전선의 해들에 대해 회랑폭 표시
+                        front1_local = F_vis[0]
+                        front1_global = [feasible_indices[i] for i in front1_local]
+                        
+                        for idx in front1_global:
+                            path = population[idx]
+                            if path.shape[0] >= 2:
+                                # 회랑폭을 얇은 점선으로 표시
+                                mean_lat_rad = np.deg2rad(np.mean(path[:, 0]))
+                                meters_per_lat_deg = 111000
+                                meters_per_lon_deg = 111000 * np.cos(mean_lat_rad)
+                                W_half_lat = W_half / meters_per_lat_deg
+                                W_half_lon = W_half / meters_per_lon_deg
+                                
+                                left_points = []
+                                right_points = []
+                                
+                                for i in range(len(path)):
+                                    if i == 0:
+                                        vec = np.array([path[1, 0] - path[0, 0], path[1, 1] - path[0, 1]])
+                                    elif i == len(path) - 1:
+                                        vec = np.array([path[-1, 0] - path[-2, 0], path[-1, 1] - path[-2, 1]])
+                                    else:
+                                        vec = np.array([path[i+1, 0] - path[i-1, 0], path[i+1, 1] - path[i-1, 1]])
+                                    
+                                    norm = np.linalg.norm(vec)
+                                    if norm < 1e-10:
+                                        continue
+                                    
+                                    perp = np.array([-vec[1], vec[0]]) / norm
+                                    offset_lat = perp[0] * W_half_lat
+                                    offset_lon = perp[1] * W_half_lon
+                                    
+                                    left_points.append([path[i, 1] + offset_lon, path[i, 0] + offset_lat])
+                                    right_points.append([path[i, 1] - offset_lon, path[i, 0] - offset_lat])
+                                
+                                if len(left_points) >= 2:
+                                    left_arr = np.array(left_points)
+                                    right_arr = np.array(right_points)
+                                    
+                                    # 얇은 점선으로 회랑폭 경계 표시
+                                    line_l, = gx.plot(left_arr[:, 0], left_arr[:, 1], ':', 
+                                                     color=[0.8, 0.6, 0.0, 0.4], linewidth=0.8, 
+                                                     transform=ccrs.Geodetic(), zorder=4)
+                                    line_r, = gx.plot(right_arr[:, 0], right_arr[:, 1], ':', 
+                                                     color=[0.8, 0.6, 0.0, 0.4], linewidth=0.8, 
+                                                     transform=ccrs.Geodetic(), zorder=4)
+                                    h_paths.append(line_l)
+                                    h_paths.append(line_r)
+            
+            plt.pause(5) # 여기를 수정하면 plot이 천천히 된다
             
         # 환경 선택 (Selection): 우수한 해 선택
         new_pop = selection_nsga3(population, f_vals, feasible, N_pop, ref_points)
@@ -385,19 +624,106 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
             population = new_pop
             
     if not population:
-        return [], np.array([])
+        return [], np.array([]), None
 
     # --- 4. Final Evaluation ---
     # [설명] 최종 세대의 해들에 대해 마지막으로 목적 함수 값을 계산하여 반환합니다.
     f_vals_final = np.zeros((len(population), num_objectives))
-    for i in range(len(population)):
-        f_vals_final[i,:], _ = evaluate_objectives_with_constraints_gp(population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales, air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim)
+    final_headings = []
     
+    for i in range(len(population)):
+        eval_result = evaluate_objectives_with_constraints_gp(
+            population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales,
+            air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim,
+            W_half=W_half, ground_speed_mps=ground_speed_mps, bank_angle_deg=bank_angle_deg,
+            min_turn_radius_m=min_turn_radius_m, check_corridor_nfz=check_corridor_nfz,
+            check_turn_radius=check_turn_radius, check_heading_continuity=check_heading_continuity,
+            prev_segment_heading=prev_segment_heading
+        )
+        
+        if len(eval_result) == 3:
+            f_vals_final[i,:], _, heading = eval_result
+            final_headings.append(heading)
+        else:
+            f_vals_final[i,:], _ = eval_result
+            final_headings.append(None)
+    
+    # 가장 우수한 해의 헤딩 반환
+    if final_headings and any(h is not None for h in final_headings):
+        valid_headings = [h for h in final_headings if h is not None]
+        final_heading = valid_headings[0] if valid_headings else None
+    
+    # [수정] 최적화 중 임시 경로선만 제거하고, 최종 파레토 해의 회랑폭은 다시 그림
     if gx and h_paths:
         for line in h_paths:
             line.remove()
+        h_paths.clear()
+    
+    # [수정] Stage 2에서만 Balanced 해의 회랑폭 시각화 유지 (플래그로 제어)
+    if gx and not is_initial_stage and W_half is not None and W_half > 0 and draw_final_corridor_width:
+        # 실행 가능한 해들 중 파레토 최전선 찾기
+        feasible_indices = [i for i in range(len(population)) if np.all(f_vals_final[i, :] < 1e6)]
+        if feasible_indices:
+            feasible_f_vals = f_vals_final[feasible_indices, :]
+            F_final = fast_non_dominated_sort(feasible_f_vals)
+            
+            if F_final and F_final[0]:
+                # 파레토 최전선에서 Balanced 해 찾기
+                front1_local = F_final[0]
+                front1_fvals = feasible_f_vals[front1_local, :]
+                
+                # 정규화된 거리로 균형해 선택
+                norm_f = normalize_objectives(front1_fvals)
+                balanced_local_idx = np.argmin(np.linalg.norm(norm_f, axis=1))
+                balanced_global_idx = feasible_indices[front1_local[balanced_local_idx]]
+                
+                print(f"  -> Drawing corridor width for Balanced solution only...")
+                
+                # Balanced 해의 회랑폭만 표시
+                path = population[balanced_global_idx]
+                if path.shape[0] >= 2:
+                    # 회랑폭 계산
+                    mean_lat_rad = np.deg2rad(np.mean(path[:, 0]))
+                    meters_per_lat_deg = 111000
+                    meters_per_lon_deg = 111000 * np.cos(mean_lat_rad)
+                    W_half_lat = W_half / meters_per_lat_deg
+                    W_half_lon = W_half / meters_per_lon_deg
+                    
+                    left_points = []
+                    right_points = []
+                    
+                    for i in range(len(path)):
+                        if i == 0:
+                            vec = np.array([path[1, 0] - path[0, 0], path[1, 1] - path[0, 1]])
+                        elif i == len(path) - 1:
+                            vec = np.array([path[-1, 0] - path[-2, 0], path[-1, 1] - path[-2, 1]])
+                        else:
+                            vec = np.array([path[i+1, 0] - path[i-1, 0], path[i+1, 1] - path[i-1, 1]])
+                        
+                        norm = np.linalg.norm(vec)
+                        if norm < 1e-10:
+                            continue
+                        
+                        perp = np.array([-vec[1], vec[0]]) / norm
+                        offset_lat = perp[0] * W_half_lat
+                        offset_lon = perp[1] * W_half_lon
+                        
+                        left_points.append([path[i, 1] + offset_lon, path[i, 0] + offset_lat])
+                        right_points.append([path[i, 1] - offset_lon, path[i, 0] - offset_lat])
+                    
+                    if len(left_points) >= 2:
+                        left_arr = np.array(left_points)
+                        right_arr = np.array(right_points)
+                        
+                        # Balanced 해의 회랑폭 - 진한 점선으로 유지
+                        gx.plot(left_arr[:, 0], left_arr[:, 1], ':', 
+                               color=[0.8, 0.6, 0.0, 0.7], linewidth=1.0, 
+                               transform=ccrs.Geodetic(), zorder=15, label='_nolegend_')
+                        gx.plot(right_arr[:, 0], right_arr[:, 1], ':', 
+                               color=[0.8, 0.6, 0.0, 0.7], linewidth=1.0, 
+                               transform=ccrs.Geodetic(), zorder=15, label='_nolegend_')
         
-    return population, f_vals_final
+    return population, f_vals_final, final_heading
 
 # =============================================================================
 # MAIN SCRIPT
@@ -411,6 +737,23 @@ def main():
     # --- 0. Parameters ---
     # [설명] 최적화 및 시뮬레이션에 필요한 주요 파라미터들을 설정합니다.
     
+    # ===== [추가] 회랑 및 항공기 동역학 파라미터 =====
+    W_half = 148.0  # 회랑 반폭 (미터) - TSE 148m 기준
+    ground_speed_mps = 70.65  # 지상 속도 (m/s) - 약 148kt 기준
+    bank_angle_deg = 25.0  # 뱅크각 (도)
+    min_turn_radius_m = 296.0  # 최소 회전반경 (미터) - 계산식: R = V²/(g×tan(φ))
+    
+    # ===== 제약 조건 활성화/비활성화 설정 =====
+    check_corridor_nfz = True  # 회랑폭 NFZ 검사 활성화 (True=활성화, False=비활성화)
+    check_turn_radius = False  # 회전반경 검사 활성화 (True=활성화, False=비활성화)
+    check_heading_continuity = False  # 헤딩 연속성 검사 활성화 (True=활성화, False=비활성화)
+    max_heading_diff_deg = 10.0  # 세그먼트 연결점 헤딩 최대 차이 (도)
+    
+    # ===== 버티포트 Valid Nodes 생성 파라미터 =====
+    NUM_VALID_NODES = 2  # 생성할 valid nodes 개수 (추후 경운대에서 제공될 예정)
+    VALID_NODE_SEARCH_RADIUS_M = 500.0  # 버티포트 중심으로부터 탐색 반경 (미터)
+    ENABLE_VERTIPORT_MULTISTART = True  # 버티포트 멀티스타트 최적화 활성화 (첫 세그먼트에만 적용)
+    
     # [수정] 2단계 최적화 파라미터 분리
     # --- Stage 1: Initial Solution Finding ---
     # [설명] 1단계: 초기 해 탐색 (비상착륙장 활용)
@@ -420,7 +763,8 @@ def main():
     offspring_ratio_stage1 = 1.0 # 자식 해 생성 비율
     H_ref_points_stage1 = 4   # 참조점 생성 파라미터 (3개 목표에 대해)
     MIN_INTER_NODES_stage1 = 1 # 비상착륙장 중 최소 1개 경유
-    MAX_INTER_NODES_stage1 = 3 # 비상착륙장 중 최대 3개 경유
+    MAX_INTER_NODES_stage1 = 5 # 비상착륙장 중 최대 3개 경유
+    MAX_INIT_ATTEMPTS_stage1 = 100 # 초기 해 생성 최대 시도 횟수 (비상착륙장 랜덤 샘플링)
     
     # --- Stage 2: Main Optimization ---
     # [설명] 2단계: 메인 최적화 (격자 노드 활용)
@@ -435,12 +779,12 @@ def main():
     # 고도 및 맵 설정
     # altitude_levels, use_heading_map = np.array([400,500,600,700]), True
     altitude_levels, use_heading_map = np.array([500]), True # 단일 고도 500m 사용
-    W_buf = 1000.0            # 경로 탐색 복도 폭 (m)
+    W_buf = 1250.0            # 경로 탐색 복도 폭 (m) - 노드 생성용
     node_grid_resolution_m = 100.0 # 노드 간격 (m). 이 값이 크면 노드가 듬성듬성 생성됩니다.
     
     # 경로 노드 개수 제약
-    MIN_INTER_NODES_stage2 = 5  # 최소 중간 노드 개수
-    MAX_INTER_NODES_stage2 = 10 # 최대 중간 노드 개수
+    MIN_INTER_NODES_stage2 = 3  # 최소 중간 노드 개수
+    MAX_INTER_NODES_stage2 = 50 # 최대 중간 노드 개수
     
     # 안전 노드 필터링 파라미터
     MIN_SAFE_NODES_TARGET = 100 # 최소 확보해야 할 안전 노드 개수
@@ -533,8 +877,9 @@ def main():
 
     # 비상착륙장 위치 정의
     # emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889]); emergency_lon = np.array([129.1191806, 129.106728, 129.0751972])
-    emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889, 35.58, 35.625, 35.62, 35.624, 35.56]); emergency_lon = np.array([129.1191806, 129.106728, 129.0751972, 129.12, 129.115, 129.09, 129.065, 129.065])
-    # emergency_lat = np.array([35.56]); emergency_lon = np.array([129.065])
+    emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889, 35.58, 35.625, 35.62, 35.624, 35.56, 35.620]); 
+    emergency_lon = np.array([129.1191806, 129.106728, 129.0751972, 129.12, 129.115, 129.09, 129.065, 129.065, 129.125])
+    # emergency_lat = np.array([35.620]); emergency_lon = np.array([129.125])
     emergency_points = np.column_stack([emergency_lat, emergency_lon, np.full_like(emergency_lat, vertiport[2])])
 
     # <<< [수정] 지도 범위를 동적으로 계산하는 대신, 최대 범위를 기준으로 고정합니다.
@@ -593,11 +938,345 @@ def main():
     # [추가] 시각화 객체 관리를 위한 변수
     stage1_current_lines = []
     stage2_current_scatter = None
-    all_stage1_solutions_history = [] 
+    all_stage1_solutions_history = []
+    
+    # [추가] 헤딩 연속성 추적 변수
+    segment_headings = []  # 각 세그먼트의 최종 헤딩 저장
+    prev_heading = None  # 이전 세그먼트의 헤딩
+    
+    # [추가] 버티포트 멀티스타트 결과 저장
+    vertiport_multistart_results = []  # 각 valid node별 최적화 결과
+    best_vertiport_node = None  # 선택된 최적 valid node
 
-    for k in tqdm(range(num_segments), desc="Stage 1: Finding Initial Solutions"):
+    for k in tqdm(range(num_segments), desc="Optimizing Segments"):
         p1, p2 = points[k, :], points[k + 1, :]
         print(f'\n=== Processing Segment {k+1}/{num_segments} ===')
+        
+        # [추가] 버티포트 멀티스타트 로직 (첫 번째 세그먼트에만 적용)
+        if k == 0 and ENABLE_VERTIPORT_MULTISTART:
+            print(f"\n*** VERTIPORT MULTI-START MODE (Segment 1) ***")
+            print(f"Generating {NUM_VALID_NODES} valid nodes near vertiport...")
+            
+            # 1. 버티포트 주변 Valid Nodes 생성
+            valid_nodes = generate_valid_nodes_near_vertiport(
+                vertiport, NUM_VALID_NODES, VALID_NODE_SEARCH_RADIUS_M,
+                lat_lim, lon_lim, Ny, Nx, forbidden_zones
+            )
+            
+            if valid_nodes.shape[0] == 0:
+                print("  WARNING: No valid nodes generated. Using vertiport as single start point.")
+                valid_nodes = np.array([vertiport])
+            
+            # 시각화: Valid nodes 표시
+            if gx1:
+                gx1.scatter(valid_nodes[:, 1], valid_nodes[:, 0], s=100, c='magenta', 
+                           marker='*', transform=ccrs.Geodetic(), label='Valid Nodes', zorder=10)
+                gx1.legend(loc='upper right', bbox_to_anchor=(-0.1, 1), borderaxespad=0.)
+                plt.pause(0.1)
+            
+            # 2. 각 Valid Node마다 Stage 1 & Stage 2 최적화 수행
+            for vn_idx, valid_node in enumerate(valid_nodes):
+                print(f"\n--- Optimizing from Valid Node {vn_idx+1}/{valid_nodes.shape[0]} ---")
+                print(f"  Node position: {valid_node}")
+                
+                # 이 valid node를 시작점으로 사용
+                p1_vn = valid_node
+                
+                # ---------------------------------------------------------
+                # [Stage 1] Initial Solution Finding (Emergency Points)
+                # ---------------------------------------------------------
+                print(f"  -> Stage 1: Finding Initial Solutions")
+                if gx1:
+                    gx1.set_title(f'Stage 1: Valid Node {vn_idx+1} Initial Search', size=16)
+                    for line in stage1_current_lines:
+                        line.remove()
+                    stage1_current_lines = []
+                
+                nodes_stage1 = emergency_points
+                
+                result_stage1 = run_nsga3_segment(
+                    nodes=nodes_stage1, p1=p1_vn, p2=p2,
+                    Norm_RT=Norm_RiskTensor, AirRisk=AirRisk, use_map=use_heading_map,
+                    f_limit=flight_dist_limit, f_zones=forbidden_zones,
+                    Nmax=Nmax_stage1, N_pop=N_pop_stage1, ratio=offspring_ratio_stage1, H=H_ref_points_stage1,
+                    gx=gx1, alt=altitude_levels, cs=cell_size, scales=refine_scales,
+                    air_risk_threshold=1.0,
+                    dz=delta_z_max, w_d=w_dist, w_g=w_ground, w_a=w_air,
+                    lat_lim=lat_lim, lon_lim=lon_lim,
+                    MAX_INIT_ATTEMPTS=MAX_INIT_ATTEMPTS_stage1,
+                    min_inter_nodes=MIN_INTER_NODES_stage1,
+                    max_inter_nodes=MAX_INTER_NODES_stage1,
+                    is_initial_stage=True,
+                    W_half=W_half, ground_speed_mps=ground_speed_mps,
+                    bank_angle_deg=bank_angle_deg, min_turn_radius_m=min_turn_radius_m,
+                    check_corridor_nfz=check_corridor_nfz, check_turn_radius=check_turn_radius,
+                    check_heading_continuity=check_heading_continuity,
+                    prev_segment_heading=None  # 첫 세그먼트이므로 None
+                )
+                
+                # 반환값 처리 (하위 호환성)
+                if len(result_stage1) == 3:
+                    population_stage1, f_vals_stage1, heading_stage1 = result_stage1
+                else:
+                    population_stage1, f_vals_stage1 = result_stage1
+                    heading_stage1 = None
+                
+                # Select Initial Solutions
+                initial_solutions = []
+                if population_stage1 and f_vals_stage1.shape[0] > 0:
+                    num_obj = f_vals_stage1.shape[1]
+                    selected_indices = set()
+                    for i in range(num_obj):
+                        selected_indices.add(np.argmin(f_vals_stage1[:, i]))
+                    
+                    F = fast_non_dominated_sort(f_vals_stage1)
+                    if F and F[0]:
+                        front1 = F[0]
+                        remaining = [idx for idx in front1 if idx not in selected_indices]
+                        if remaining:
+                            norm_f = normalize_objectives(f_vals_stage1[remaining, :])
+                            best_bal = np.argmin(np.linalg.norm(norm_f, axis=1))
+                            selected_indices.add(remaining[best_bal])
+                    
+                    initial_solutions = [population_stage1[i] for i in selected_indices]
+                    print(f"  -> Selected {len(initial_solutions)} initial solutions from Stage 1.")
+                    
+                    if gx1:
+                        stage1_current_lines = plot_solutions(gx1, initial_solutions, ['m-'], 1.2, k+1, labels=["Init"])
+                        plt.pause(0.1)
+                
+                # ---------------------------------------------------------
+                # [Stage 2] Main Optimization (Grid Nodes)
+                # ---------------------------------------------------------
+                print(f"  -> Stage 2: Main Optimization")
+                if gx2:
+                    gx2.set_title(f'Stage 2: Valid Node {vn_idx+1} Optimization', size=16)
+                    if stage2_current_scatter is not None:
+                        stage2_current_scatter.remove()
+                        stage2_current_scatter = None
+                
+                # Generate nodes from valid node to p2
+                nodes_stage2, all_grid_nodes = generate_nodes_3d_segment(
+                    p1_vn, p2, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones
+                )
+                
+                # 안전 노드 필터링 (기존 로직)
+                half_all_nodes = all_grid_nodes.shape[0] // 2
+                base_target = int(max(MIN_SAFE_NODES_TARGET, half_all_nodes))
+                current_min_safe_nodes_target = min(base_target, nodes_stage2.shape[0])
+                
+                safe_nodes = nodes_stage2
+                if nodes_stage2.shape[0] > 0:
+                    node_lons, node_lats, node_alts = nodes_stage2[:, 1], nodes_stage2[:, 0], nodes_stage2[:, 2]
+                    I_nodes = ((node_lons - lon_lim[0]) / (lon_lim[1] - lon_lim[0]) * (Nx - 1)).astype(int)
+                    J_nodes = ((node_lats - lat_lim[0]) / (lat_lim[1] - lat_lim[0]) * (Ny - 1)).astype(int)
+                    alt_idx = np.argmin(np.abs(altitude_levels - node_alts[0]))
+                    
+                    avg_ground_risk_map = np.mean(Norm_RiskTensor[alt_idx, :, :, :], axis=0)
+                    air_risk_slice = AirRisk[:, :, alt_idx]
+                    air_risks_of_nodes = air_risk_slice[J_nodes, I_nodes]
+                    node_risks = air_risks_of_nodes
+                    
+                    current_threshold = 0.0
+                    for percentile in SAFE_NODE_PERCENTILE_LIST:
+                        risk_threshold = np.percentile(node_risks, percentile)
+                        current_threshold = risk_threshold
+                        safe_nodes = nodes_stage2[node_risks <= risk_threshold]
+                        if safe_nodes.shape[0] >= current_min_safe_nodes_target:
+                            break
+                    
+                    if safe_nodes.shape[0] == 0:
+                        safe_nodes = nodes_stage2
+                    
+                    # [추가] Stage 2 안전 노드 시각화
+                    if gx2 and safe_nodes.shape[0] > 0:
+                        s_lons, s_lats = safe_nodes[:, 1], safe_nodes[:, 0]
+                        s_I = ((s_lons - lon_lim[0]) / (lon_lim[1] - lon_lim[0]) * (Nx - 1)).astype(int)
+                        s_J = ((s_lats - lat_lim[0]) / (lat_lim[1] - lat_lim[0]) * (Ny - 1)).astype(int)
+                        s_I = np.clip(s_I, 0, Nx - 1)
+                        s_J = np.clip(s_J, 0, Ny - 1)
+                        s_risks = air_risk_slice[s_J, s_I]
+                        
+                        stage2_current_scatter = gx2.scatter(s_lons, s_lats, c=s_risks, cmap='jet', 
+                                                            vmin=0.0, vmax=1.0, s=10, alpha=0.5, 
+                                                            transform=ccrs.Geodetic(), zorder=3)
+                        
+                        if cbar2 is None:
+                            cbar2 = fig2.colorbar(stage2_current_scatter, ax=gx2, fraction=0.046, pad=0.04)
+                            cbar2.set_label('Risk Level')
+                        
+                        plt.pause(0.1)
+                
+                # Stage 2 최적화 수행 (회랑폭 그리기 비활성화 - 나중에 최종 선택된 것만 그림)
+                result_stage2 = run_nsga3_segment(
+                    nodes=safe_nodes, p1=p1_vn, p2=p2,
+                    Norm_RT=Norm_RiskTensor, AirRisk=AirRisk, use_map=use_heading_map,
+                    f_limit=flight_dist_limit, f_zones=forbidden_zones,
+                    Nmax=Nmax_stage2, N_pop=N_pop_stage2, ratio=offspring_ratio_stage2, H=H_ref_points_stage2,
+                    gx=gx2, alt=altitude_levels, cs=cell_size, scales=refine_scales,
+                    air_risk_threshold=current_threshold if 'current_threshold' in locals() else 0.0,
+                    dz=delta_z_max, w_d=w_dist, w_g=w_ground, w_a=w_air,
+                    lat_lim=lat_lim, lon_lim=lon_lim,
+                    MAX_INIT_ATTEMPTS=MAX_INIT_ATTEMPTS_stage2,
+                    min_inter_nodes=MIN_INTER_NODES_stage2,
+                    max_inter_nodes=MAX_INTER_NODES_stage2,
+                    is_initial_stage=False,
+                    initial_population=initial_solutions,
+                    W_half=W_half, ground_speed_mps=ground_speed_mps,
+                    bank_angle_deg=bank_angle_deg, min_turn_radius_m=min_turn_radius_m,
+                    check_corridor_nfz=check_corridor_nfz, check_turn_radius=check_turn_radius,
+                    check_heading_continuity=check_heading_continuity,
+                    prev_segment_heading=None,
+                    draw_final_corridor_width=False  # 버티포트 멀티스타트에서는 회랑폭 그리지 않음
+                )
+                
+                if len(result_stage2) == 3:
+                    population_stage2, f_vals_stage2, heading_stage2 = result_stage2
+                else:
+                    population_stage2, f_vals_stage2 = result_stage2
+                    heading_stage2 = None
+                
+                # 결과 저장 (Stage 1 초기해도 함께 저장)
+                vertiport_multistart_results.append({
+                    'valid_node': valid_node,
+                    'valid_node_idx': vn_idx,
+                    'population': population_stage2,
+                    'f_vals': f_vals_stage2,
+                    'final_heading': heading_stage2,
+                    'stage1_initial_solutions': initial_solutions  # Stage 1 초기해 저장
+                })
+                
+                print(f"  -> Completed optimization for Valid Node {vn_idx+1}")
+            
+            # 3. 모든 Valid Node 결과 중 가장 좋은 것 선택
+            print(f"\n--- Selecting Best Valid Node ---")
+            best_result = None
+            best_score = float('inf')
+            
+            for res in vertiport_multistart_results:
+                if res['population'] and res['f_vals'].shape[0] > 0:
+                    # 파레토 최전선 찾기
+                    F = fast_non_dominated_sort(res['f_vals'])
+                    if F and F[0]:
+                        front1_fvals = res['f_vals'][F[0], :]
+                        # 정규화된 거리로 균형해 찾기
+                        norm_f = normalize_objectives(front1_fvals)
+                        balanced_idx = F[0][np.argmin(np.linalg.norm(norm_f, axis=1))]
+                        score = np.linalg.norm(norm_f[np.argmin(np.linalg.norm(norm_f, axis=1)), :])
+                        
+                        if score < best_score:
+                            best_score = score
+                            best_result = res
+                            best_vertiport_node = res['valid_node']
+            
+            if best_result is None:
+                print("  ERROR: All valid nodes failed optimization. Falling back to vertiport.")
+                best_vertiport_node = vertiport
+                representative_paths_final.append([])
+                continue
+            
+            print(f"  -> Best Valid Node: Index {best_result['valid_node_idx']}, Position: {best_vertiport_node}")
+            
+            # 4. 선택된 결과에서 대표 경로 추출 및 저장
+            population_stage2 = best_result['population']
+            f_vals_stage2 = best_result['f_vals']
+            final_heading = best_result['final_heading']
+            
+            # 대표 경로 저장
+            if population_stage2 and f_vals_stage2.shape[0] > 0:
+                num_obj = f_vals_stage2.shape[1]
+                rep_paths = []
+                # 각 목표에 대해 최적해 선택
+                for i in range(num_obj):
+                    rep_paths.append(population_stage2[np.argmin(f_vals_stage2[:, i])])
+                
+                # 파레토 최전선에서 균형해 선택
+                F = fast_non_dominated_sort(f_vals_stage2)
+                if F and F[0]:
+                    front1 = F[0]
+                    norm_f = normalize_objectives(f_vals_stage2[front1, :])
+                    balanced_idx = front1[np.argmin(np.linalg.norm(norm_f, axis=1))]
+                    rep_paths.append(population_stage2[balanced_idx])
+                else:
+                    rep_paths.append(rep_paths[0])
+                
+                representative_paths_final.append(rep_paths)
+                
+                # 헤딩 업데이트
+                if final_heading is not None:
+                    segment_headings.append(final_heading)
+                    prev_heading = final_heading
+                
+                # 시각화
+                if gx2:
+                    styles = ['r-', 'b-', 'g-', 'm-']
+                    labels = [f'{name} Min' for name in objective_names[:num_obj]] + ['Balanced']
+                    plot_solutions(gx2, rep_paths, styles, 1.2, k+1, labels=labels)
+                    
+                    # [추가] Balanced 해에만 회랑폭 표시
+                    balanced_path = rep_paths[-1]  # 마지막이 Balanced 해
+                    if balanced_path.shape[0] >= 2:
+                        mean_lat_rad = np.deg2rad(np.mean(balanced_path[:, 0]))
+                        meters_per_lat_deg = 111000
+                        meters_per_lon_deg = 111000 * np.cos(mean_lat_rad)
+                        W_half_lat = W_half / meters_per_lat_deg
+                        W_half_lon = W_half / meters_per_lon_deg
+                        
+                        left_points = []
+                        right_points = []
+                        
+                        for i in range(len(balanced_path)):
+                            if i == 0:
+                                vec = np.array([balanced_path[1, 0] - balanced_path[0, 0], balanced_path[1, 1] - balanced_path[0, 1]])
+                            elif i == len(balanced_path) - 1:
+                                vec = np.array([balanced_path[-1, 0] - balanced_path[-2, 0], balanced_path[-1, 1] - balanced_path[-2, 1]])
+                            else:
+                                vec = np.array([balanced_path[i+1, 0] - balanced_path[i-1, 0], balanced_path[i+1, 1] - balanced_path[i-1, 1]])
+                            
+                            norm = np.linalg.norm(vec)
+                            if norm < 1e-10:
+                                continue
+                            
+                            perp = np.array([-vec[1], vec[0]]) / norm
+                            offset_lat = perp[0] * W_half_lat
+                            offset_lon = perp[1] * W_half_lon
+                            
+                            left_points.append([balanced_path[i, 1] + offset_lon, balanced_path[i, 0] + offset_lat])
+                            right_points.append([balanced_path[i, 1] - offset_lon, balanced_path[i, 0] - offset_lat])
+                        
+                        if len(left_points) >= 2:
+                            left_arr = np.array(left_points)
+                            right_arr = np.array(right_points)
+                            
+                            # 점선으로 회랑폭 경계 표시
+                            gx2.plot(left_arr[:, 0], left_arr[:, 1], ':', 
+                                   color=[0.8, 0.6, 0.0, 0.7], linewidth=1.0, 
+                                   transform=ccrs.Geodetic(), zorder=15, label='_nolegend_')
+                            gx2.plot(right_arr[:, 0], right_arr[:, 1], ':', 
+                                   color=[0.8, 0.6, 0.0, 0.7], linewidth=1.0, 
+                                   transform=ccrs.Geodetic(), zorder=15, label='_nolegend_')
+                    
+                    gx2.legend(loc='upper right', bbox_to_anchor=(-0.1, 1), borderaxespad=0.)
+                    plt.pause(1)
+            else:
+                representative_paths_final.append([])
+            
+            # p1을 선택된 valid node로 업데이트 (다음 세그먼트를 위해)
+            p1 = best_vertiport_node
+            
+            # [수정] 선택된 Valid Node의 Stage 1 초기해를 이력에 저장
+            if 'stage1_initial_solutions' in best_result and best_result['stage1_initial_solutions']:
+                all_stage1_solutions_history.append(best_result['stage1_initial_solutions'])
+                print(f"  -> Saved {len(best_result['stage1_initial_solutions'])} Stage 1 solutions for final visualization.")
+            else:
+                all_stage1_solutions_history.append([])
+            
+            # 다음 세그먼트로 이동 (일반 Stage 1/2 스킵)
+            continue
+            
+        else:
+            # [기존 로직] 버티포트가 아닌 일반 세그먼트 또는 멀티스타트 비활성화
+            pass
 
         # ---------------------------------------------------------
         # [Stage 1] Initial Solution Finding (Emergency Points)
@@ -613,7 +1292,7 @@ def main():
         
         nodes_stage1 = emergency_points
         
-        population_stage1, f_vals_stage1 = run_nsga3_segment(
+        result_stage1 = run_nsga3_segment(
             nodes=nodes_stage1, p1=p1, p2=p2,
             Norm_RT=Norm_RiskTensor, AirRisk=AirRisk, use_map=use_heading_map,
             f_limit=flight_dist_limit, f_zones=forbidden_zones,
@@ -622,11 +1301,23 @@ def main():
             air_risk_threshold=1.0, # 1단계에서는 모든 비상착륙장을 고려하므로 임계값 0
             dz=delta_z_max, w_d=w_dist, w_g=w_ground, w_a=w_air,
             lat_lim=lat_lim, lon_lim=lon_lim,
-            MAX_INIT_ATTEMPTS=5, 
+            MAX_INIT_ATTEMPTS=MAX_INIT_ATTEMPTS_stage1, 
             min_inter_nodes=MIN_INTER_NODES_stage1, 
             max_inter_nodes=MAX_INTER_NODES_stage1,
-            is_initial_stage=True # 초기 단계임을 명시
+            is_initial_stage=True, # 초기 단계임을 명시
+            W_half=W_half, ground_speed_mps=ground_speed_mps,
+            bank_angle_deg=bank_angle_deg, min_turn_radius_m=min_turn_radius_m,
+            check_corridor_nfz=check_corridor_nfz, check_turn_radius=check_turn_radius,
+            check_heading_continuity=check_heading_continuity,
+            prev_segment_heading=prev_heading
         )
+        
+        # 반환값 처리 (하위 호환성)
+        if len(result_stage1) == 3:
+            population_stage1, f_vals_stage1, heading_stage1 = result_stage1
+        else:
+            population_stage1, f_vals_stage1 = result_stage1
+            heading_stage1 = None
 
         # Select Initial Solutions
         # [설명] Stage 1에서 찾은 해들 중 우수한 해들을 선택하여 Stage 2의 초기 해로 사용합니다.
@@ -772,7 +1463,7 @@ def main():
 
         # 2-3. Run Optimization
         # [설명] Stage 2 최적화 실행
-        population_stage2, f_vals_stage2 = run_nsga3_segment(
+        result_stage2 = run_nsga3_segment(
             nodes=safe_nodes, p1=p1, p2=p2,
             Norm_RT=Norm_RiskTensor, AirRisk=AirRisk, use_map=use_heading_map,
             f_limit=flight_dist_limit, f_zones=forbidden_zones,
@@ -785,8 +1476,20 @@ def main():
             min_inter_nodes=MIN_INTER_NODES_stage2,
             max_inter_nodes=MAX_INTER_NODES_stage2,
             is_initial_stage=False, # [중요] 메인 단계
-            initial_population=initial_solutions # [중요] Stage 1 결과 주입
+            initial_population=initial_solutions, # [중요] Stage 1 결과 주입
+            W_half=W_half, ground_speed_mps=ground_speed_mps,
+            bank_angle_deg=bank_angle_deg, min_turn_radius_m=min_turn_radius_m,
+            check_corridor_nfz=check_corridor_nfz, check_turn_radius=check_turn_radius,
+            check_heading_continuity=check_heading_continuity,
+            prev_segment_heading=prev_heading
         )
+        
+        # 반환값 처리 (하위 호환성)
+        if len(result_stage2) == 3:
+            population_stage2, f_vals_stage2, heading_stage2 = result_stage2
+        else:
+            population_stage2, f_vals_stage2 = result_stage2
+            heading_stage2 = None
 
         # 2-4. 최종 결과 저장 및 시각화
         # [설명] Stage 2 결과 중 대표 해(각 목표별 최적해 + 균형해)를 선택하여 저장합니다.
@@ -808,11 +1511,60 @@ def main():
                 rep_paths.append(rep_paths[0])
 
             representative_paths_final.append(rep_paths)
+            
+            # [추가] 헤딩 업데이트
+            if heading_stage2 is not None:
+                segment_headings.append(heading_stage2)
+                prev_heading = heading_stage2
 
             if gx2:
                 styles = ['r-', 'b-', 'g-', 'm-']
                 labels = [f'{name} Min' for name in objective_names[:num_obj]] + ['Balanced']
                 plot_solutions(gx2, rep_paths, styles, 1.2, k+1, labels=labels)
+                
+                # [추가] Balanced 해에만 회랑폭 표시
+                balanced_path = rep_paths[-1]  # 마지막이 Balanced 해
+                if balanced_path.shape[0] >= 2:
+                    mean_lat_rad = np.deg2rad(np.mean(balanced_path[:, 0]))
+                    meters_per_lat_deg = 111000
+                    meters_per_lon_deg = 111000 * np.cos(mean_lat_rad)
+                    W_half_lat = W_half / meters_per_lat_deg
+                    W_half_lon = W_half / meters_per_lon_deg
+                    
+                    left_points = []
+                    right_points = []
+                    
+                    for i in range(len(balanced_path)):
+                        if i == 0:
+                            vec = np.array([balanced_path[1, 0] - balanced_path[0, 0], balanced_path[1, 1] - balanced_path[0, 1]])
+                        elif i == len(balanced_path) - 1:
+                            vec = np.array([balanced_path[-1, 0] - balanced_path[-2, 0], balanced_path[-1, 1] - balanced_path[-2, 1]])
+                        else:
+                            vec = np.array([balanced_path[i+1, 0] - balanced_path[i-1, 0], balanced_path[i+1, 1] - balanced_path[i-1, 1]])
+                        
+                        norm = np.linalg.norm(vec)
+                        if norm < 1e-10:
+                            continue
+                        
+                        perp = np.array([-vec[1], vec[0]]) / norm
+                        offset_lat = perp[0] * W_half_lat
+                        offset_lon = perp[1] * W_half_lon
+                        
+                        left_points.append([balanced_path[i, 1] + offset_lon, balanced_path[i, 0] + offset_lat])
+                        right_points.append([balanced_path[i, 1] - offset_lon, balanced_path[i, 0] - offset_lat])
+                    
+                    if len(left_points) >= 2:
+                        left_arr = np.array(left_points)
+                        right_arr = np.array(right_points)
+                        
+                        # 점선으로 회랑폭 경계 표시
+                        gx2.plot(left_arr[:, 0], left_arr[:, 1], ':', 
+                               color=[0.8, 0.6, 0.0, 0.7], linewidth=1.0, 
+                               transform=ccrs.Geodetic(), zorder=15, label='_nolegend_')
+                        gx2.plot(right_arr[:, 0], right_arr[:, 1], ':', 
+                               color=[0.8, 0.6, 0.0, 0.7], linewidth=1.0, 
+                               transform=ccrs.Geodetic(), zorder=15, label='_nolegend_')
+                
                 gx2.legend(loc='upper right', bbox_to_anchor=(-0.1, 1), borderaxespad=0.)
                 plt.pause(1)
         else:
@@ -870,9 +1622,20 @@ def main():
         styles = ['r-', 'b-', 'g-', 'm-']
         labels = [f'Overall {name} Min' for name in objective_names] + ['Overall Balanced']
         
+        # [추가] 회랑폭 시각화를 위한 리스트
+        corridor_polygons = []
+        
         for i, route in enumerate(final_routes):
             if route.shape[0] > 0:
+                # 경로 그리기
                 gx2.plot(route[:, 1], route[:, 0], styles[i % len(styles)], linewidth=1.2, transform=ccrs.Geodetic(), label=labels[i], zorder=20)
+                
+                # [추가] 회랑폭 시각화 (파레토 최전선 경로에만 적용)
+                # 여기서는 균형해 (마지막 경로)에 회랑폭 시각화
+                if i == len(final_routes) - 1:  # 균형해 (Balanced solution)
+                    poly = plot_corridor_width(gx2, route, W_half, color='yellow', alpha=0.15, lat_lim=lat_lim, lon_lim=lon_lim)
+                    if poly is not None:
+                        corridor_polygons.append(poly)
 
         handles, labels = gx2.get_legend_handles_labels()
         unique_labels = {}
@@ -881,6 +1644,15 @@ def main():
                 unique_labels[label] = handle
         gx2.legend(unique_labels.values(), unique_labels.keys(), loc='upper right', bbox_to_anchor=(-0.1, 1), borderaxespad=0.)
         print('Figure 2: Final results displayed.')
+        
+        # [추가] Waypoint 표시 (균형해 기준)
+        if len(final_routes) > 0 and final_routes[-1].shape[0] > 0:
+            balanced_route = final_routes[-1]
+            # Waypoint를 다이아몬드 마커로 표시
+            gx2.scatter(balanced_route[:, 1], balanced_route[:, 0], s=10, c='orange', 
+                       marker='D', edgecolors='black', linewidths=1.5, 
+                       transform=ccrs.Geodetic(), label='Waypoints', zorder=25)
+        
         plt.ioff()
         plt.show()
 
