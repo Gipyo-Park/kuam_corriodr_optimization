@@ -27,70 +27,115 @@ from evaluate_objectives_with_constraints_GP import evaluate_objectives_with_con
 # Local functions for MAIN script
 # =============================================================================
 
-def generate_valid_nodes_near_vertiport(vertiport, num_nodes, search_radius_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones):
+def generate_valid_nodes_near_vertiport(vertiport, target_altitude, takeoff_landing_angle_deg, 
+                                         sector_angle_deg, num_available_sectors, 
+                                         lat_lim, lon_lim, Ny, Nx, forbidden_zones):
     """
-    버티포트 중심으로 MOC(Minimum Obstacle Clearance) 기준으로 이착륙 가능한
-    Valid Nodes를 랜덤으로 생성합니다.
-    (추후 경운대에서 제공할 실제 Valid Nodes로 대체 가능)
+    버티포트 중심으로 이착륙 각도 기반 섹터 방식으로 멀티스타트 노드를 생성합니다.
+    
+    로직:
+    1. 이착륙 각도로부터 거리 계산: d = target_altitude / tan(angle)
+    2. 360도를 sector_angle_deg 단위로 분할 (예: 30도 → 12개 섹터)
+    3. 랜덤하게 num_available_sectors개 선택 (비행 가능 영역)
+    4. 각 섹터의 중간 각도에서 노드 생성 (호의 중간점)
+    5. NFZ 검사하여 금지구역 내 노드 제외
     
     Args:
         vertiport: 버티포트 위치 [lat, lon, alt]
-        num_nodes: 생성할 노드 개수
-        search_radius_m: 탐색 반경 (미터)
+        target_altitude: 목표 고도 (미터)
+        takeoff_landing_angle_deg: 이착륙 각도 (도)
+        sector_angle_deg: 섹터 분할 각도 (도) - 예: 30도면 12개 섹터
+        num_available_sectors: 선택할 비행 가능 섹터 수
         lat_lim, lon_lim: 지도 범위
         Ny, Nx: 지도 그리드 크기
         forbidden_zones: 금지 구역 정보
     
     Returns:
-        valid_nodes: 생성된 유효 노드들 [N x 3]
+        valid_nodes: 생성된 유효 노드들 [N x 3] (각 섹터의 중간점)
     """
-    print(f"  -> Generating {num_nodes} valid nodes near vertiport (radius: {search_radius_m}m)...")
+    print(f"  -> Generating sector-based takeoff/landing nodes...")
+    print(f"     Takeoff/Landing Angle: {takeoff_landing_angle_deg}°")
+    print(f"     Target Altitude: {target_altitude}m")
+    print(f"     Sector Division: {sector_angle_deg}° per sector")
     
-    # 위경도 -> 미터 변환 스케일
+    # 1. 이착륙 각도로부터 수평 거리 계산
+    angle_rad = np.deg2rad(takeoff_landing_angle_deg)
+    if np.abs(np.tan(angle_rad)) < 1e-6:
+        print("  -> Warning: Takeoff angle too small, using default 500m radius")
+        horizontal_distance_m = 500.0
+    else:
+        horizontal_distance_m = target_altitude / np.tan(angle_rad)
+    
+    print(f"     Horizontal Distance (d): {horizontal_distance_m:.1f}m")
+    
+    # 2. 위경도 -> 미터 변환 스케일
     mean_lat_rad = np.deg2rad(vertiport[0])
     meters_per_lat_deg = 111000
     meters_per_lon_deg = 111000 * np.cos(mean_lat_rad)
     
-    # 미터 -> 위경도 변환
-    search_radius_lat = search_radius_m / meters_per_lat_deg
-    search_radius_lon = search_radius_m / meters_per_lon_deg
+    # 3. 전체 섹터 개수 계산
+    num_total_sectors = int(360 / sector_angle_deg)
+    print(f"     Total Sectors: {num_total_sectors}")
     
+    # 4. 랜덤하게 비행 가능 섹터 선택
+    if num_available_sectors > num_total_sectors:
+        num_available_sectors = num_total_sectors
+        print(f"     Warning: num_available_sectors exceeds total sectors, using {num_total_sectors}")
+    
+    all_sector_indices = list(range(num_total_sectors))
+    selected_sector_indices = np.random.choice(all_sector_indices, 
+                                               size=num_available_sectors, 
+                                               replace=False)
+    
+    print(f"     Selected {num_available_sectors} sectors (indices): {sorted(selected_sector_indices)}")
+    
+    # 5. 각 섹터의 중간점에서 노드 생성
     valid_nodes = []
-    max_attempts = num_nodes * 100  # 최대 시도 횟수
     
-    for attempt in range(max_attempts):
-        if len(valid_nodes) >= num_nodes:
-            break
-            
-        # 랜덤한 거리와 각도로 노드 생성
-        angle = np.random.uniform(0, 2 * np.pi)
-        distance_ratio = np.sqrt(np.random.uniform(0, 1))  # 균등 분포를 위한 sqrt
+    for sector_idx in selected_sector_indices:
+        # 섹터의 시작 각도와 끝 각도
+        start_angle_deg = sector_idx * sector_angle_deg
+        end_angle_deg = start_angle_deg + sector_angle_deg
         
-        dlat = search_radius_lat * distance_ratio * np.sin(angle)
-        dlon = search_radius_lon * distance_ratio * np.cos(angle)
+        # 섹터의 중간 각도 (호의 중간점)
+        mid_angle_deg = (start_angle_deg + end_angle_deg) / 2.0
+        mid_angle_rad = np.deg2rad(mid_angle_deg)
         
-        node_lat = vertiport[0] + dlat
-        node_lon = vertiport[1] + dlon
-        node_alt = vertiport[2]
+        # 극좌표 -> 직교좌표 변환 (북쪽이 0도, 시계방향)
+        # 지리 좌표계: 북쪽 0도 기준, 시계방향
+        offset_lat_deg = (horizontal_distance_m / meters_per_lat_deg) * np.cos(mid_angle_rad)
+        offset_lon_deg = (horizontal_distance_m / meters_per_lon_deg) * np.sin(mid_angle_rad)
         
-        # 지도 범위 체크
-        if not (lat_lim[0] <= node_lat <= lat_lim[1] and lon_lim[0] <= node_lon <= lon_lim[1]):
+        candidate_lat = vertiport[0] + offset_lat_deg
+        candidate_lon = vertiport[1] + offset_lon_deg
+        candidate_alt = target_altitude  # 목표 고도로 설정
+        
+        # 지도 범위 내부 검사
+        if not (lat_lim[0] <= candidate_lat <= lat_lim[1] and 
+                lon_lim[0] <= candidate_lon <= lon_lim[1]):
+            print(f"       Sector {sector_idx} ({start_angle_deg}°-{end_angle_deg}°): Out of bounds, skipped")
             continue
         
-        # NFZ 체크
+        # NFZ 검사
         is_in_nfz = False
         if forbidden_zones is not None and forbidden_zones.shape[0] > 0:
-            for rect in forbidden_zones:
-                min_lon, max_lon, min_lat, max_lat = rect
-                if (min_lon <= node_lon <= max_lon) and (min_lat <= node_lat <= max_lat):
+            for fz in forbidden_zones:
+                min_lon, max_lon, min_lat, max_lat = fz
+                if (min_lon <= candidate_lon <= max_lon and 
+                    min_lat <= candidate_lat <= max_lat):
                     is_in_nfz = True
                     break
         
-        if not is_in_nfz:
-            valid_nodes.append([node_lat, node_lon, node_alt])
+        if is_in_nfz:
+            print(f"       Sector {sector_idx} ({start_angle_deg}°-{end_angle_deg}°): In NFZ, skipped")
+            continue
+        
+        # 유효 노드 추가
+        valid_nodes.append([candidate_lat, candidate_lon, candidate_alt])
+        print(f"       Sector {sector_idx} ({start_angle_deg}°-{end_angle_deg}°, mid={mid_angle_deg:.1f}°): Node added at ({candidate_lat:.6f}, {candidate_lon:.6f}, {candidate_alt}m)")
     
     result = np.array(valid_nodes) if valid_nodes else np.empty((0, 3))
-    print(f"  -> Generated {result.shape[0]} valid nodes.")
+    print(f"  -> Generated {result.shape[0]} valid sector-based nodes (out of {num_available_sectors} selected sectors)")
     return result
 
 
@@ -429,8 +474,8 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
     num_objectives = len(temp_f_val)
     
     # [수정] 사용자 요청: 목표 개수에 따라 H값 동적 설정 (H = 목표 개수 + 1)
-    H = num_objectives + 1
-    print(f"Running NSGA-III with {num_objectives} objectives. Setting H = {H}.")
+    # H = num_objectives + 1
+    # print(f"Running NSGA-III with {num_objectives} objectives. Setting H = {H}.")
     
     # 목표 개수에 맞는 참조점 생성
     ref_points = generate_reference_points(num_objectives, H)
@@ -606,7 +651,7 @@ def run_nsga3_segment(nodes, p1, p2, Norm_RT, AirRisk, use_map, f_limit, f_zones
                                     h_paths.append(line_l)
                                     h_paths.append(line_r)
             
-            plt.pause(5) # 여기를 수정하면 plot이 천천히 된다
+            plt.pause(1) # 여기를 수정하면 plot이 천천히 된다
             
         # 환경 선택 (Selection): 우수한 해 선택
         new_pop = selection_nsga3(population, f_vals, feasible, N_pop, ref_points)
@@ -749,10 +794,13 @@ def main():
     check_heading_continuity = False  # 헤딩 연속성 검사 활성화 (True=활성화, False=비활성화)
     max_heading_diff_deg = 10.0  # 세그먼트 연결점 헤딩 최대 차이 (도)
     
-    # ===== 버티포트 Valid Nodes 생성 파라미터 =====
-    NUM_VALID_NODES = 2  # 생성할 valid nodes 개수 (추후 경운대에서 제공될 예정)
-    VALID_NODE_SEARCH_RADIUS_M = 500.0  # 버티포트 중심으로부터 탐색 반경 (미터)
+    # ===== 버티포트 이착륙 섹터 기반 멀티스타트 파라미터 =====
     ENABLE_VERTIPORT_MULTISTART = True  # 버티포트 멀티스타트 최적화 활성화 (첫 세그먼트에만 적용)
+    TAKEOFF_LANDING_ANGLE_DEG = 25.0  # 이착륙 각도 (도) - 기본값 8도
+    SECTOR_ANGLE_DEG = 30.0  # 섹터 분할 각도 (도) - 예: 30도면 12개 섹터, 45도면 8개 섹터
+    NUM_AVAILABLE_SECTORS = 1  # 선택할 비행 가능 섹터 수 (랜덤 선택)
+    TARGET_ALTITUDE = 500  # 목표 고도 (m) - 버티포트 이착륙 시나리오용
+    
     
     # [수정] 2단계 최적화 파라미터 분리
     # --- Stage 1: Initial Solution Finding ---
@@ -761,7 +809,7 @@ def main():
     N_pop_stage1 = 50          # 인구 크기 (해 집단 크기)
     Nmax_stage1 = 100          # 최대 세대 수 (반복 횟수)
     offspring_ratio_stage1 = 1.0 # 자식 해 생성 비율
-    H_ref_points_stage1 = 4   # 참조점 생성 파라미터 (3개 목표에 대해)
+    H_ref_points_stage1 = 10   # 참조점 생성 파라미터 (3개 목표에 대해)
     MIN_INTER_NODES_stage1 = 1 # 비상착륙장 중 최소 1개 경유
     MAX_INTER_NODES_stage1 = 5 # 비상착륙장 중 최대 3개 경유
     MAX_INIT_ATTEMPTS_stage1 = 100 # 초기 해 생성 최대 시도 횟수 (비상착륙장 랜덤 샘플링)
@@ -798,7 +846,7 @@ def main():
     Nmax_stage2 = 100         # 최대 세대 수
     N_pop_stage2 = 50         # 인구 크기
     offspring_ratio_stage2 = 2.0 # 자식 해 생성 비율
-    H_ref_points_stage2 = 4   # 참조점 생성 파라미터
+    H_ref_points_stage2 = 10   # 참조점 생성 파라미터
     flight_dist_limit = 100.0 # (사용되지 않음) 비행 거리 제한
     objective_names = ["Distance", "Ground Risk", "Air Risk"] # [추가] 시각화를 위한 목표 이름
 
@@ -955,11 +1003,12 @@ def main():
         # [추가] 버티포트 멀티스타트 로직 (첫 번째 세그먼트에만 적용)
         if k == 0 and ENABLE_VERTIPORT_MULTISTART:
             print(f"\n*** VERTIPORT MULTI-START MODE (Segment 1) ***")
-            print(f"Generating {NUM_VALID_NODES} valid nodes near vertiport...")
+            print(f"Using sector-based takeoff/landing node generation...")
             
-            # 1. 버티포트 주변 Valid Nodes 생성
+            # 1. 버티포트 주변 섹터 기반 Valid Nodes 생성
             valid_nodes = generate_valid_nodes_near_vertiport(
-                vertiport, NUM_VALID_NODES, VALID_NODE_SEARCH_RADIUS_M,
+                vertiport, TARGET_ALTITUDE, TAKEOFF_LANDING_ANGLE_DEG,
+                SECTOR_ANGLE_DEG, NUM_AVAILABLE_SECTORS,
                 lat_lim, lon_lim, Ny, Nx, forbidden_zones
             )
             
@@ -1652,7 +1701,169 @@ def main():
             gx2.scatter(balanced_route[:, 1], balanced_route[:, 0], s=10, c='orange', 
                        marker='D', edgecolors='black', linewidths=1.5, 
                        transform=ccrs.Geodetic(), label='Waypoints', zorder=25)
+    
+    # =============================================================================
+    # [추가] Waypoint 정보 저장 (CSV)
+    # =============================================================================
+    print('\n========================================')
+    print('SAVING OPTIMAL WAYPOINTS TO CSV')
+    print('========================================\n')
+    
+    import csv
+    from datetime import datetime
+    
+    # CSV 파일 이름
+    csv_filename = 'optimal_waypoints.csv'
+    
+    # 3가지 대표 솔루션 정의
+    solution_types = ['Balanced', 'Distance-Optimal', 'Ground-Risk-Optimal', 'Air-Risk-Optimal']
+    
+    # CSV 헤더
+    csv_header = [
+        'SolutionType', 'SegmentID', 'WaypointID', 
+        'Latitude', 'Longitude', 'Altitude_m',
+        'SegmentDistance_m', 'CumulativeDist_km',
+        'LocalGroundRisk', 'LocalAirRisk',
+        'CumulGroundRisk', 'CumulAirRisk'
+    ]
+    
+    # CSV 데이터 저장용 리스트
+    csv_rows = []
+    
+    # 콘솔 출력 시작
+    print('[OPTIMAL WAYPOINTS]\n')
+    
+    # 각 솔루션별로 처리
+    for sol_idx, route in enumerate(final_routes):
+        if route.shape[0] == 0:
+            continue
         
+        solution_name = solution_types[sol_idx] if sol_idx < len(solution_types) else f'Solution-{sol_idx+1}'
+        
+        print(f'--- {solution_name} ---')
+        
+        # 누적 거리 및 위험도 계산
+        cumulative_dist_km = 0.0
+        cumul_ground_risk = 0.0
+        cumul_air_risk = 0.0
+        
+        # 각 waypoint별로 처리
+        global_waypoint_id = 1
+        
+        # 세그먼트 구분을 위해 representative_paths_final에서 정보 가져오기
+        segment_boundaries = []
+        cumulative_waypoints = 0
+        for seg_paths in representative_paths_final:
+            if seg_paths and sol_idx < len(seg_paths) and seg_paths[sol_idx] is not None:
+                num_waypoints = seg_paths[sol_idx].shape[0]
+                segment_boundaries.append((cumulative_waypoints, cumulative_waypoints + num_waypoints))
+                cumulative_waypoints += num_waypoints
+        
+        for wp_idx in range(route.shape[0]):
+            lat, lon, alt = route[wp_idx]
+            
+            # 현재 waypoint가 속한 세그먼트 찾기
+            current_segment = 1
+            for seg_idx, (start, end) in enumerate(segment_boundaries):
+                if start <= wp_idx < end:
+                    current_segment = seg_idx + 1
+                    break
+            
+            # 세그먼트 거리 계산 (이전 waypoint로부터)
+            if wp_idx == 0:
+                segment_distance_m = 0.0
+            else:
+                prev_lat, prev_lon, prev_alt = route[wp_idx - 1]
+                # 3D 거리 계산
+                dlat = (lat - prev_lat) * 111000  # 위도 차이 (m)
+                dlon = (lon - prev_lon) * 111000 * np.cos(np.deg2rad((lat + prev_lat) / 2))  # 경도 차이 (m)
+                dalt = alt - prev_alt  # 고도 차이 (m)
+                segment_distance_m = np.sqrt(dlat**2 + dlon**2 + dalt**2)
+                cumulative_dist_km += segment_distance_m / 1000.0
+            
+            # 지상/공중 위험도 (간단히 위치에서 보간)
+            # 실제 값은 evaluate_objectives_gp에서 계산된 값 사용 가능
+            # 여기서는 근사값으로 맵에서 직접 추출
+            try:
+                minLat, maxLat = lat_lim
+                minLon, maxLon = lon_lim
+                Ny, Nx = Norm_RiskTensor.shape[2], Norm_RiskTensor.shape[3]
+                
+                # 위경도 -> 그리드 인덱스
+                i_grid = int((lon - minLon) / (maxLon - minLon) * (Nx - 1))
+                j_grid = int((lat - minLat) / (maxLat - minLat) * (Ny - 1))
+                
+                # 범위 체크
+                i_grid = max(0, min(Nx - 1, i_grid))
+                j_grid = max(0, min(Ny - 1, j_grid))
+                
+                # 고도 인덱스
+                alt_idx = np.argmin(np.abs(altitude_levels - alt))
+                
+                # 지상 위험도 (헤딩 인덱스 0 사용)
+                local_ground_risk = float(Norm_RiskTensor[alt_idx, 0, j_grid, i_grid])
+                
+                # 공중 위험도
+                local_air_risk = float(AirRisk[j_grid, i_grid, alt_idx])
+                
+                # 누적 위험도 (간단히 평균으로 근사)
+                if wp_idx > 0:
+                    cumul_ground_risk += local_ground_risk
+                    cumul_air_risk += local_air_risk
+                
+            except Exception as e:
+                local_ground_risk = 0.0
+                local_air_risk = 0.0
+            
+            # CSV 행 추가
+            csv_rows.append([
+                solution_name,
+                current_segment,
+                global_waypoint_id,
+                f'{lat:.6f}',
+                f'{lon:.6f}',
+                f'{alt:.1f}',
+                f'{segment_distance_m:.2f}',
+                f'{cumulative_dist_km:.4f}',
+                f'{local_ground_risk:.6f}',
+                f'{local_air_risk:.6f}',
+                f'{cumul_ground_risk:.6f}',
+                f'{cumul_air_risk:.6f}'
+            ])
+            
+            # 콘솔 출력 (처음 3개와 마지막만)
+            if wp_idx < 3 or wp_idx == route.shape[0] - 1:
+                print(f'  Waypoint {global_waypoint_id:3d} [Seg {current_segment}]: '
+                      f'Lat={lat:10.6f}, Lon={lon:10.6f}, Alt={alt:6.1f}m | '
+                      f'Dist={segment_distance_m:7.1f}m | CumDist={cumulative_dist_km:6.2f}km')
+            elif wp_idx == 3:
+                print(f'  ... ({route.shape[0] - 4} more waypoints) ...')
+            
+            global_waypoint_id += 1
+        
+        # 솔루션 총합 출력
+        print(f'  Total: {route.shape[0]} waypoints | '
+              f'Distance: {cumulative_dist_km:.2f} km | '
+              f'Ground Risk: {cumul_ground_risk:.4f} | '
+              f'Air Risk: {cumul_air_risk:.4f}\n')
+    
+    # CSV 파일 저장
+    try:
+        with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(csv_header)
+            writer.writerows(csv_rows)
+        
+        print(f'✓ Waypoints saved to: {csv_filename}')
+        print(f'  Total rows: {len(csv_rows)} waypoints')
+        print('========================================\n')
+    except Exception as e:
+        print(f'✗ Error saving CSV: {e}\n')
+
+    # =============================================================================
+    # Plot 표시 (CSV 저장 후)
+    # =============================================================================
+    if gx2:
         plt.ioff()
         plt.show()
 
