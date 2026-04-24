@@ -1,0 +1,927 @@
+import numpy as np
+import pickle
+from tqdm import tqdm
+
+from crossover_GP import crossover_gp
+from mutation_GP import mutation_gp
+from fast_non_dominated_sort import fast_non_dominated_sort
+from generate_initial_population_GP import generate_initial_population_gp
+from generate_reference_points import generate_reference_points
+from normalize_objectives import normalize_objectives
+from niching_selection import niching_selection
+from evaluate_objectives_with_constraints_GP import evaluate_objectives_with_constraints_gp
+
+
+def generate_valid_nodes_near_vertiport(vertiport, num_nodes, search_radius_m, lat_lim, lon_lim, forbidden_zones):
+    mean_lat_rad = np.deg2rad(vertiport[0])
+    meters_per_lat_deg = 111000.0
+    meters_per_lon_deg = 111000.0 * np.cos(mean_lat_rad)
+
+    search_radius_lat = search_radius_m / meters_per_lat_deg
+    search_radius_lon = search_radius_m / meters_per_lon_deg
+
+    valid_nodes = []
+    max_attempts = int(num_nodes * 200)
+
+    for _ in range(max_attempts):
+        if len(valid_nodes) >= num_nodes:
+            break
+
+        angle = np.random.uniform(0.0, 2.0 * np.pi)
+        distance_ratio = np.sqrt(np.random.uniform(0.0, 1.0))
+
+        dlat = search_radius_lat * distance_ratio * np.sin(angle)
+        dlon = search_radius_lon * distance_ratio * np.cos(angle)
+
+        node_lat = vertiport[0] + dlat
+        node_lon = vertiport[1] + dlon
+        node_alt = vertiport[2]
+
+        if not (lat_lim[0] <= node_lat <= lat_lim[1] and lon_lim[0] <= node_lon <= lon_lim[1]):
+            continue
+
+        is_in_nfz = False
+        if forbidden_zones is not None and forbidden_zones.size > 0:
+            for rect in forbidden_zones:
+                min_lon, max_lon, min_lat, max_lat = rect
+                if (min_lon <= node_lon <= max_lon) and (min_lat <= node_lat <= max_lat):
+                    is_in_nfz = True
+                    break
+
+        if not is_in_nfz:
+            valid_nodes.append([node_lat, node_lon, node_alt])
+
+    if valid_nodes:
+        return np.array(valid_nodes)
+    return np.empty((0, 3))
+
+
+def generate_nodes_3d_segment(p1, p2, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones):
+    minLat, maxLat = lat_lim
+    minLon, maxLon = lon_lim
+    dLat_deg = (maxLat - minLat) / (Ny - 1)
+    dLon_deg = (maxLon - minLon) / (Nx - 1)
+
+    j1, i1 = (p1[0] - minLat) / dLat_deg, (p1[1] - minLon) / dLon_deg
+    j2, i2 = (p2[0] - minLat) / dLat_deg, (p2[1] - minLon) / dLon_deg
+    p1_grid = np.array([i1, j1], dtype=float)
+    p2_grid = np.array([i2, j2], dtype=float)
+
+    vec = p2_grid - p1_grid
+    len_val = float(np.linalg.norm(vec))
+    if len_val < 1e-9:
+        return np.empty((0, 3)), np.empty((0, 3))
+
+    u_vec = vec / len_val
+    v_vec = np.array([-u_vec[1], u_vec[0]], dtype=float)
+
+    mean_lat_rad = np.deg2rad(float(np.mean([p1[0], p2[0]])))
+    meters_per_lon_deg = 111000.0 * np.cos(mean_lat_rad)
+    meters_per_lat_deg = 111000.0
+
+    meters_per_unit_u = float(np.sqrt((u_vec[0] * dLon_deg * meters_per_lon_deg) ** 2 + (u_vec[1] * dLat_deg * meters_per_lat_deg) ** 2))
+    meters_per_unit_v = float(np.sqrt((v_vec[0] * dLon_deg * meters_per_lon_deg) ** 2 + (v_vec[1] * dLat_deg * meters_per_lat_deg) ** 2))
+
+    len_m = len_val * meters_per_unit_u
+    n_s = max(2, int(round(len_m / node_grid_resolution_m)) + 1)
+    s_vec_m = np.linspace(0.0, len_m, n_s)
+
+    n_t = max(3, int(round(2.0 * W_buf / node_grid_resolution_m)) + 1)
+    t_vec_m = np.linspace(-W_buf, W_buf, n_t)
+
+    S_m, T_m = np.meshgrid(s_vec_m, t_vec_m)
+    S_idx = S_m / meters_per_unit_u
+    T_idx = T_m / meters_per_unit_v
+
+    I = p1_grid[0] + S_idx * u_vec[0] + T_idx * v_vec[0]
+    J = p1_grid[1] + S_idx * u_vec[1] + T_idx * v_vec[1]
+
+    valid_mask = (I >= 0) & (I < Nx) & (J >= 0) & (J < Ny)
+    Ii = I[valid_mask].ravel()
+    Ji = J[valid_mask].ravel()
+
+    all_nodes_lon = minLon + Ii * dLon_deg
+    all_nodes_lat = minLat + Ji * dLat_deg
+    all_nodes_alt = np.full_like(all_nodes_lat, p1[2], dtype=float)
+    all_grid_nodes = np.vstack([all_nodes_lat, all_nodes_lon, all_nodes_alt]).T
+
+    if forbidden_zones is not None and forbidden_zones.size > 0 and all_grid_nodes.size > 0:
+        lats = all_grid_nodes[:, 0]
+        lons = all_grid_nodes[:, 1]
+        is_valid = np.ones(all_grid_nodes.shape[0], dtype=bool)
+        for rect in forbidden_zones:
+            min_lon, max_lon, min_lat, max_lat = rect
+            in_rect = (lons >= min_lon) & (lons <= max_lon) & (lats >= min_lat) & (lats <= max_lat)
+            is_valid[in_rect] = False
+        nodes = all_grid_nodes[is_valid]
+    else:
+        nodes = all_grid_nodes
+
+    return nodes, all_grid_nodes
+
+
+def selection_nsga3(population, f_vals, feasible, N, ref_points):
+    fronts = fast_non_dominated_sort(f_vals)
+    next_indices = []
+
+    for front in fronts:
+        valid = [idx for idx in front if feasible[idx]]
+        if not valid:
+            continue
+
+        if len(next_indices) + len(valid) <= N:
+            next_indices.extend(valid)
+        else:
+            remaining = N - len(next_indices)
+            last_front = np.array(valid, dtype=int)
+            if last_front.size > 0 and remaining > 0:
+                last_f = f_vals[last_front, :]
+                norm_f = normalize_objectives(last_f)
+                selected_local = niching_selection(norm_f, ref_points, remaining)
+                next_indices.extend(last_front[selected_local].tolist())
+            break
+
+    next_indices = next_indices[:N]
+    return [population[i] for i in next_indices]
+
+
+def variation_nsga3(pop, nodes, ratio):
+    if not pop:
+        return []
+    offspring_num = int(round(len(pop) * ratio))
+    offspring = []
+
+    n = len(pop)
+    for _ in range(offspring_num):
+        if n >= 2:
+            p1_idx, p2_idx = np.random.choice(n, 2, replace=False)
+        else:
+            p1_idx = 0
+            p2_idx = 0
+
+        child = crossover_gp(pop[p1_idx], pop[p2_idx])
+        child = mutation_gp(child, nodes)
+        offspring.append(child)
+
+    return offspring
+
+# def variation_nsga3(pop, seg_nodes_list, base_points, ratio):
+#     if not pop:
+#         return []
+#     offspring_num = int(round(len(pop) * ratio))
+#     offspring = []
+#     n = len(pop)
+
+#     for _ in range(offspring_num):
+#         if n >= 2:
+#             p1_idx, p2_idx = np.random.choice(n, 2, replace=False)
+#         else:
+#             p1_idx = p2_idx = 0
+
+#         child = pop[p1_idx].copy()
+#         # child = crossover_gp(pop[p1_idx], pop[p2_idx])
+#         child = mutation_gp(child, seg_nodes_list, base_points, p_mut=0.2)
+#         offspring.append(child)
+
+#     return offspring
+
+
+
+def run_nsga3_segment(
+    nodes, p1, p2,
+    Norm_RT, AirRisk, use_map, f_limit, f_zones,
+    Nmax, N_pop, ratio, alt, cs, scales,
+    air_risk_threshold, dz, w_d, w_g, w_a,
+    lat_lim, lon_lim, MAX_INIT_ATTEMPTS,
+    min_inter_nodes, max_inter_nodes,
+    initial_population=None,
+    W_half=None, ground_speed_mps=None, bank_angle_deg=25.0, min_turn_radius_m=296.0,
+    check_corridor_nfz=False, check_turn_radius=False, check_heading_continuity=False,
+    prev_segment_heading=None
+):
+    dummy_path = np.vstack([p1, p2])
+    temp = evaluate_objectives_with_constraints_gp(
+        dummy_path, Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales,
+        air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim,
+        W_half=W_half, ground_speed_mps=ground_speed_mps, bank_angle_deg=bank_angle_deg,
+        min_turn_radius_m=min_turn_radius_m, check_corridor_nfz=check_corridor_nfz,
+        check_turn_radius=check_turn_radius, check_heading_continuity=check_heading_continuity,
+        prev_segment_heading=prev_segment_heading
+    )
+    if len(temp) == 3:
+        temp_f, _, _ = temp
+    else:
+        temp_f, _ = temp
+    num_objectives = int(len(temp_f))
+
+    H = num_objectives + 1
+    ref_points = generate_reference_points(num_objectives, H)
+
+    population = []
+    if initial_population:
+        population = list(initial_population)
+
+    for _ in range(MAX_INIT_ATTEMPTS):
+        need = N_pop - len(population)
+        random_pop = []
+        if need > 0:
+            random_pop = generate_initial_population_gp(need, nodes, p1, p2, min_inter_nodes, max_inter_nodes)
+        temp_full = population + (random_pop if random_pop else [])
+
+        if not temp_full:
+            continue
+
+        any_feasible = False
+        for path in temp_full:
+            ev = evaluate_objectives_with_constraints_gp(
+                path, Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales,
+                air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim,
+                W_half=W_half, ground_speed_mps=ground_speed_mps, bank_angle_deg=bank_angle_deg,
+                min_turn_radius_m=min_turn_radius_m, check_corridor_nfz=check_corridor_nfz,
+                check_turn_radius=check_turn_radius, check_heading_continuity=check_heading_continuity,
+                prev_segment_heading=prev_segment_heading
+            )
+            if len(ev) == 3:
+                _, feas, _ = ev
+            else:
+                _, feas = ev
+            if feas:
+                any_feasible = True
+                break
+
+        if any_feasible:
+            population = temp_full[:N_pop]
+            break
+
+    if not population:
+        return [], np.empty((0, num_objectives)), None
+
+    for gen in range(1, Nmax + 1):
+        Np = len(population)
+        f_vals = np.zeros((Np, num_objectives), dtype=float)
+        feasible = np.zeros(Np, dtype=bool)
+
+        for i in range(Np):
+            ev = evaluate_objectives_with_constraints_gp(
+                population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales,
+                air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim,
+                W_half=W_half, ground_speed_mps=ground_speed_mps, bank_angle_deg=bank_angle_deg,
+                min_turn_radius_m=min_turn_radius_m, check_corridor_nfz=check_corridor_nfz,
+                check_turn_radius=check_turn_radius, check_heading_continuity=check_heading_continuity,
+                prev_segment_heading=prev_segment_heading
+            )
+            if len(ev) == 3:
+                f_vals[i, :], feasible[i], _ = ev
+            else:
+                f_vals[i, :], feasible[i] = ev
+
+        new_pop = selection_nsga3(population, f_vals, feasible, N_pop, ref_points)
+        if not new_pop:
+            break
+
+        if gen < Nmax:
+            offspring = variation_nsga3(new_pop, nodes, ratio)
+            population = new_pop + offspring
+        else:
+            population = new_pop
+
+    if not population:
+        return [], np.empty((0, num_objectives)), None
+
+    f_final = np.zeros((len(population), num_objectives), dtype=float)
+    headings = []
+
+    for i in range(len(population)):
+        ev = evaluate_objectives_with_constraints_gp(
+            population[i], Norm_RT, AirRisk, use_map, f_limit, f_zones, dz, alt, cs, scales,
+            air_risk_threshold, w_d, w_g, w_a, lat_lim, lon_lim,
+            W_half=W_half, ground_speed_mps=ground_speed_mps, bank_angle_deg=bank_angle_deg,
+            min_turn_radius_m=min_turn_radius_m, check_corridor_nfz=check_corridor_nfz,
+            check_turn_radius=check_turn_radius, check_heading_continuity=check_heading_continuity,
+            prev_segment_heading=prev_segment_heading
+        )
+        if len(ev) == 3:
+            f_final[i, :], _, hd = ev
+            headings.append(hd)
+        else:
+            f_final[i, :], _ = ev
+            headings.append(None)
+
+    final_heading = None
+    for hd in headings:
+        if hd is not None:
+            final_heading = hd
+            break
+
+    return population, f_final, final_heading
+
+
+def pick_representatives(population, f_vals):
+    if (not population) or f_vals.size == 0:
+        return []
+
+    num_obj = f_vals.shape[1]
+    rep = []
+
+    for i in range(num_obj):
+        rep.append(population[int(np.argmin(f_vals[:, i]))])
+
+    fronts = fast_non_dominated_sort(f_vals)
+    if fronts and fronts[0]:
+        front1 = np.array(fronts[0], dtype=int)
+        norm_f = normalize_objectives(f_vals[front1, :])
+        balanced_local = int(np.argmin(np.linalg.norm(norm_f, axis=1)))
+        rep.append(population[int(front1[balanced_local])])
+    else:
+        rep.append(rep[0])
+
+    return rep
+
+
+def main():
+    W_half = 148.0
+    ground_speed_mps = 70.65
+    bank_angle_deg = 25.0
+    min_turn_radius_m = 296.0
+
+    check_corridor_nfz = True
+    check_turn_radius = True
+    check_heading_continuity = False
+
+    NUM_VALID_NODES = 2
+    VALID_NODE_SEARCH_RADIUS_M = 500.0
+    ENABLE_VERTIPORT_MULTISTART = True
+
+    N_pop_stage1 = 50
+    Nmax_stage1 = 100
+    offspring_ratio_stage1 = 1.0
+    MIN_INTER_NODES_stage1 = 1
+    MAX_INTER_NODES_stage1 = 5
+    MAX_INIT_ATTEMPTS_stage1 = 100
+
+    w_dist, w_ground, w_air = 1.0, 0.5, 1.0
+
+    altitude_levels = np.array([500.0])
+    use_heading_map = True
+    W_buf = 1250.0
+    node_grid_resolution_m = 100.0
+
+    MIN_INTER_NODES_stage2 = 3
+    MAX_INTER_NODES_stage2 = 50
+
+    MIN_SAFE_NODES_TARGET = 100
+    SAFE_NODE_PERCENTILE_LIST = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
+
+    MAX_INIT_ATTEMPTS_stage2 = 100
+    cell_size = 100.0
+    refine_scales = np.array([1.0, 0.5, 0.2, 0.1])
+    delta_z_max = 100.0
+    Nmax_stage2 = 100
+    N_pop_stage2 = 50
+    offspring_ratio_stage2 = 2.0
+    flight_dist_limit = 10000.0
+    objective_names = ["Distance", "Ground Risk", "Air Risk"]
+
+    grc_file_list = "high_res_affected_population_GRC.npy"
+    air_risk_file = "AirRisk_combined_max_risk_map.npy"
+
+    pop_risk_raw = np.load(grc_file_list, allow_pickle=True)
+    selected_scenario = pop_risk_raw[:, :, 0, 3:]
+    Ny, Nx, H_time = selected_scenario.shape[0], selected_scenario.shape[1], selected_scenario.shape[2]
+
+    A = len(altitude_levels)
+    RiskTensor = np.zeros((A, H_time, Ny, Nx), dtype=float)
+    for ai in range(A):
+        for hi in range(H_time):
+            RiskTensor[ai, hi, :, :] = selected_scenario[:, :, hi]
+
+    min_val = float(np.min(RiskTensor))
+    RiskTensor_shifted = RiskTensor - min_val
+    max_val = float(np.max(RiskTensor_shifted))
+    Norm_RiskTensor = RiskTensor_shifted / max_val if max_val > 0 else RiskTensor_shifted
+
+    air_risk_raw = np.load(air_risk_file, allow_pickle=True).item()
+    z_vec_air = air_risk_raw["z_vec"]
+    air_risk_3d_raw = air_risk_raw["Risk_3d"]
+
+    AirRisk = np.zeros((Ny, Nx, len(altitude_levels)), dtype=float)
+    if air_risk_3d_raw.shape[0] == Nx and air_risk_3d_raw.shape[1] == Ny:
+        raw_air = np.transpose(air_risk_3d_raw, (1, 0, 2))
+    elif air_risk_3d_raw.shape[0] == Ny and air_risk_3d_raw.shape[1] == Nx:
+        raw_air = air_risk_3d_raw
+    else:
+        raise RuntimeError(f"AirRisk shape {air_risk_3d_raw.shape} incompatible with ({Ny}, {Nx}).")
+
+    for i, alt in enumerate(altitude_levels):
+        air_alt_idx = int(np.argmin(np.abs(z_vec_air - alt)))
+        AirRisk[:, :, i] = raw_air[:, :, air_alt_idx]
+
+
+    vertiport = np.array([35.6033361, 129.0776917, 150.0])  # [lat, lon, alt]
+
+    corridor_lat = np.array([35.5845917, 35.6026528, 35.6326806, 35.6249583, 35.6034750,
+                            35.5845361, 35.5692361, 35.5546444, 35.5586722, 35.5784750,
+                            35.5843722, 35.6163861, 35.6212528, 35.6109972])
+
+    corridor_lon = np.array([129.0936472, 129.1130667, 129.1238583, 129.1335528, 129.1268194,
+                            129.1076472, 129.1085306, 129.0936972, 129.0816611, 129.0916889,
+                            129.0770000, 129.0613944, 129.0725444, 129.0711889])
+
+    waypoints = np.column_stack([corridor_lat, corridor_lon, np.full_like(corridor_lat, vertiport[2])])
+
+    points = np.vstack([vertiport, waypoints, vertiport])  # start -> waypoints -> end(vertiport)
+    num_segments = points.shape[0] - 1
+
+    # vertiport = np.array([35.5545361, 129.0876472, 500.0])
+    # corridor_lat = np.array([35.6249583])
+    # corridor_lon = np.array([129.1335528])
+       
+    
+    # points = np.vstack([vertiport, np.column_stack([corridor_lat, corridor_lon, 500.0 * np.ones_like(corridor_lat)]), vertiport])
+
+    forbidden_zones = np.array([
+        [129.08, 129.10, 35.59, 35.61],
+        [129.11, 129.118, 35.62, 35.63],
+        [129.12, 129.13, 35.59, 35.60]
+    ], dtype=float)
+
+    # emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889, 35.58, 35.625, 35.62, 35.624, 35.56, 35.620])
+    # emergency_lon = np.array([129.1191806, 129.106728, 129.0751972, 129.12, 129.115, 129.09, 129.065, 129.065, 129.125])
+    emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889]);
+    emergency_lon = np.array([129.1191806, 129.106728, 129.0751972]);
+    emergency_points = np.column_stack([emergency_lat, emergency_lon, np.full_like(emergency_lat, vertiport[2], dtype=float)])
+
+    lat_lim = [35.5446, 35.6427]
+    lon_lim = [129.0514, 129.1436]
+
+    # num_segments = points.shape[0] - 1
+    representative_paths_final = []
+    all_stage1_solutions_history = []
+    segment_headings = []
+    prev_heading = None
+
+    multistart_cache_used = False
+
+    for k in tqdm(range(num_segments), desc="Optimizing Segments"):
+        p1, p2 = points[k, :], points[k + 1, :]
+
+        if (k == 0) and ENABLE_VERTIPORT_MULTISTART and (not multistart_cache_used):
+            valid_nodes = generate_valid_nodes_near_vertiport(
+                vertiport, NUM_VALID_NODES, VALID_NODE_SEARCH_RADIUS_M, lat_lim, lon_lim, forbidden_zones
+            )
+            if valid_nodes.shape[0] == 0:
+                valid_nodes = np.array([vertiport], dtype=float)
+
+            results = []
+            for vn_idx, vn in enumerate(valid_nodes):
+                pop1, f1, _ = run_nsga3_segment(
+                    nodes=emergency_points, p1=vn, p2=p2,
+                    Norm_RT=Norm_RiskTensor, AirRisk=AirRisk, use_map=use_heading_map,
+                    f_limit=flight_dist_limit, f_zones=forbidden_zones,
+                    Nmax=Nmax_stage1, N_pop=N_pop_stage1, ratio=offspring_ratio_stage1,
+                    alt=altitude_levels, cs=cell_size, scales=refine_scales,
+                    air_risk_threshold=1.0,
+                    dz=delta_z_max, w_d=w_dist, w_g=w_ground, w_a=w_air,
+                    lat_lim=lat_lim, lon_lim=lon_lim,
+                    MAX_INIT_ATTEMPTS=MAX_INIT_ATTEMPTS_stage1,
+                    min_inter_nodes=MIN_INTER_NODES_stage1,
+                    max_inter_nodes=MAX_INTER_NODES_stage1,
+                    initial_population=None,
+                    W_half=W_half, ground_speed_mps=ground_speed_mps,
+                    bank_angle_deg=bank_angle_deg, min_turn_radius_m=min_turn_radius_m,
+                    check_corridor_nfz=check_corridor_nfz, check_turn_radius=check_turn_radius,
+                    check_heading_continuity=check_heading_continuity,
+                    prev_segment_heading=None
+                )
+
+                init_solutions = []
+                if pop1 and f1.size > 0:
+                    init_solutions = pick_representatives(pop1, f1)
+
+                nodes_stage2, all_grid_nodes = generate_nodes_3d_segment(
+                    vn, p2, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones
+                )
+
+                if nodes_stage2.size == 0:
+                    results.append((vn_idx, vn, [], np.empty((0, 3)), None, init_solutions))
+                    continue
+
+                half_all = int(all_grid_nodes.shape[0] // 2)
+                base_target = int(max(MIN_SAFE_NODES_TARGET, half_all))
+                current_target = int(min(base_target, nodes_stage2.shape[0]))
+
+                node_lons = nodes_stage2[:, 1]
+                node_lats = nodes_stage2[:, 0]
+                I_nodes = ((node_lons - lon_lim[0]) / (lon_lim[1] - lon_lim[0]) * (Nx - 1)).astype(int)
+                J_nodes = ((node_lats - lat_lim[0]) / (lat_lim[1] - lat_lim[0]) * (Ny - 1)).astype(int)
+                I_nodes = np.clip(I_nodes, 0, Nx - 1)
+                J_nodes = np.clip(J_nodes, 0, Ny - 1)
+                alt_idx = int(np.argmin(np.abs(altitude_levels - nodes_stage2[0, 2])))
+
+                air_slice = AirRisk[:, :, alt_idx]
+                node_risks = air_slice[J_nodes, I_nodes]
+
+                safe_nodes = nodes_stage2
+                current_threshold = 0.0
+                for perc in SAFE_NODE_PERCENTILE_LIST:
+                    thr = float(np.percentile(node_risks, perc))
+                    current_threshold = thr
+                    safe_nodes = nodes_stage2[node_risks <= thr]
+                    if safe_nodes.shape[0] >= current_target:
+                        break
+                if safe_nodes.size == 0:
+                    safe_nodes = nodes_stage2
+
+                pop2, f2, hd2 = run_nsga3_segment(
+                    nodes=safe_nodes, p1=vn, p2=p2,
+                    Norm_RT=Norm_RiskTensor, AirRisk=AirRisk, use_map=use_heading_map,
+                    f_limit=flight_dist_limit, f_zones=forbidden_zones,
+                    Nmax=Nmax_stage2, N_pop=N_pop_stage2, ratio=offspring_ratio_stage2,
+                    alt=altitude_levels, cs=cell_size, scales=refine_scales,
+                    air_risk_threshold=current_threshold,
+                    dz=delta_z_max, w_d=w_dist, w_g=w_ground, w_a=w_air,
+                    lat_lim=lat_lim, lon_lim=lon_lim,
+                    MAX_INIT_ATTEMPTS=MAX_INIT_ATTEMPTS_stage2,
+                    min_inter_nodes=MIN_INTER_NODES_stage2,
+                    max_inter_nodes=MAX_INTER_NODES_stage2,
+                    initial_population=init_solutions,
+                    W_half=W_half, ground_speed_mps=ground_speed_mps,
+                    bank_angle_deg=bank_angle_deg, min_turn_radius_m=min_turn_radius_m,
+                    check_corridor_nfz=check_corridor_nfz, check_turn_radius=check_turn_radius,
+                    check_heading_continuity=check_heading_continuity,
+                    prev_segment_heading=None
+                )
+
+                results.append((vn_idx, vn, pop2, f2, hd2, init_solutions))
+
+            best = None
+            best_score = float("inf")
+            for vn_idx, vn, pop2, f2, hd2, init_solutions in results:
+                if (not pop2) or f2.size == 0:
+                    continue
+                fronts = fast_non_dominated_sort(f2)
+                if not fronts or not fronts[0]:
+                    continue
+                front1 = np.array(fronts[0], dtype=int)
+                norm_f = normalize_objectives(f2[front1, :])
+                score = float(np.min(np.linalg.norm(norm_f, axis=1)))
+                if score < best_score:
+                    best_score = score
+                    best = (vn, pop2, f2, hd2, init_solutions)
+
+            if best is None:
+                representative_paths_final.append([])
+                all_stage1_solutions_history.append([])
+                prev_heading = None
+                continue
+
+            best_vn, pop2, f2, hd2, init_solutions = best
+            reps = pick_representatives(pop2, f2)
+            representative_paths_final.append(reps)
+            all_stage1_solutions_history.append(init_solutions)
+
+            if hd2 is not None:
+                segment_headings.append(hd2)
+                prev_heading = hd2
+            else:
+                prev_heading = None
+
+            points[0, :] = best_vn
+            multistart_cache_used = True
+            continue
+
+        pop1, f1, _ = run_nsga3_segment(
+            nodes=emergency_points, p1=p1, p2=p2,
+            Norm_RT=Norm_RiskTensor, AirRisk=AirRisk, use_map=use_heading_map,
+            f_limit=flight_dist_limit, f_zones=forbidden_zones,
+            Nmax=Nmax_stage1, N_pop=N_pop_stage1, ratio=offspring_ratio_stage1,
+            alt=altitude_levels, cs=cell_size, scales=refine_scales,
+            air_risk_threshold=1.0,
+            dz=delta_z_max, w_d=w_dist, w_g=w_ground, w_a=w_air,
+            lat_lim=lat_lim, lon_lim=lon_lim,
+            MAX_INIT_ATTEMPTS=MAX_INIT_ATTEMPTS_stage1,
+            min_inter_nodes=MIN_INTER_NODES_stage1,
+            max_inter_nodes=MAX_INTER_NODES_stage1,
+            initial_population=None,
+            W_half=W_half, ground_speed_mps=ground_speed_mps,
+            bank_angle_deg=bank_angle_deg, min_turn_radius_m=min_turn_radius_m,
+            check_corridor_nfz=check_corridor_nfz, check_turn_radius=check_turn_radius,
+            check_heading_continuity=check_heading_continuity,
+            prev_segment_heading=prev_heading
+        )
+
+        init_solutions = []
+        if pop1 and f1.size > 0:
+            init_solutions = pick_representatives(pop1, f1)
+        all_stage1_solutions_history.append(init_solutions)
+
+        nodes_stage2, all_grid_nodes = generate_nodes_3d_segment(
+            p1, p2, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones
+        )
+
+        if nodes_stage2.size == 0:
+            representative_paths_final.append([])
+            continue
+
+        half_all = int(all_grid_nodes.shape[0] // 2)
+        base_target = int(max(MIN_SAFE_NODES_TARGET, half_all))
+        current_target = int(min(base_target, nodes_stage2.shape[0]))
+
+        node_lons = nodes_stage2[:, 1]
+        node_lats = nodes_stage2[:, 0]
+        I_nodes = ((node_lons - lon_lim[0]) / (lon_lim[1] - lon_lim[0]) * (Nx - 1)).astype(int)
+        J_nodes = ((node_lats - lat_lim[0]) / (lat_lim[1] - lat_lim[0]) * (Ny - 1)).astype(int)
+        I_nodes = np.clip(I_nodes, 0, Nx - 1)
+        J_nodes = np.clip(J_nodes, 0, Ny - 1)
+        alt_idx = int(np.argmin(np.abs(altitude_levels - nodes_stage2[0, 2])))
+
+        air_slice = AirRisk[:, :, alt_idx]
+        node_risks = air_slice[J_nodes, I_nodes]
+
+        safe_nodes = nodes_stage2
+        current_threshold = 0.0
+        for perc in SAFE_NODE_PERCENTILE_LIST:
+            thr = float(np.percentile(node_risks, perc))
+            current_threshold = thr
+            safe_nodes = nodes_stage2[node_risks <= thr]
+            if safe_nodes.shape[0] >= current_target:
+                break
+        if safe_nodes.size == 0:
+            safe_nodes = nodes_stage2
+
+        pop2, f2, hd2 = run_nsga3_segment(
+            nodes=safe_nodes, p1=p1, p2=p2,
+            Norm_RT=Norm_RiskTensor, AirRisk=AirRisk, use_map=use_heading_map,
+            f_limit=flight_dist_limit, f_zones=forbidden_zones,
+            Nmax=Nmax_stage2, N_pop=N_pop_stage2, ratio=offspring_ratio_stage2,
+            alt=altitude_levels, cs=cell_size, scales=refine_scales,
+            air_risk_threshold=current_threshold,
+            dz=delta_z_max, w_d=w_dist, w_g=w_ground, w_a=w_air,
+            lat_lim=lat_lim, lon_lim=lon_lim,
+            MAX_INIT_ATTEMPTS=MAX_INIT_ATTEMPTS_stage2,
+            min_inter_nodes=MIN_INTER_NODES_stage2,
+            max_inter_nodes=MAX_INTER_NODES_stage2,
+            initial_population=init_solutions,
+            W_half=W_half, ground_speed_mps=ground_speed_mps,
+            bank_angle_deg=bank_angle_deg, min_turn_radius_m=min_turn_radius_m,
+            check_corridor_nfz=check_corridor_nfz, check_turn_radius=check_turn_radius,
+            check_heading_continuity=check_heading_continuity,
+            prev_segment_heading=prev_heading
+        )
+
+        if pop2 and f2.size > 0:
+            reps = pick_representatives(pop2, f2)
+            representative_paths_final.append(reps)
+        else:
+            representative_paths_final.append([])
+
+        if hd2 is not None:
+            segment_headings.append(hd2)
+            prev_heading = hd2
+
+    result = {
+        "objective_names": objective_names,
+        "representative_paths_final": representative_paths_final,
+        "all_stage1_solutions_history": all_stage1_solutions_history,
+        "points": points,
+        "vertiport": vertiport,
+        "forbidden_zones": forbidden_zones,
+        "emergency_points": emergency_points,
+        "lat_lim": lat_lim,
+        "lon_lim": lon_lim,
+        "W_half": W_half
+    }
+
+# def main():
+#     W_half = 148.0
+#     ground_speed_mps = 70.65
+#     bank_angle_deg = 25.0
+#     min_turn_radius_m = 296.0
+
+#     check_corridor_nfz = True
+#     check_turn_radius = True
+#     check_heading_continuity = False
+
+#     N_pop = 80
+#     Nmax = 150
+#     offspring_ratio = 0.5
+
+#     w_dist, w_ground, w_air = 1.0, 0.5, 1.0
+
+#     altitude_levels = np.array([500.0])
+#     use_heading_map = True
+#     W_buf = 1250.0
+#     node_grid_resolution_m = 120.0
+
+#     MIN_INSERT_PER_SEG = 1
+#     MAX_INSERT_PER_SEG = 3
+
+#     MAX_INIT_ATTEMPTS = 1
+
+#     MIN_INTER_NODES_dummy = 0
+#     MAX_INTER_NODES_dummy = 0
+
+#     MIN_SAFE_NODES_TARGET = 200
+#     SAFE_NODE_PERCENTILE_LIST = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
+
+#     cell_size = 100.0
+#     refine_scales = np.array([1.0, 0.5, 0.2, 0.1])
+#     delta_z_max = 100.0
+#     flight_dist_limit = 100000.0
+#     objective_names = ["Distance", "Ground Risk", "Air Risk"]
+
+#     grc_file_list = "high_res_affected_population_GRC.npy"
+#     air_risk_file = "AirRisk_combined_max_risk_map.npy"
+
+#     pop_risk_raw = np.load(grc_file_list, allow_pickle=True)
+#     selected_scenario = pop_risk_raw[:, :, 0, 3:]
+#     Ny, Nx, H_time = selected_scenario.shape[0], selected_scenario.shape[1], selected_scenario.shape[2]
+
+#     A = len(altitude_levels)
+#     RiskTensor = np.zeros((A, H_time, Ny, Nx), dtype=float)
+#     for ai in range(A):
+#         for hi in range(H_time):
+#             RiskTensor[ai, hi, :, :] = selected_scenario[:, :, hi]
+
+#     min_val = float(np.min(RiskTensor))
+#     RiskTensor_shifted = RiskTensor - min_val
+#     max_val = float(np.max(RiskTensor_shifted))
+#     Norm_RiskTensor = RiskTensor_shifted / max_val if max_val > 0 else RiskTensor_shifted
+
+#     air_risk_raw = np.load(air_risk_file, allow_pickle=True).item()
+#     z_vec_air = air_risk_raw["z_vec"]
+#     air_risk_3d_raw = air_risk_raw["Risk_3d"]
+
+#     AirRisk = np.zeros((Ny, Nx, len(altitude_levels)), dtype=float)
+#     if air_risk_3d_raw.shape[0] == Nx and air_risk_3d_raw.shape[1] == Ny:
+#         raw_air = np.transpose(air_risk_3d_raw, (1, 0, 2))
+#     elif air_risk_3d_raw.shape[0] == Ny and air_risk_3d_raw.shape[1] == Nx:
+#         raw_air = air_risk_3d_raw
+#     else:
+#         raise RuntimeError(f"AirRisk shape {air_risk_3d_raw.shape} incompatible with ({Ny}, {Nx}).")
+
+#     for i, alt in enumerate(altitude_levels):
+#         air_alt_idx = int(np.argmin(np.abs(z_vec_air - alt)))
+#         AirRisk[:, :, i] = raw_air[:, :, air_alt_idx]
+
+#     vertiport = np.array([35.6033361, 129.0776917, 150.0])
+
+#     corridor_lat = np.array([35.5845917, 35.6026528, 35.6326806, 35.6249583, 35.6034750,
+#                             35.5845361, 35.5692361, 35.5546444, 35.5586722, 35.5784750,
+#                             35.5843722, 35.6163861, 35.6212528, 35.6109972])
+
+#     corridor_lon = np.array([129.0936472, 129.1130667, 129.1238583, 129.1335528, 129.1268194,
+#                             129.1076472, 129.1085306, 129.0936972, 129.0816611, 129.0916889,
+#                             129.0770000, 129.0613944, 129.0725444, 129.0711889])
+
+#     waypoints = np.column_stack([corridor_lat, corridor_lon, np.full_like(corridor_lat, vertiport[2])])
+#     base_points = np.vstack([vertiport, waypoints, vertiport])  # 고정 뼈대
+#     p_start = base_points[0, :]
+#     p_end = base_points[-1, :]
+
+#     forbidden_zones = np.array([
+#     ], dtype=float)
+    
+#     # forbidden_zones = np.array([
+#     #     [129.08, 129.10, 35.59, 35.61],
+#     #     [129.11, 129.118, 35.62, 35.63],
+#     #     [129.12, 129.13, 35.59, 35.60]
+#     # ], dtype=float)
+
+#     emergency_lat = np.array([35.6201083, 35.5678222, 35.5919889])
+#     emergency_lon = np.array([129.1191806, 129.106728, 129.0751972])
+#     emergency_points = np.column_stack([emergency_lat, emergency_lon, np.full_like(emergency_lat, vertiport[2], dtype=float)])
+
+#     lat_lim = [35.5446, 35.6427]
+#     lon_lim = [129.0514, 129.1436]
+
+#     def build_safe_nodes_for_segment(a, b):
+#         nodes_seg, all_grid_nodes = generate_nodes_3d_segment(
+#             a, b, W_buf, node_grid_resolution_m, lat_lim, lon_lim, Ny, Nx, forbidden_zones
+#         )
+#         if nodes_seg.size == 0:
+#             return np.empty((0, 3)), 0.0
+
+#         half_all = int(all_grid_nodes.shape[0] // 2)
+#         base_target = int(max(MIN_SAFE_NODES_TARGET, half_all))
+#         current_target = int(min(base_target, nodes_seg.shape[0]))
+
+#         node_lons = nodes_seg[:, 1]
+#         node_lats = nodes_seg[:, 0]
+#         I_nodes = ((node_lons - lon_lim[0]) / (lon_lim[1] - lon_lim[0]) * (Nx - 1)).astype(int)
+#         J_nodes = ((node_lats - lat_lim[0]) / (lat_lim[1] - lat_lim[0]) * (Ny - 1)).astype(int)
+#         I_nodes = np.clip(I_nodes, 0, Nx - 1)
+#         J_nodes = np.clip(J_nodes, 0, Ny - 1)
+#         alt_idx = int(np.argmin(np.abs(altitude_levels - nodes_seg[0, 2])))
+
+#         air_slice = AirRisk[:, :, alt_idx]
+#         node_risks = air_slice[J_nodes, I_nodes]
+
+#         safe_nodes = nodes_seg
+#         current_threshold = 0.0
+#         for perc in SAFE_NODE_PERCENTILE_LIST:
+#             thr = float(np.percentile(node_risks, perc))
+#             current_threshold = thr
+#             safe_nodes = nodes_seg[node_risks <= thr]
+#             if safe_nodes.shape[0] >= current_target:
+#                 break
+#         if safe_nodes.size == 0:
+#             safe_nodes = nodes_seg
+
+#         return safe_nodes, current_threshold
+
+#     def build_initial_population_whole(num_pop):
+#         safe_nodes_by_seg = []
+#         thr_by_seg = []
+
+#         for k in range(base_points.shape[0] - 1):
+#             s, thr = build_safe_nodes_for_segment(base_points[k, :], base_points[k + 1, :])
+#             safe_nodes_by_seg.append(s)
+#             thr_by_seg.append(thr)
+
+#         init_pop = []
+#         for _ in range(num_pop):
+#             path_pts = [base_points[0, :]]
+#             for k in range(base_points.shape[0] - 1):
+#                 a = base_points[k, :]
+#                 b = base_points[k + 1, :]
+#                 cand = safe_nodes_by_seg[k]
+#                 m = int(np.random.randint(MIN_INSERT_PER_SEG, MAX_INSERT_PER_SEG + 1))
+
+#                 if cand.size == 0:
+#                     inserts = []
+#                 else:
+#                     idx = np.random.choice(cand.shape[0], size=min(m, cand.shape[0]), replace=False)
+#                     chosen = cand[idx, :]
+
+#                     ab = b[:2] - a[:2]
+#                     denom = float(np.dot(ab, ab)) + 1e-12
+#                     t = ((chosen[:, :2] - a[:2]) @ ab) / denom
+#                     order = np.argsort(t)
+#                     inserts = chosen[order, :].tolist()
+
+#                 path_pts.extend(inserts)
+#                 path_pts.append(b)
+
+#             init_pop.append(np.array(path_pts, dtype=float))
+
+#         nodes_pool = np.vstack([s for s in safe_nodes_by_seg if s.size > 0]) if any(s.size > 0 for s in safe_nodes_by_seg) else emergency_points
+#         air_thr_global = float(np.max(thr_by_seg)) if len(thr_by_seg) > 0 else 1.0
+#         return init_pop, nodes_pool, air_thr_global
+
+#     initial_population, nodes_pool, air_thr_global = build_initial_population_whole(N_pop)
+
+#     pop, fvals, _ = run_nsga3_segment(
+#         nodes=nodes_pool, p1=p_start, p2=p_end,
+#         Norm_RT=Norm_RiskTensor, AirRisk=AirRisk, use_map=use_heading_map,
+#         f_limit=flight_dist_limit, f_zones=forbidden_zones,
+#         Nmax=Nmax, N_pop=N_pop, ratio=offspring_ratio,
+#         alt=altitude_levels, cs=cell_size, scales=refine_scales,
+#         air_risk_threshold=air_thr_global,
+#         dz=delta_z_max, w_d=w_dist, w_g=w_ground, w_a=w_air,
+#         lat_lim=lat_lim, lon_lim=lon_lim,
+#         MAX_INIT_ATTEMPTS=MAX_INIT_ATTEMPTS,
+#         min_inter_nodes=MIN_INTER_NODES_dummy,
+#         max_inter_nodes=MAX_INTER_NODES_dummy,
+#         initial_population=initial_population,
+#         W_half=W_half, ground_speed_mps=ground_speed_mps,
+#         bank_angle_deg=bank_angle_deg, min_turn_radius_m=min_turn_radius_m,
+#         check_corridor_nfz=check_corridor_nfz, check_turn_radius=check_turn_radius,
+#         check_heading_continuity=check_heading_continuity,
+#         prev_segment_heading=None
+#     )
+
+#     reps = []
+#     if pop and fvals.size > 0:
+#         reps = pick_representatives(pop, fvals)
+
+#     result = {
+#         "objective_names": objective_names,
+#         "base_points": base_points,
+#         "representative_paths_final": reps,
+#         "population_final": pop,
+#         "f_final": fvals,
+#         "vertiport": vertiport,
+#         "forbidden_zones": forbidden_zones,
+#         "emergency_points": emergency_points,
+#         "lat_lim": lat_lim,
+#         "lon_lim": lon_lim,
+#         "W_half": W_half
+#     }
+
+#     out_path = "uam_nsga3_results_whole.pkl"
+#     with open(out_path, "wb") as f:
+#         pickle.dump(result, f)
+
+#     print(f"Saved results to {out_path}")
+
+
+#     out_path = "uam_nsga3_results.pkl"
+#     with open(out_path, "wb") as f:
+#         pickle.dump(result, f)
+
+#     print(f"Saved results to {out_path}")
+
+
+if __name__ == "__main__":
+    main()
