@@ -1,0 +1,161 @@
+{
+  "run_timestamp": "20260317_161510",
+  "W_half": 150.0,
+  "ground_speed_mps": 83.33333333333333,
+  "ground_speed_kmh": 300.0,
+  "bank_angle_deg": 25.0,
+  "gravity_mps2": 9.80665,
+  "rf_base_turn_radius_m": 1518.6031081159488,
+  "num_arc_points": 30,
+  "N_init": 1000,
+  "N_pop": 100,
+  "Nmax": 10,
+  "offspring_ratio": 0.5,
+  "wp_perturb_radius_m": 100.0,
+  "wp_perturb_steps": 10,
+  "min_extra_nodes_per_seg": 0,
+  "max_extra_nodes_per_seg": 2,
+  "emergency_strip_m": 500.0,
+  "min_seg_for_extra_nodes_m": 1500.0,
+  "look_ahead": true,
+  "look_ahead_threshold_m": 1500.0,
+  "look_ahead_min_scale": 0.11,
+  "look_ahead_min_turn_radius_m": 167.04634189275436,
+  "look_ahead_min_equiv_speed_mps": 27.63853991962833,
+  "look_ahead_min_equiv_speed_kmh": 99.49874371066198,
+  "look_ahead_window": 2,
+  "max_init_retries": 300,
+  "w_dist": 0.1,
+  "w_ground": 2.0,
+  "w_air": 2.0,
+  "altitude_levels_m": [
+    600.0
+  ],
+  "W_buf": 1250.0,
+  "node_grid_resolution_m": 100.0,
+  "cell_size": 100.0,
+  "delta_z_max": 455.0,
+  "flight_dist_limit": 100000.0,
+  "check_corridor_nfz": true,
+  "wp_skip_prob": 0.0,
+  "airspace_radius_km": 5.0,
+  "min_corridor_distance_km": 0.0,
+  "min_corridor_distance_m": 0.0,
+  "vertiport": {
+    "lat": 35.6033361,
+    "lon": 129.0776917,
+    "alt_m": 150.0
+  },
+  "takeoff_sector": 6,
+  "landing_sector": 11,
+  "takeoff_angle_deg": 25.0,
+  "alt_delta_m": 350.0,
+  "takeoff_complete": {
+    "lat": 35.596804549398996,
+    "lon": 129.079844196657,
+    "alt_m": 600.0
+  },
+  "landing_entry": {
+    "lat": 35.608117526892144,
+    "lon": 129.07181096976998,
+    "alt_m": 600.0
+  },
+  "waypoint_altitudes_m": [
+    600.0,
+    600.0,
+    600.0,
+    600.0,
+    600.0,
+    600.0,
+    600.0,
+    600.0,
+    600.0
+  ],
+  "backbone_waypoints": [
+    {
+      "index": 0,
+      "lat": 35.5944587,
+      "lon": 129.0977958,
+      "alt_m": 600.0
+    },
+    {
+      "index": 1,
+      "lat": 35.619558,
+      "lon": 129.1153758,
+      "alt_m": 600.0
+    },
+    {
+      "index": 2,
+      "lat": 35.6218142,
+      "lon": 129.1266116,
+      "alt_m": 600.0
+    },
+    {
+      "index": 3,
+      "lat": 35.5625903,
+      "lon": 129.0949662,
+      "alt_m": 600.0
+    },
+    {
+      "index": 4,
+      "lat": 35.5671301,
+      "lon": 129.0776521,
+      "alt_m": 600.0
+    },
+    {
+      "index": 5,
+      "lat": 35.5887324,
+      "lon": 129.0691071,
+      "alt_m": 600.0
+    },
+    {
+      "index": 6,
+      "lat": 35.5931814,
+      "lon": 129.0665565,
+      "alt_m": 600.0
+    },
+    {
+      "index": 7,
+      "lat": 35.6185184,
+      "lon": 129.0512209,
+      "alt_m": 600.0
+    },
+    {
+      "index": 8,
+      "lat": 35.6249109,
+      "lon": 129.058671,
+      "alt_m": 600.0
+    }
+  ],
+  "emergency_landing_sites": [
+    {
+      "index": 0,
+      "lat": 35.6201083,
+      "lon": 129.1191806,
+      "alt_m": 600.0
+    },
+    {
+      "index": 1,
+      "lat": 35.5678222,
+      "lon": 129.106728,
+      "alt_m": 600.0
+    },
+    {
+      "index": 2,
+      "lat": 35.5919889,
+      "lon": 129.0751972,
+      "alt_m": 600.0
+    }
+  ],
+  "forbidden_zones_bbox": [],
+  "map_boundary": {
+    "lat_lim": [
+      35.5446,
+      35.6427
+    ],
+    "lon_lim": [
+      129.0514,
+      129.1436
+    ]
+  }
+}

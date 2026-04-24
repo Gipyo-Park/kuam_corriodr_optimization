@@ -1,0 +1,6 @@
+{
+  "event": "result",
+  "ok": false,
+  "status_code": 500,
+  "detail": "cannot access local variable 'start_vertiport' where it is not associated with a value"
+}
