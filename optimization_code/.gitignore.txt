@@ -1,0 +1,16 @@
+# 로그 파일 제외
+logs/
+*.log
+
+# 빌드 결과물 제외
+/build/
+*.o
+*.class
+
+# 환경 설정 파일 제외
+.env
+config/local.json
+
+# runs 내부의 모든 것을 무시하되, '성공' 폴더 자체와 그 내용물은 제외
+runs/*
+!runs/성공/
