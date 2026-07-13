@@ -1,0 +1,6 @@
+﻿layer,shape,crs,x_min_m,x_max_m,y_min_m,y_max_m,dx_m,dy_m,cells_in_cone,note
+air_risk,128x143,EPSG:5179,1137450.0,1150150.0,1726450.0,1740650.0,100.0,100.0,314,Reference X_2d/Y_2d grid
+annual_wind,128x143,EPSG:5179,1137450.0,1150150.0,1726450.0,1740650.0,100.0,100.0,314,Exact coordinate match across 12 monthly files
+ground_risk,128x143,EPSG:5179,1137450.0,1150150.0,1726450.0,1740650.0,100.0,100.0,314,Spatial axes transposed once; coordinates inherited from air-risk grid
+cruise_moc_fixedAGL400,100x100,EPSG:5179,1137950.0,1147850.0,1730350.0,1740250.0,100.0,100.0,314,Separate cruise MOC source grid
+vertiport_moc_angle08_alt600,100x100,EPSG:5179,1137950.0,1147850.0,1730350.0,1740250.0,100.0,100.0,314,8 deg cone MOC clipped to the 1 km analysis radius

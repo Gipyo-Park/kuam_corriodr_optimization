@@ -518,6 +518,78 @@ def _corridor_hits_binary_moc_with_width(
 
     return False
 
+
+def _point_to_segment_distance_m(pt, a, b):
+    """Minimum distance (m) from point pt to segment a-b in 2D metric plane."""
+    ab = b - a
+    ab2 = float(np.dot(ab, ab))
+    if ab2 <= 1e-12:
+        return float(np.linalg.norm(pt - a))
+    t = float(np.dot(pt - a, ab) / ab2)
+    t = float(np.clip(t, 0.0, 1.0))
+    proj = a + t * ab
+    return float(np.linalg.norm(pt - proj))
+
+
+def _segment_to_segment_min_distance_m(a1, a2, b1, b2):
+    """Minimum distance (m) between two 2D line segments."""
+    # If centerlines intersect, distance is zero.
+    p1 = (float(a1[0]), float(a1[1]))
+    q1 = (float(a2[0]), float(a2[1]))
+    p2 = (float(b1[0]), float(b1[1]))
+    q2 = (float(b2[0]), float(b2[1]))
+    if _segments_intersect(p1, q1, p2, q2):
+        return 0.0
+
+    d1 = _point_to_segment_distance_m(a1, b1, b2)
+    d2 = _point_to_segment_distance_m(a2, b1, b2)
+    d3 = _point_to_segment_distance_m(b1, a1, a2)
+    d4 = _point_to_segment_distance_m(b2, a1, a2)
+    return float(min(d1, d2, d3, d4))
+
+
+def _has_self_corridor_width_overlap(path, W_half, eps_m=1.0):
+    """
+    Return True if non-adjacent corridor strips (centerline buffered by W_half)
+    overlap in interior.
+    """
+    if path is None or np.size(path) == 0:
+        return False
+    p = np.asarray(path, dtype=float).reshape(-1, 3)
+    if p.shape[0] < 4:
+        return False
+
+    mean_lat = float(np.mean(p[:, 0]))
+    m_lat = 111000.0
+    m_lon = 111000.0 * np.cos(np.deg2rad(mean_lat))
+    if abs(m_lon) < 1e-9:
+        m_lon = 1e-9
+
+    xy = np.column_stack([p[:, 1] * m_lon, p[:, 0] * m_lat])  # [x=lon_m, y=lat_m]
+    n_seg = xy.shape[0] - 1
+    if n_seg < 3:
+        return False
+
+    threshold = float(2.0 * float(W_half) - max(0.0, float(eps_m)))
+    if threshold <= 0.0:
+        return False
+
+    for i in range(n_seg):
+        a1 = xy[i]
+        a2 = xy[i + 1]
+        for j in range(i + 1, n_seg):
+            # Adjacent segments share an endpoint by construction -> ignore.
+            if j <= i + 1:
+                continue
+            b1 = xy[j]
+            b2 = xy[j + 1]
+
+            dmin = _segment_to_segment_min_distance_m(a1, a2, b1, b2)
+            if dmin < threshold:
+                return True
+    return False
+
+
 def _resample_path_by_step_m(path, step_m=400.0, min_step_m=300.0, max_step_m=500.0):
     if path is None or path.shape[0] < 2:
         return path
@@ -594,6 +666,7 @@ def evaluate_objectives_with_constraints_gp(
     check_corridor_nfz=False,
     MOCRisk=None,
     check_corridor_moc=False,
+    check_corridor_self_overlap=True,
     vertiport=None, landing_entry=None, takeoff_complete=None,
     return_reason=False,
 ):
@@ -680,6 +753,12 @@ def evaluate_objectives_with_constraints_gp(
                     lon_lim,
                 ):
                     return _pack(penalty_cost_array, False, "moc_corridor_width_intersection : Overlapping of obstacle danger zone and corridor width")
+
+    # 6) 회랑폭 자기겹침 하드 제약 (비인접 세그먼트끼리만 검사)
+    if check_corridor_self_overlap and W_half is not None and float(W_half) > 0.0:
+        self_overlap_eps_m = 1.0
+        if _has_self_corridor_width_overlap(path, float(W_half), eps_m=self_overlap_eps_m):
+            return _pack(penalty_cost_array, False, "self_corridor_width_overlap")
 
     return _pack(temp_f_val, True, "ok")
 

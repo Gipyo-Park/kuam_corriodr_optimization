@@ -1,0 +1,21 @@
+# Wind direction convention
+TO: wind is moving toward this bearing
+FROM: meteorological source direction = TO + 180 deg
+
+Annual 550 m TO=50.610 deg
+Annual 550 m FROM=230.610 deg
+Annual 550 m speed=4.842 m/s
+
+# Monthly recommendations
+01: TO=44.40, FROM=224.40, takeoff_center=S8, landing_center=S2
+02: TO=44.27, FROM=224.27, takeoff_center=S8, landing_center=S2
+03: TO=57.05, FROM=237.05, takeoff_center=S8, landing_center=S2
+04: TO=60.02, FROM=240.02, takeoff_center=S9, landing_center=S3
+05: TO=51.18, FROM=231.18, takeoff_center=S8, landing_center=S2
+06: TO=48.85, FROM=228.85, takeoff_center=S8, landing_center=S2
+07: TO=53.01, FROM=233.01, takeoff_center=S8, landing_center=S2
+08: TO=54.25, FROM=234.25, takeoff_center=S8, landing_center=S2
+09: TO=53.94, FROM=233.94, takeoff_center=S8, landing_center=S2
+10: TO=44.79, FROM=224.79, takeoff_center=S8, landing_center=S2
+11: TO=51.74, FROM=231.74, takeoff_center=S8, landing_center=S2
+12: TO=45.88, FROM=225.88, takeoff_center=S8, landing_center=S2
