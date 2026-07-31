@@ -19,17 +19,20 @@ payload_optimal_corridor = {
     "end_vertiport": {
         "lla": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
     },
+    # Optional; None keeps the automatic transition endpoint.
+    # "takeoff_end": {"lla": {"lat": 35.59468397, "lon": 129.07515721}},
+    # "landing_end": {"lla": {"lat": 35.59701567, "lon": 129.08585995}},
+    "takeoff_end": None,
+    "landing_end": None,
     "airspace_info": {
-        "center": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
+        "center": {"lat": 35.6033361, "lon": 129.0776917},
         "radius_km": 5.0,
-        "altitude_min_m": 100.0,
-        "altitude_max_m": 1000.0,
     },
     # [lon_min, lon_max, lat_min, lat_max] # optional (default: [])
     "no_fly_zones": [                  
         # {"bbox": [129.0700, 129.0820, 35.5980, 35.6100]},  
     ],
-    # optional middle waypoints (if empty, start/end만으로 계산)
+    # optional middle waypoints (missing/null/empty uses no middle waypoints)
     "corridor_points": [
         {"lat": 35.6165628, "lon": 129.1174075, "alt_m": 600.0},
         {"lat": 35.6125953, "lon": 129.1271681, "alt_m": 600.0},
@@ -83,6 +86,47 @@ def post_and_log(endpoint, payload):
         return {}
 
 
+def _print_diagnostic_event(event):
+    checks = event.get("checks", {}) or {}
+    overall = checks.get("overall_feasible", {}) or {}
+    current = event.get("current", "?")
+    total = event.get("total", "?")
+    feasible = overall.get("passed", 0)
+    target = overall.get("target", 0)
+    state = str(event.get("state", ""))
+    if state == "completed":
+        print(
+            f"[server/diagnostic] initial population completed on retry "
+            f"{current}/{total}: feasible_candidates={feasible} (required={target})"
+        )
+        return
+    if state == "failed":
+        print(
+            f"[server/diagnostic] initial population failed after "
+            f"{current}/{total} retries: feasible_candidates={feasible} (required={target})"
+        )
+    else:
+        print(
+            f"[server/diagnostic] initial population retry {current}/{total}: "
+            f"feasible_candidates={feasible} (required={target})"
+        )
+
+    blockers = list(event.get("blockers", []) or [])[:3]
+    if blockers:
+        blocker_text = ", ".join(
+            f"{item.get('code')} {item.get('failed', 0)}/{item.get('evaluated', 0)}"
+            for item in blockers
+        )
+        print(f"  blockers: {blocker_text}")
+        actions = []
+        for item in blockers:
+            action = str(item.get("suggested_action", "")).strip()
+            if action and action not in actions:
+                actions.append(action)
+        if actions:
+            print(f"  suggested: {' | '.join(actions)}")
+
+
 def post_optimized_path_stream(payload):
     url = f"{SERVER}/optimized-path/stream"
     final_event = None
@@ -91,7 +135,7 @@ def post_optimized_path_stream(payload):
             resp.raise_for_status()
             print("[request] streaming connected")
 
-            for raw_line in resp.iter_lines(decode_unicode=True):
+            for raw_line in resp.iter_lines(decode_unicode=True, chunk_size=1):
                 if not raw_line:
                     continue
                 line = raw_line.strip()
@@ -108,10 +152,27 @@ def post_optimized_path_stream(payload):
                     continue
 
                 event_type = str(ev.get("event", ""))
-                if event_type == "log":
-                    print(f"[server/log] {ev.get('message', '')}")
+                if event_type == "progress":
+                    percent = ev.get("percent", 0)
+                    stage = ev.get("stage", "")
+                    current = ev.get("current")
+                    total = ev.get("total")
+                    count_text = f" ({current}/{total})" if current is not None and total is not None else ""
+                    print(f"[server/progress] {percent}% {stage}{count_text}: {ev.get('message', '')}")
+                elif event_type == "diagnostic":
+                    _print_diagnostic_event(ev)
+                elif event_type == "error":
+                    print(
+                        f"[server/error] status={ev.get('status_code')} "
+                        f"type={ev.get('error_type')} stage={ev.get('stage')} "
+                        f"progress={ev.get('percent')}% id={ev.get('error_id')}: "
+                        f"{ev.get('message', '')}"
+                    )
                 elif event_type == "status":
-                    print(f"[server/status] {ev.get('message', '')}")
+                    stage = ev.get("stage")
+                    percent = ev.get("percent")
+                    state_text = f" {percent}% {stage}" if stage is not None and percent is not None else ""
+                    print(f"[server/status]{state_text}: {ev.get('message', '')}")
                 elif event_type == "accepted":
                     print(f"[server] {ev.get('message', '')}")
                 elif event_type == "result":
@@ -126,10 +187,9 @@ def post_optimized_path_stream(payload):
                             print("[server/result] success, waypoints=0")
                     else:
                         print(
-                            f"[server/result] failed (status={ev.get('status_code')}): {ev.get('detail')}"
+                            f"[server/result] failed (status={ev.get('status_code')}, "
+                            f"id={ev.get('error_id')}): {ev.get('detail')}"
                         )
-                else:
-                    print(f"[server/{event_type}] {ev}")
     except Exception as e:
         print(f"Error(stream): {e}")
         return {}

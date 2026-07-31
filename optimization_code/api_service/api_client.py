@@ -13,27 +13,35 @@ LOG_DIR = str(API_SERVICE_DIR / "logs")
 
 # /optimized-path is a long-running optimization endpoint.
 REQUEST_TIMEOUTS = {
-    "/optimized-path": 600,
+    "/optimized-path": 1000,
 }
 
 USE_STREAMING = True
 
 # 시작점 고도 기반.
 payload_optimal_corridor = {
-    # Required fields
+    # optional (engine default is used when omitted)
     "start_vertiport": {
         "lla": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
     },
-    # Required fields
+    # optional (engine default is used when omitted)
     "end_vertiport": {
         "lla": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
     },
-    # Required fields
+    # optional transition endpoints; replace either object with None for automatic fallback
+    # "takeoff_end": None,
+    # "landing_end": None,
+    "takeoff_end": {
+        "lla": {"lat": 35.59468397, "lon": 129.07515721},
+    },
+    "landing_end": {
+        "lla": {"lat": 35.59701567, "lon": 129.08585995},
+    },
+
+    # optional horizontal airspace
     "airspace_info": {
-        "center": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
+        "center": {"lat": 35.6033361, "lon": 129.0776917},
         "radius_km": 5.0,
-        "altitude_min_m": 100.0,
-        "altitude_max_m": 1000.0,
     },
     # Required fields
     "cruise_altitude_m": 600.0,
@@ -41,19 +49,27 @@ payload_optimal_corridor = {
     "no_fly_zones": [
         # {"bbox": [129.0700, 129.0820, 35.5980, 35.6100]},
     ],
-    # optional middle waypoints (if empty, start/end만으로 계산)
+    # optional middle waypoints (missing/null/empty uses no middle waypoints)
+    # alt_m is optional; every point uses cruise_altitude_m as its altitude.
     "corridor_points": [
-        {"lat": 35.6165628, "lon": 129.1174075, "alt_m": 600.0},
-        {"lat": 35.6125953, "lon": 129.1271681, "alt_m": 600.0},
-        {"lat": 35.5709934, "lon": 129.1042811, "alt_m": 600.0},
-        {"lat": 35.5693508, "lon": 129.0849280, "alt_m": 600.0},
-        {"lat": 35.5980918, "lon": 129.1098345, "alt_m": 600.0},
-        {"lat": 35.6009654, "lon": 129.0968764, "alt_m": 600.0},
-        {"lat": 35.5777004, "lon": 129.0787014, "alt_m": 600.0},
-        {"lat": 35.5901549, "lon": 129.0696139, "alt_m": 600.0},
-        {"lat": 35.6156051, "lon": 129.0442026, "alt_m": 600.0},
-        {"lat": 35.6329778, "lon": 129.0531218, "alt_m": 600.0},
-        {"lat": 35.6213509, "lon": 129.0687725, "alt_m": 600.0},
+        {"lat": 35.5924808, "lon": 129.0628871},
+        {"lat": 35.6073229, "lon": 129.0684057},
+        {"lat": 35.6143978, "lon": 129.0620381},
+        {"lat": 35.6131899, "lon": 129.0448457},
+        {"lat": 35.6235425, "lon": 129.0524868},
+        {"lat": 35.6219897, "lon": 129.0734997},
+        {"lat": 35.6052521, "lon": 129.0866594},
+        {"lat": 35.6055972, "lon": 129.1078846},
+        {"lat": 35.6171586, "lon": 129.1153134},
+        {"lat": 35.6118095, "lon": 129.1261383},
+        {"lat": 35.5897192, "lon": 129.1246525},
+        {"lat": 35.5750464, "lon": 129.1106439},
+        {"lat": 35.5671048, "lon": 129.0970597},
+        {"lat": 35.5655509, "lon": 129.0817776},
+        {"lat": 35.5757370, "lon": 129.0764712},
+        {"lat": 35.5810885, "lon": 129.0979087},
+        {"lat": 35.5955875, "lon": 129.1157379},
+        {"lat": 35.5900644, "lon": 129.0913289},
     ],
     # optional minimum corridor distance constraint (default: 0, meaning no constraint)
     "min_corridor_distance_km": 0.0,
@@ -95,6 +111,47 @@ def check_server_health():
         return False
 
 
+def _print_diagnostic_event(event):
+    checks = event.get("checks", {}) or {}
+    overall = checks.get("overall_feasible", {}) or {}
+    current = event.get("current", "?")
+    total = event.get("total", "?")
+    feasible = overall.get("passed", 0)
+    target = overall.get("target", 0)
+    state = str(event.get("state", ""))
+    if state == "completed":
+        print(
+            f"[server/diagnostic] initial population completed on retry "
+            f"{current}/{total}: feasible_candidates={feasible} (required={target})"
+        )
+        return
+    if state == "failed":
+        print(
+            f"[server/diagnostic] initial population failed after "
+            f"{current}/{total} retries: feasible_candidates={feasible} (required={target})"
+        )
+    else:
+        print(
+            f"[server/diagnostic] initial population retry {current}/{total}: "
+            f"feasible_candidates={feasible} (required={target})"
+        )
+
+    blockers = list(event.get("blockers", []) or [])[:3]
+    if blockers:
+        blocker_text = ", ".join(
+            f"{item.get('code')} {item.get('failed', 0)}/{item.get('evaluated', 0)}"
+            for item in blockers
+        )
+        print(f"  blockers: {blocker_text}")
+        actions = []
+        for item in blockers:
+            action = str(item.get("suggested_action", "")).strip()
+            if action and action not in actions:
+                actions.append(action)
+        if actions:
+            print(f"  suggested: {' | '.join(actions)}")
+
+
 def post_and_log_stream(payload):
     url = f"{SERVER_URL}/optimized-path/stream"
     final_event = None
@@ -103,7 +160,7 @@ def post_and_log_stream(payload):
             resp.raise_for_status()
             print("[client] streaming connected")
 
-            for raw_line in resp.iter_lines(decode_unicode=True):
+            for raw_line in resp.iter_lines(decode_unicode=True, chunk_size=1):
                 if not raw_line:
                     continue
                 line = raw_line.strip()
@@ -121,10 +178,27 @@ def post_and_log_stream(payload):
                     continue
 
                 event_type = str(ev.get("event", ""))
-                if event_type == "log":
-                    print(f"[server/log] {ev.get('message', '')}")
+                if event_type == "progress":
+                    percent = ev.get("percent", 0)
+                    stage = ev.get("stage", "")
+                    current = ev.get("current")
+                    total = ev.get("total")
+                    count_text = f" ({current}/{total})" if current is not None and total is not None else ""
+                    print(f"[server/progress] {percent}% {stage}{count_text}: {ev.get('message', '')}")
+                elif event_type == "diagnostic":
+                    _print_diagnostic_event(ev)
+                elif event_type == "error":
+                    print(
+                        f"[server/error] status={ev.get('status_code')} "
+                        f"type={ev.get('error_type')} stage={ev.get('stage')} "
+                        f"progress={ev.get('percent')}% id={ev.get('error_id')}: "
+                        f"{ev.get('message', '')}"
+                    )
                 elif event_type == "status":
-                    print(f"[server/status] {ev.get('message', '')}")
+                    stage = ev.get("stage")
+                    percent = ev.get("percent")
+                    state_text = f" {percent}% {stage}" if stage is not None and percent is not None else ""
+                    print(f"[server/status]{state_text}: {ev.get('message', '')}")
                 elif event_type == "accepted":
                     print(f"[server] {ev.get('message', '')}")
                 elif event_type == "result":
@@ -138,10 +212,10 @@ def post_and_log_stream(payload):
                         else:
                             print("[server/result] success, waypoints=0")
                     else:
-                        print(f"[server/result] failed (status={ev.get('status_code')}): {ev.get('detail')}")
-                else:
-                    print(f"[server/{event_type}] {ev}")
-
+                        print(
+                            f"[server/result] failed (status={ev.get('status_code')}, "
+                            f"id={ev.get('error_id')}): {ev.get('detail')}"
+                        )
     except Exception as e:
         print(f"Error(stream): {e}")
         return {

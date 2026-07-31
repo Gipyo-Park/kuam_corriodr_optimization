@@ -1,12 +1,15 @@
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Any, Dict, List, Optional, Tuple
 import asyncio
-import contextlib
 import queue
+import sys
 import threading
+import time
+import traceback
+import uuid
 import json
 from pathlib import Path
 
@@ -30,6 +33,24 @@ class LLA(BaseModel):
     alt_m: float
 
 
+class LatLon(BaseModel):
+    lat: float
+    lon: float
+
+
+class EndpointLatLon(BaseModel):
+    lat: float = Field(ge=-90.0, le=90.0)
+    lon: float = Field(ge=-180.0, le=180.0)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TransitionEndpoint(BaseModel):
+    lla: EndpointLatLon
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class WaypointLLA(BaseModel):
     lat: float
     lon: float
@@ -41,30 +62,31 @@ class Vertiport(BaseModel):
 
 
 class AirspaceInfo(BaseModel):
-    center: LLA
+    center: LatLon
     radius_km: float
-    altitude_min_m: float
-    altitude_max_m: float
 
 
 class PathRequest(BaseModel):
     """API 요청 본문 모델 (api_request.py 스키마)"""
     start_vertiport: Optional[Vertiport] = None
     end_vertiport: Optional[Vertiport] = None
+    takeoff_end: Optional[TransitionEndpoint] = None
+    landing_end: Optional[TransitionEndpoint] = None
     airspace_info: Optional[AirspaceInfo] = None
     # Preferred NFZ format: {"bbox": [lon_min, lon_max, lat_min, lat_max]}
-    # Backward compatible: {"center": {lat, lon, alt_m}, "radius_km": 1.0}
+    # Backward compatible: {"center": {lat, lon}, "radius_km": 1.0}
     no_fly_zones: List[Any] = Field(default_factory=list)
-    # Optional middle waypoints. If empty, optimization runs with start/end only.
-    corridor_points: List[WaypointLLA] = Field(default_factory=list)
+    # Optional middle waypoints. Missing/null/empty runs without middle waypoints.
+    corridor_points: Optional[List[WaypointLLA]] = None
     # Backward-compatible alias for corridor_points.
-    waypoints: List[WaypointLLA] = Field(default_factory=list)
+    waypoints: Optional[List[WaypointLLA]] = None
     # Required explicit cruise altitude used by planner altitude_levels.
     cruise_altitude_m: float
     min_corridor_distance_km: Optional[float] = 0.0
 
-    class Config:
-        schema_extra = {
+    # OpenAPI /docs display example only. Runtime defaults live in path_engine.py.
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "start_vertiport": {
                     "lla": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0}
@@ -72,22 +94,31 @@ class PathRequest(BaseModel):
                 "end_vertiport": {
                     "lla": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0}
                 },
+                "takeoff_end": {
+                    "lla": {
+                        "lat": 35.59468397,
+                        "lon": 129.07515721
+                    }
+                },
+                "landing_end": {
+                    "lla": {
+                        "lat": 35.59701567,
+                        "lon": 129.08585995
+                    }
+                },
                 "airspace_info": {
-                    "center": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
-                    "radius_km": 5.0,
-                    "altitude_min_m": 100.0,
-                    "altitude_max_m": 1000.0
+                    "center": {"lat": 35.6033361, "lon": 129.0776917},
+                    "radius_km": 5.0
                 },
                 "cruise_altitude_m": 600.0,
                 "no_fly_zones": [
                     {"bbox": [129.0600, 129.0700, 35.5950, 35.6050]}
                 ],
-                "corridor_points": [
-                    {"lat": 35.6201083, "lon": 129.1191806, "alt_m": 600.0}
-                ],
+                "corridor_points": [],
                 "min_corridor_distance_km": 0.0
             }
         }
+    )
 
 class PathResponse(BaseModel):
     """API 응답 본문 모델"""
@@ -100,29 +131,7 @@ class PathResponse(BaseModel):
 
 
 _EXCEL_ARTIFACTS: Dict[str, str] = {}
-
-
-class _QueueStreamWriter:
-    def __init__(self, event_queue: "queue.Queue[Dict[str, Any]]"):
-        self._q = event_queue
-        self._buf = ""
-
-    def write(self, s: str) -> int:
-        text = str(s)
-        if not text:
-            return 0
-        self._buf += text
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            line = line.rstrip("\r")
-            if line:
-                self._q.put({"event": "log", "message": line})
-        return len(text)
-
-    def flush(self) -> None:
-        if self._buf.strip():
-            self._q.put({"event": "log", "message": self._buf.strip()})
-        self._buf = ""
+SSE_HEARTBEAT_SECONDS = 10.0
 
 
 def _normalize_no_fly_zones(no_fly_zones: List[Any]) -> List[Any]:
@@ -152,7 +161,9 @@ def _normalize_no_fly_zones(no_fly_zones: List[Any]) -> List[Any]:
 
 
 def _build_engine_request(request: PathRequest) -> Dict[str, Any]:
-    points = request.corridor_points if len(request.corridor_points) > 0 else request.waypoints
+    corridor_points = request.corridor_points or []
+    legacy_waypoints = request.waypoints or []
+    points = corridor_points if corridor_points else legacy_waypoints
     engine_request: Dict[str, Any] = {
         "no_fly_zones": _normalize_no_fly_zones(request.no_fly_zones),
         "min_corridor_distance_km": float(request.min_corridor_distance_km or 0.0),
@@ -163,6 +174,10 @@ def _build_engine_request(request: PathRequest) -> Dict[str, Any]:
         engine_request["start_vertiport"] = {"lla": request.start_vertiport.lla.model_dump()}
     if request.end_vertiport is not None:
         engine_request["end_vertiport"] = {"lla": request.end_vertiport.lla.model_dump()}
+    if request.takeoff_end is not None:
+        engine_request["takeoff_end"] = request.takeoff_end.model_dump()
+    if request.landing_end is not None:
+        engine_request["landing_end"] = request.landing_end.model_dump()
     if request.airspace_info is not None:
         engine_request["airspace_info"] = request.airspace_info.model_dump()
     return engine_request
@@ -283,27 +298,68 @@ async def get_optimal_path(request: PathRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/optimized-path/stream", summary="Find Optimal Path With Streaming Logs")
+@app.post("/optimized-path/stream", summary="Find Optimal Path With Streaming Progress and Diagnostics")
 async def get_optimal_path_stream(request: PathRequest):
     """
-    SSE 스트림으로 서버 진행 로그(초기화/Gen/재시도)를 전달하고,
-    마지막에 result 이벤트로 최종 결과를 보냅니다.
+    Stream status, progress, initial-population diagnostics, errors, and the final
+    result through SSE. Detailed engine logs and tracebacks stay on the server.
     """
     event_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
     done = threading.Event()
-    state: Dict[str, Any] = {"engine_output": None, "error": None}
+    state: Dict[str, Any] = {
+        "engine_output": None,
+        "error": None,
+        "error_id": None,
+        "error_message": None,
+        "percent": 0,
+        "stage": "accepted",
+        "latest_diagnostic": None,
+    }
+
+    def _engine_event_callback(event: Dict[str, Any]) -> None:
+        percent = int(max(int(state["percent"]), min(100, max(0, int(event.get("percent", 0))))))
+        engine_event = dict(event)
+        event_type = str(engine_event.get("event", "progress"))
+        if event_type not in {"progress", "diagnostic"}:
+            event_type = "progress"
+        engine_event["event"] = event_type
+        engine_event["percent"] = percent
+        state["percent"] = percent
+        state["stage"] = str(engine_event.get("stage", state["stage"]))
+        if event_type == "diagnostic":
+            state["latest_diagnostic"] = engine_event
+        event_queue.put(engine_event)
+
+    def _record_exception(error: Exception) -> None:
+        error_id = uuid.uuid4().hex
+        error_message = str(error).strip() or (
+            f"{type(error).__name__} occurred without an error message."
+        )
+        state["error"] = error
+        state["error_id"] = error_id
+        state["error_message"] = error_message
+        print(
+            f"[path-engine/error] error_id={error_id} "
+            f"type={type(error).__name__} stage={state['stage']} "
+            f"percent={state['percent']} message={error_message}",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
 
     def _worker() -> None:
         try:
             event_queue.put({"event": "status", "message": "Request accepted. Building engine request..."})
+            state["stage"] = "input_validation"
             engine_request = _build_engine_request(request)
             event_queue.put({"event": "status", "message": "Path optimization started."})
-            writer = _QueueStreamWriter(event_queue)
-            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                state["engine_output"] = find_optimal_path_with_artifacts(engine_request)
-            writer.flush()
+            state["stage"] = "optimization"
+            state["engine_output"] = find_optimal_path_with_artifacts(
+                engine_request,
+                progress_callback=_engine_event_callback,
+            )
         except Exception as e:
-            state["error"] = str(e)
+            _record_exception(e)
         finally:
             done.set()
 
@@ -311,6 +367,8 @@ async def get_optimal_path_stream(request: PathRequest):
 
     async def _event_generator():
         yield f"data: {json.dumps({'event': 'accepted', 'message': 'Streaming started'}, ensure_ascii=False)}\n\n"
+        last_event_at = time.monotonic()
+        stream_started_at = last_event_at
 
         while not done.is_set() or not event_queue.empty():
             flushed = False
@@ -320,46 +378,143 @@ async def get_optimal_path_stream(request: PathRequest):
                 except queue.Empty:
                     break
                 flushed = True
+                last_event_at = time.monotonic()
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
 
             if not flushed:
+                now = time.monotonic()
+                if not done.is_set() and now - last_event_at >= SSE_HEARTBEAT_SECONDS:
+                    heartbeat = {
+                        "event": "status",
+                        "stage": state["stage"],
+                        "percent": int(state["percent"]),
+                        "elapsed_seconds": int(max(0.0, now - stream_started_at)),
+                        "message": "Optimization is still running.",
+                    }
+                    last_event_at = now
+                    yield f"data: {json.dumps(heartbeat, ensure_ascii=False)}\n\n"
+                    continue
                 await asyncio.sleep(0.15)
 
         if state.get("error") is not None:
-            payload = {
+            error = state["error"]
+            status_code = 422 if isinstance(error, ValueError) else 500
+            error_id = str(state["error_id"])
+            error_message = str(state["error_message"])
+            error_payload = {
+                "event": "error",
+                "status_code": status_code,
+                "error_type": type(error).__name__,
+                "stage": state["stage"],
+                "percent": int(state["percent"]),
+                "message": error_message,
+                "error_id": error_id,
+            }
+            yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+            result_payload = {
                 "event": "result",
                 "ok": False,
-                "status_code": 500,
-                "detail": state["error"],
+                "status_code": status_code,
+                "detail": error_message,
+                "error_id": error_id,
             }
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps(result_payload, ensure_ascii=False)}\n\n"
             return
 
         engine_output = state.get("engine_output") or {}
         path = engine_output.get("optimal_path", [])
         if not path:
-            payload = {
+            latest_diagnostic = state.get("latest_diagnostic")
+            initial_population_failed = bool(
+                isinstance(latest_diagnostic, dict)
+                and latest_diagnostic.get("stage") == "initial_population"
+                and latest_diagnostic.get("state") == "failed"
+            )
+            if initial_population_failed:
+                error_type = "NoFeasibleInitialPopulationError"
+                message = "No feasible initial population was found after all retries."
+            else:
+                error_type = "NoFeasiblePathError"
+                message = "Could not find a feasible optimal path with the given parameters."
+            error_id = uuid.uuid4().hex
+            print(
+                f"[path-engine/error] error_id={error_id} "
+                f"type={error_type} stage={state['stage']} "
+                f"percent={state['percent']} message={message}",
+                file=sys.stderr,
+                flush=True,
+            )
+            error_payload = {
+                "event": "error",
+                "status_code": 404,
+                "error_type": error_type,
+                "stage": state["stage"],
+                "percent": int(state["percent"]),
+                "message": message,
+                "error_id": error_id,
+                "run_dir": engine_output.get("run_dir"),
+            }
+            if initial_population_failed:
+                error_payload["diagnostic"] = latest_diagnostic
+            yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+            result_payload = {
                 "event": "result",
                 "ok": False,
                 "status_code": 404,
-                "detail": "Could not find a feasible optimal path with the given parameters.",
+                "detail": message,
+                "error_id": error_id,
                 "run_dir": engine_output.get("run_dir"),
             }
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            if initial_population_failed:
+                result_payload["diagnostic"] = latest_diagnostic
+            yield f"data: {json.dumps(result_payload, ensure_ascii=False)}\n\n"
             return
 
-        response_payload = _to_path_response_payload(engine_output)
-        payload = {
-            "event": "result",
-            "ok": True,
-            "response": response_payload,
-            "run_dir": engine_output.get("run_dir"),
-            "attempt": engine_output.get("attempt"),
-            "feasible_count": engine_output.get("feasible_count"),
-        }
-        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        try:
+            state["stage"] = "result_processing"
+            response_payload = _to_path_response_payload(engine_output)
+            payload = {
+                "event": "result",
+                "ok": True,
+                "response": response_payload,
+                "run_dir": engine_output.get("run_dir"),
+                "attempt": engine_output.get("attempt"),
+                "feasible_count": engine_output.get("feasible_count"),
+            }
+            result_event = json.dumps(payload, ensure_ascii=False)
+        except Exception as e:
+            _record_exception(e)
+            status_code = 422 if isinstance(e, ValueError) else 500
+            error_payload = {
+                "event": "error",
+                "status_code": status_code,
+                "error_type": type(e).__name__,
+                "stage": state["stage"],
+                "percent": int(state["percent"]),
+                "message": state["error_message"],
+                "error_id": state["error_id"],
+            }
+            yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+            result_payload = {
+                "event": "result",
+                "ok": False,
+                "status_code": status_code,
+                "detail": state["error_message"],
+                "error_id": state["error_id"],
+            }
+            yield f"data: {json.dumps(result_payload, ensure_ascii=False)}\n\n"
+            return
 
-    return StreamingResponse(_event_generator(), media_type="text/event-stream")
+        yield f"data: {result_event}\n\n"
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/artifacts/excel/{run_id}", summary="Download Excel Artifact")

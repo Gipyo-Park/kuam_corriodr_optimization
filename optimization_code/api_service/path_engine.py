@@ -1,7 +1,7 @@
 # API engine aligned with main_JS_1218_v20.py.
 # main_JS_1218_v20.py is the reference; this file keeps API input wrappers around that pipeline.
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 API_SERVICE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = API_SERVICE_DIR.parent
@@ -67,6 +67,223 @@ RF_ALLOW_TANGENT_CLAMP = True
 RF_CORNER_FIT_MARGIN = 0.95
 RF_CORNER_MIN_TANGENT_M = 1.0
 RF_MIN_TURN_ANGLE_DEG = 0.5
+
+DEFAULT_START_VERTIPORT = (35.603386, 129.078025, 150.0)
+DEFAULT_END_VERTIPORT = (35.6316511, 129.0535480, 150.0)
+
+ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
+
+
+def _emit_progress(
+    callback: ProgressCallback,
+    percent: float,
+    stage: str,
+    message: str,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
+) -> None:
+    if callback is None:
+        return
+    event: Dict[str, Any] = {
+        "event": "progress",
+        "percent": int(np.clip(round(float(percent)), 0, 100)),
+        "stage": str(stage),
+        "message": str(message),
+    }
+    if current is not None:
+        event["current"] = int(current)
+    if total is not None:
+        event["total"] = int(total)
+    callback(event)
+
+
+_INITIAL_BLOCKER_DETAILS: Dict[str, Dict[str, str]] = {
+    "initial_horizontal_airspace": {
+        "message": "Candidates were rejected by the initial horizontal airspace filter.",
+        "suggested_action": "Increase airspace_info.radius_km or move corridor points closer to the airspace center.",
+    },
+    "rf_geometry": {
+        "message": "Candidates could not form a feasible RF-turn geometry.",
+        "suggested_action": "Adjust waypoint spacing or reduce sharp direction changes.",
+    },
+    "horizontal_airspace": {
+        "message": "RF-adjusted paths extend outside the horizontal airspace.",
+        "suggested_action": "Increase airspace_info.radius_km or move corridor points inward.",
+    },
+    "minimum_corridor_distance": {
+        "message": "Candidates do not satisfy the minimum corridor distance.",
+        "suggested_action": "Reduce min_corridor_distance_km or provide a longer corridor.",
+    },
+    "path_too_short": {
+        "message": "A candidate path does not contain enough points.",
+        "suggested_action": "Provide additional corridor points or adjust their placement.",
+    },
+    "segment_distance_exceeds_limit": {
+        "message": "A path segment exceeds the allowed segment distance.",
+        "suggested_action": "Add intermediate corridor points between widely separated points.",
+    },
+    "segment_altitude_jump_exceeds_limit": {
+        "message": "A path segment exceeds the allowed altitude change.",
+        "suggested_action": "Adjust vertiport or cruise altitude inputs to reduce abrupt altitude changes.",
+    },
+    "nfz_centerline_intersection": {
+        "message": "A candidate centerline intersects a no-fly zone.",
+        "suggested_action": "Move corridor points away from the no-fly zone.",
+    },
+    "nfz_corridor_width_intersection": {
+        "message": "A candidate corridor width overlaps a no-fly zone.",
+        "suggested_action": "Move corridor points farther away from the no-fly zone boundary.",
+    },
+    "moc_corridor_width_intersection": {
+        "message": "A candidate corridor width overlaps an obstacle danger zone.",
+        "suggested_action": "Move corridor points away from MOC obstacle areas.",
+    },
+    "self_corridor_width_overlap": {
+        "message": "Non-adjacent portions of the corridor overlap.",
+        "suggested_action": "Reorder or reposition corridor points to remove loops and overlaps.",
+    },
+}
+
+
+def _make_initial_blocker(code: str, failed: int, evaluated: int) -> Dict[str, Any]:
+    details = _INITIAL_BLOCKER_DETAILS.get(
+        code,
+        {
+            "message": f"Candidates failed constraint: {code}.",
+            "suggested_action": "Review the active corridor inputs and constraint settings.",
+        },
+    )
+    return {
+        "code": str(code),
+        "failed": int(max(0, failed)),
+        "evaluated": int(max(0, evaluated)),
+        "message": details["message"],
+        "suggested_action": details["suggested_action"],
+    }
+
+
+def _build_initial_population_diagnostic(
+    retry: int,
+    total_retries: int,
+    n_init: int,
+    candidate_count: int,
+    rf_count: int,
+    rf_no_clamp_count: int,
+    constraint_count: int,
+    airspace_count: int,
+    distance_count: int,
+    feasible_count: int,
+    target_count: int,
+    reason_counts: Dict[str, int],
+    airspace_radius_km: float,
+    min_corridor_distance_km: float,
+    corridor_half_width_m: float,
+) -> Dict[str, Any]:
+    retry = int(retry)
+    total_retries = int(max(1, total_retries))
+    n_init = int(max(0, n_init))
+    candidate_count = int(max(0, candidate_count))
+    rf_count = int(max(0, rf_count))
+    target_count = int(max(0, target_count))
+
+    if feasible_count >= target_count:
+        diagnostic_state = "completed"
+        message = "Feasible initial population found. NSGA-III will start."
+    elif retry >= total_retries:
+        diagnostic_state = "failed"
+        message = "No feasible initial population was found after all retries."
+    else:
+        diagnostic_state = "searching"
+        message = "No feasible initial solution found yet."
+
+    blockers: List[Dict[str, Any]] = []
+    initial_airspace_failed = max(0, n_init - candidate_count)
+    if initial_airspace_failed:
+        blockers.append(
+            _make_initial_blocker(
+                "initial_horizontal_airspace",
+                initial_airspace_failed,
+                n_init,
+            )
+        )
+
+    rf_failed = max(0, candidate_count - rf_count)
+    if rf_failed:
+        blockers.append(_make_initial_blocker("rf_geometry", rf_failed, candidate_count))
+
+    for raw_reason, count in reason_counts.items():
+        reason_code = str(raw_reason).split(":", 1)[0].strip()
+        failed = int(max(0, count))
+        if failed:
+            blockers.append(_make_initial_blocker(reason_code, failed, rf_count))
+
+    horizontal_airspace_failed = max(0, rf_count - int(airspace_count))
+    if horizontal_airspace_failed:
+        blockers.append(
+            _make_initial_blocker(
+                "horizontal_airspace",
+                horizontal_airspace_failed,
+                rf_count,
+            )
+        )
+
+    minimum_distance_failed = max(0, rf_count - int(distance_count))
+    if minimum_distance_failed:
+        blockers.append(
+            _make_initial_blocker(
+                "minimum_corridor_distance",
+                minimum_distance_failed,
+                rf_count,
+            )
+        )
+
+    blockers.sort(key=lambda item: (-int(item["failed"]), str(item["code"])))
+    return {
+        "event": "diagnostic",
+        "percent": int(np.clip(round(40.0 + 15.0 * retry / total_retries), 40, 55)),
+        "stage": "initial_population",
+        "state": diagnostic_state,
+        "current": retry,
+        "total": total_retries,
+        "message": message,
+        "checks": {
+            "candidate_after_initial_airspace": {
+                "passed": candidate_count,
+                "total": n_init,
+            },
+            "rf_feasible": {
+                "passed": rf_count,
+                "total": candidate_count,
+            },
+            "rf_without_clamp": {
+                "passed": int(max(0, rf_no_clamp_count)),
+                "total": rf_count,
+            },
+            "constraint_feasible": {
+                "passed": int(max(0, constraint_count)),
+                "total": rf_count,
+            },
+            "horizontal_airspace_feasible": {
+                "passed": int(max(0, airspace_count)),
+                "total": rf_count,
+            },
+            "minimum_distance_feasible": {
+                "passed": int(max(0, distance_count)),
+                "total": rf_count,
+            },
+            "overall_feasible": {
+                "passed": int(max(0, feasible_count)),
+                "target": target_count,
+            },
+        },
+        "active_limits": {
+            "airspace_radius_km": float(airspace_radius_km),
+            "min_corridor_distance_km": float(min_corridor_distance_km),
+            "corridor_half_width_m": float(corridor_half_width_m),
+        },
+        "blockers": blockers,
+        "counts_may_overlap": True,
+    }
 
 
 def _title_with_altitude(title, altitude_levels, vertiport):
@@ -399,6 +616,42 @@ def build_transition_profile_by_mode(
         "end_lla": end_lla.astype(float),
     })
     return end_lla.astype(float), path_distance_m, profile.astype(float), geometry
+
+
+def build_transition_profile_to_endpoint(
+    start_lla,
+    end_lla,
+    sample_spacing_m=50.0,
+    mode_label="transition",
+):
+    """Build a linear transition profile ending at an explicit client coordinate."""
+    start = np.asarray(start_lla, dtype=float).reshape(3)
+    endpoint = np.asarray(end_lla, dtype=float).reshape(3)
+    profile = build_transition_profile_linear(
+        start,
+        endpoint,
+        sample_spacing_m=sample_spacing_m,
+    )
+    distance_m = _seg_dist_m(start, endpoint)
+    height_m = float(abs(endpoint[2] - start[2]))
+    angle_deg = float(np.rad2deg(np.arctan2(height_m, distance_m)))
+    heading_deg = _heading_deg_from_segment(start, endpoint)
+    geometry = {
+        "mode": "explicit_endpoint",
+        "height_m": height_m,
+        "distance_m": float(distance_m),
+        "angle_deg": angle_deg,
+        "heading_deg": float("nan") if heading_deg is None else float(heading_deg),
+        "sample_spacing_m": float(sample_spacing_m),
+        "end_lla": endpoint.astype(float),
+    }
+    print(
+        f"[{mode_label}] mode=explicit_endpoint | "
+        f"height={height_m:.1f}m | distance={distance_m:.1f}m | "
+        f"angle={angle_deg:.2f}deg | heading={geometry['heading_deg']:.2f}deg | "
+        f"samples={profile.shape[0]} | sample_spacing={float(sample_spacing_m):.1f}m"
+    )
+    return endpoint.astype(float), float(distance_m), profile.astype(float), geometry
 
 
 def build_full_corridor_path(start_vertiport, takeoff_complete, path_core, landing_entry, end_vertiport):
@@ -919,7 +1172,7 @@ def collect_waypoints_from_clicks(
         plt.switch_backend("TkAgg")
         matplotlib.rcParams["toolbar"] = "None"
     except Exception:
-        print("Failed to activate TkAgg for click input. Falling back to default waypoints.")
+        print("Failed to activate TkAgg for click input. Continuing without middle waypoints.")
         return np.empty((0, 2), dtype=float)
 
     fig = plt.figure("Waypoint Click Input", figsize=(11, 8))
@@ -1509,28 +1762,18 @@ def _dist_to_center_m(points_latlon, center_latlon):
     return np.sqrt(dlat * dlat + dlon * dlon)
 
 
-def filter_nodes_in_airspace(cand, center_latlon, radius_m, alt_min_m=None, alt_max_m=None):
+def filter_nodes_in_airspace(cand, center_latlon, radius_m):
     if cand is None or cand.size == 0:
         return cand
     d = _dist_to_center_m(cand[:, :2], center_latlon)
-    mask = d <= float(radius_m)
-    if alt_min_m is not None:
-        mask &= cand[:, 2] >= float(alt_min_m)
-    if alt_max_m is not None:
-        mask &= cand[:, 2] <= float(alt_max_m)
-    return cand[mask]
+    return cand[d <= float(radius_m)]
 
 
-def is_path_inside_airspace(path, center_latlon, radius_m, alt_min_m=None, alt_max_m=None):
+def is_path_inside_airspace(path, center_latlon, radius_m):
     if path is None or path.size == 0:
         return False
     d = _dist_to_center_m(path[:, :2], center_latlon)
-    mask = d <= float(radius_m)
-    if alt_min_m is not None:
-        mask &= path[:, 2] >= float(alt_min_m)
-    if alt_max_m is not None:
-        mask &= path[:, 2] <= float(alt_max_m)
-    return bool(np.all(mask))
+    return bool(np.all(d <= float(radius_m)))
 
 
 def generate_single_initial_solution(
@@ -2119,8 +2362,8 @@ def run_nsga3(
     MOCRisk,
     start_vertiport, end_vertiport, landing_entry, takeoff_complete,
     airspace_center_latlon, airspace_radius_m,
-    airspace_alt_min_m, airspace_alt_max_m,
     min_corridor_distance_m,
+    progress_callback: ProgressCallback = None,
 ):
     """NSGA-III with RF-turn preprocessing."""
 
@@ -2157,8 +2400,6 @@ def run_nsga3(
             full_path,
             airspace_center_latlon,
             airspace_radius_m,
-            alt_min_m=airspace_alt_min_m,
-            alt_max_m=airspace_alt_max_m,
         ):
             f_pen = np.asarray(temp_f, dtype=float) + 1e6
             return f_pen, False
@@ -2266,6 +2507,14 @@ def run_nsga3(
             f"offspring: {offspring_count} (unique {offspring_unique}) | "
             f"next_pop: {next_count} (unique {next_unique}) | "
             f"carry_over: {int(carry_over_used)}"
+        )
+        _emit_progress(
+            progress_callback,
+            60.0 + 25.0 * float(gen) / float(max(1, Nmax)),
+            "nsga3",
+            f"NSGA-III generation {gen}/{Nmax}",
+            current=gen,
+            total=Nmax,
         )
 
         pop = [_enforce_mandatory_wp_order(pn, mandatory_backbone) for pn in pop_next]
@@ -2400,8 +2649,6 @@ def _compute_final_feasibility(
     eval_corridor_objectives_fn,
     airspace_center_lla,
     airspace_radius_m,
-    airspace_alt_min_m,
-    airspace_alt_max_m,
     min_corridor_distance_m,
 ):
     """Evaluate final feasibility mask and RF no-clamp count for a population."""
@@ -2417,8 +2664,6 @@ def _compute_final_feasibility(
             full_path,
             airspace_center_lla[:2],
             airspace_radius_m,
-            alt_min_m=airspace_alt_min_m,
-            alt_max_m=airspace_alt_max_m,
         )
         dist_ok = True
         if min_corridor_distance_m > 0.0:
@@ -2486,8 +2731,6 @@ def _make_initial_population(
     min_seg_for_extra_nodes_m,
     airspace_center_lla,
     airspace_radius_m,
-    airspace_alt_min_m,
-    airspace_alt_max_m,
     enforce_mandatory_wp_order,
 ):
     """Create up to N_init airspace-filtered initial solutions."""
@@ -2534,8 +2777,6 @@ def _make_initial_population(
             sol,
             airspace_center_lla[:2],
             airspace_radius_m,
-            alt_min_m=airspace_alt_min_m,
-            alt_max_m=airspace_alt_max_m,
         ):
             if enforce_mandatory_wp_order:
                 sol = _enforce_mandatory_wp_order(sol, backbone)
@@ -2551,8 +2792,6 @@ def _evaluate_initial_candidates(
     eval_constraints_with_reason_fn,
     airspace_center_lla,
     airspace_radius_m,
-    airspace_alt_min_m,
-    airspace_alt_max_m,
     min_corridor_distance_m,
 ):
     """Evaluate RF + constraints for initial candidates and return summary stats."""
@@ -2582,8 +2821,6 @@ def _evaluate_initial_candidates(
                 full_path,
                 airspace_center_lla[:2],
                 airspace_radius_m,
-                alt_min_m=airspace_alt_min_m,
-                alt_max_m=airspace_alt_max_m,
             )
             dist_ok = True
             if min_corridor_distance_m > 0.0:
@@ -2638,8 +2875,6 @@ def _export_route_outputs(
     airspace_center_lla,
     airspace_radius_m,
     airspace_radius_km,
-    airspace_alt_min_m,
-    airspace_alt_max_m,
     forbidden_zones,
     use_takeoff_landing_transition,
     end_vertiport,
@@ -2747,11 +2982,8 @@ def _export_route_outputs(
         "Zone_ID": 1,
         "Lat": float(airspace_center_lla[0]),
         "Lon": float(airspace_center_lla[1]),
-        "Alt_m": float(airspace_center_lla[2]),
         "Radius_m": float(airspace_radius_m),
         "Radius_km": float(airspace_radius_km),
-        "Alt_Min_m": float(airspace_alt_min_m),
-        "Alt_Max_m": float(airspace_alt_max_m),
     }]
     for pi, p in enumerate(build_circle_lla(airspace_center_lla, airspace_radius_m, n_pts=180), start=1):
         airspace_rows.append({
@@ -2760,11 +2992,8 @@ def _export_route_outputs(
             "Point_No": pi,
             "Lat": float(p[0]),
             "Lon": float(p[1]),
-            "Alt_m": float(p[2]),
             "Radius_m": float(airspace_radius_m),
             "Radius_km": float(airspace_radius_km),
-            "Alt_Min_m": float(airspace_alt_min_m),
-            "Alt_Max_m": float(airspace_alt_max_m),
         })
     df_airspace = pd.DataFrame(airspace_rows)
 
@@ -2882,10 +3111,10 @@ def _export_route_outputs(
             "Alt_m": float(landing_entry[2]),
         },
     ]
-    n_wp_default = min(int(np.size(corridor_lat_default)), int(np.size(corridor_lon_default)))
-    for i_wp in range(n_wp_default):
+    n_corridor_points = min(int(np.size(corridor_lat_default)), int(np.size(corridor_lon_default)))
+    for i_wp in range(n_corridor_points):
         input_rows.append({
-            "Point_Name": f"WP_Default_{i_wp+1:03d}",
+            "Point_Name": f"Corridor_Point_{i_wp+1:03d}",
             "Lat": float(corridor_lat_default[i_wp]),
             "Lon": float(corridor_lon_default[i_wp]),
             "Alt_m": float(waypoint_alt_fixed_m),
@@ -3294,15 +3523,19 @@ def _plot_representative_corridor_figures(
 def attempt_run_once(
     start_point: Optional[Sequence[float]] = None,
     end_point: Optional[Sequence[float]] = None,
+    takeoff_end_lla: Optional[Sequence[float]] = None,
+    landing_end_lla: Optional[Sequence[float]] = None,
     airspace_info: Optional[Dict[str, Any]] = None,
     no_fly_zones: Optional[Sequence[Dict[str, Any]]] = None,
     min_corridor_distance_km: Optional[float] = None,
     corridor_points: Optional[Sequence[Sequence[float]]] = None,
     cruise_altitude_m: Optional[float] = None,
+    progress_callback: ProgressCallback = None,
 ):
     airspace_info = {} if airspace_info is None else dict(airspace_info)
     no_fly_zones = [] if no_fly_zones is None else list(no_fly_zones)
     corridor_points = [] if corridor_points is None else corridor_points
+    _emit_progress(progress_callback, 5, "input_resolution", "Resolving request inputs and defaults.")
 
     # ==================== Core Parameters ====================
     W_half = 296.0                   # TSE=148 (m), W_half = TSE*2 (m)
@@ -3467,7 +3700,7 @@ def attempt_run_once(
     clicked_wp_map_zoom = 13    # 클릭 입력용 지도 초기 줌 레벨
     clicked_wp_base_name = "clicked_waypoints"
     if use_clicked_waypoints and not USE_INTERACTIVE_BACKEND:
-        print("Interactive backend is not available. Falling back to default predefined waypoints.")
+        print("Interactive backend is not available. Continuing without middle waypoints.")
         use_clicked_waypoints = False
 
     W_buf = 1250.0  # 회랑 버퍼 폭 (m)
@@ -3483,8 +3716,6 @@ def attempt_run_once(
     flight_dist_limit = 100000.0 
     objective_names = ["Distance", "Ground Risk", "Air Risk", "Noise Risk"]
     airspace_radius_m = float(airspace_radius_km) * 1000.0
-    airspace_alt_min_m = float(airspace_info.get("altitude_min_m", 100.0))
-    airspace_alt_max_m = float(airspace_info.get("altitude_max_m", 1000.0))
     min_corridor_distance_m = float(min_corridor_distance_km) * 1000.0
 
     noise_npy_path = project_path("noise_data", "noise_lden_grid.npy")
@@ -3506,10 +3737,20 @@ def attempt_run_once(
 
     # start_vertiport_default = np.array([35.6033361, 129.0776917, 150.0], dtype=float) # 26년 5월 28일 변경전 버티포트 좌표
     # end_vertiport_default = np.array([35.6033361, 129.0776917, 150.0], dtype=float)   # 26년 5월 28일 변경전 버티포트 좌표
-    start_vertiport_default = np.array([35.603386, 129.078025, 150.0], dtype=float) # 변경후 버티포트 좌표
-    end_vertiport_default = np.array([35.6316511, 129.0535480, 150.0], dtype=float)   # 변경후 버티포트 좌표
-    takeoff_end_lla = np.array([35.59468397, 129.07515721, float(altitude_levels[0])], dtype=float) # 이륙 끝 지점, 고도를 순항 고도와 일치하도록 설정
-    landing_end_lla = np.array([35.59701567, 129.08585995, float(altitude_levels[0])], dtype=float) #  착륙 끝 지점, 고도를 순항 고도와 일치하도록 설정
+    start_vertiport_default = np.asarray(DEFAULT_START_VERTIPORT, dtype=float)
+    end_vertiport_default = np.asarray(DEFAULT_END_VERTIPORT, dtype=float)
+    takeoff_end_lla_default = np.array([35.59468397, 129.07515721, float(altitude_levels[0])], dtype=float) # 이륙 끝 지점, 고도를 순항 고도와 일치하도록 설정
+    landing_end_lla_default = np.array([35.59701567, 129.08585995, float(altitude_levels[0])], dtype=float) #  착륙 끝 지점, 고도를 순항 고도와 일치하도록 설정
+    takeoff_end_lla_request = _normalize_transition_endpoint(
+        takeoff_end_lla,
+        float(altitude_levels[0]),
+        "takeoff_end_lla",
+    )
+    landing_end_lla_request = _normalize_transition_endpoint(
+        landing_end_lla,
+        float(altitude_levels[0]),
+        "landing_end_lla",
+    )
     if start_point is not None:
         start_vertiport_default = np.asarray(start_point, dtype=float).reshape(3)
     if end_point is not None:
@@ -3578,8 +3819,8 @@ def attempt_run_once(
         "takeoff_heading_deg": float(takeoff_heading_deg),
         "landing_heading_deg": float(landing_heading_deg),
         "use_takeoff_landing_transition": bool(use_takeoff_landing_transition),
-        "takeoff_end_lla": [float(v) for v in takeoff_end_lla.tolist()],
-        "landing_end_lla": [float(v) for v in landing_end_lla.tolist()],
+        "takeoff_end_lla": [float(v) for v in takeoff_end_lla_default.tolist()],
+        "landing_end_lla": [float(v) for v in landing_end_lla_default.tolist()],
         "transition_mode": str(transition_mode),
         "takeoff_distance_m": float(takeoff_distance_m),
         "landing_distance_m": float(landing_distance_m),
@@ -3611,8 +3852,6 @@ def attempt_run_once(
         "check_corridor_self_overlap": check_corridor_self_overlap,
         "wp_skip_prob": wp_skip_prob,
         "airspace_radius_km": airspace_radius_km,
-        "airspace_alt_min_m": airspace_alt_min_m,
-        "airspace_alt_max_m": airspace_alt_max_m,
         "min_corridor_distance_km": min_corridor_distance_km,
         "min_corridor_distance_m": min_corridor_distance_m,
         "use_clicked_waypoints": bool(use_clicked_waypoints),
@@ -3629,6 +3868,7 @@ def attempt_run_once(
         json.dump(params_dict, _pf, indent=2, ensure_ascii=False)
     print(f"Output folder : {out_dir}")
 
+    _emit_progress(progress_callback, 10, "risk_map_loading", "Loading ground, air, MOC, and noise risk maps.")
     pop_risk_raw = np.load(str(ground_risk_path), allow_pickle=True)
     selected = pop_risk_raw[:, :, 0, 3:]
     Ny, Nx, H_time = selected.shape
@@ -3708,6 +3948,7 @@ def attempt_run_once(
     params_dict.update({
         "noise_meta": noise_meta,
     })
+    _emit_progress(progress_callback, 20, "risk_map_loading", "Risk maps loaded and aligned.")
 
     # main eval extent is fixed by v18 settings; keep NPY extents as diagnostics only.
     _lat_lim_meta = noise_meta.get("lat_lim_meta", None)
@@ -3735,7 +3976,12 @@ def attempt_run_once(
 
     center_obj = airspace_info.get("center")
     if isinstance(center_obj, dict):
-        airspace_center_lla = _parse_lla_dict(center_obj, "airspace_info.center")
+        center_latlon = _parse_latlon_dict(center_obj, "airspace_info.center")
+        airspace_center_lla = np.array([
+            center_latlon[0],
+            center_latlon[1],
+            0.5 * (float(start_vertiport[2]) + float(end_vertiport[2])),
+        ], dtype=float)
     else:
         airspace_center_lla = None
 
@@ -3750,23 +3996,12 @@ def attempt_run_once(
         if airspace_center_lla.size != 3:
             raise ValueError("airspace_center_lla must be [lat, lon, alt].")
 
-    if float(airspace_alt_max_m) <= float(airspace_alt_min_m):
-        raise ValueError("airspace_alt_max_m must be greater than airspace_alt_min_m.")
-
-    cruise_alt_min_m = float(np.min(altitude_levels))
-    cruise_alt_max_m = float(np.max(altitude_levels))
-    if cruise_alt_min_m < float(airspace_alt_min_m) or cruise_alt_max_m > float(airspace_alt_max_m):
-        raise ValueError(
-            "Cruise altitude is outside configured airspace altitude range. "
-            f"cruise_altitude_levels_m={altitude_levels.tolist()}, "
-            f"airspace_alt_range_m=[{float(airspace_alt_min_m):.1f}, {float(airspace_alt_max_m):.1f}]. "
-            "Map visualization is 2D (horizontal) and does not show altitude violations."
-        )
     print(
         f"Airspace check: radius={airspace_radius_km:.1f}km, "
-        f"alt_range=[{float(airspace_alt_min_m):.1f}, {float(airspace_alt_max_m):.1f}]m, "
-        f"cruise={float(altitude_levels[0]):.1f}m MSL"
+        f"horizontal center=({float(airspace_center_lla[0]):.7f}, "
+        f"{float(airspace_center_lla[1]):.7f})"
     )
+    _emit_progress(progress_callback, 25, "input_validation", "Validated horizontal airspace and active inputs.")
 
     #
     #
@@ -3774,8 +4009,8 @@ def attempt_run_once(
     # lon_lim = [129.0514, 129.1436]
     request = cimgt.OSM()
 
-    corridor_lat_default = np.array([], dtype=float)
-    corridor_lon_default = np.array([], dtype=float)
+    corridor_lat_default = np.empty((0,), dtype=float)
+    corridor_lon_default = np.empty((0,), dtype=float)
 
 
     # WP set (alt=750m), msl 750일때, agl = 600 일때 위경도값, 이거 사용시 altitude_levels를 750으로 고정해야 함
@@ -3833,34 +4068,68 @@ def attempt_run_once(
         corridor_lat = corridor_points_arr[:, 0].astype(float)
         corridor_lon = corridor_points_arr[:, 1].astype(float)
 
+    takeoff_endpoint_source = (
+        "api_request" if takeoff_end_lla_request is not None else "automatic_transition"
+    )
+    landing_endpoint_source = (
+        "api_request" if landing_end_lla_request is not None else "automatic_transition"
+    )
+
     if use_takeoff_landing_transition:
-        preview_takeoff, _, takeoff_transition_profile, takeoff_transition_meta = build_transition_profile_by_mode(
-            start_vertiport,
-            target_alt_m=waypoint_alt_fixed_m,
-            heading_deg=takeoff_heading_deg,
-            transition_mode=transition_mode,
-            distance_m=takeoff_distance_m,
-            angle_deg=takeoff_angle_deg,
-            sample_spacing_m=transition_sample_spacing_m,
-            mode_label="takeoff",
-        )
-        preview_landing, _, landing_transition_profile, landing_transition_meta = build_transition_profile_by_mode(
-            end_vertiport,
-            target_alt_m=waypoint_alt_fixed_m,
-            heading_deg=landing_heading_deg,
-            transition_mode=transition_mode,
-            distance_m=landing_distance_m,
-            angle_deg=landing_angle_deg,
-            sample_spacing_m=transition_sample_spacing_m,
-            mode_label="landing",
-        )
+        if takeoff_end_lla_request is None:
+            preview_takeoff, _, takeoff_transition_profile, takeoff_transition_meta = build_transition_profile_by_mode(
+                start_vertiport,
+                target_alt_m=waypoint_alt_fixed_m,
+                heading_deg=takeoff_heading_deg,
+                transition_mode=transition_mode,
+                distance_m=takeoff_distance_m,
+                angle_deg=takeoff_angle_deg,
+                sample_spacing_m=transition_sample_spacing_m,
+                mode_label="takeoff",
+            )
+        else:
+            preview_takeoff, _, takeoff_transition_profile, takeoff_transition_meta = build_transition_profile_to_endpoint(
+                start_vertiport,
+                takeoff_end_lla_request,
+                sample_spacing_m=transition_sample_spacing_m,
+                mode_label="takeoff",
+            )
+
+        if landing_end_lla_request is None:
+            preview_landing, _, landing_transition_profile, landing_transition_meta = build_transition_profile_by_mode(
+                end_vertiport,
+                target_alt_m=waypoint_alt_fixed_m,
+                heading_deg=landing_heading_deg,
+                transition_mode=transition_mode,
+                distance_m=landing_distance_m,
+                angle_deg=landing_angle_deg,
+                sample_spacing_m=transition_sample_spacing_m,
+                mode_label="landing",
+            )
+        else:
+            preview_landing, _, landing_transition_profile, landing_transition_meta = build_transition_profile_to_endpoint(
+                end_vertiport,
+                landing_end_lla_request,
+                sample_spacing_m=transition_sample_spacing_m,
+                mode_label="landing",
+            )
         if landing_transition_profile is None or np.size(landing_transition_profile) == 0:
             landing_transition_profile_desc = landing_transition_profile
         else:
             landing_transition_profile_desc = np.asarray(landing_transition_profile, dtype=float)[::-1].copy()
     else:
-        preview_takeoff = np.asarray(takeoff_end_lla, dtype=float).reshape(3)
-        preview_landing = np.asarray(landing_end_lla, dtype=float).reshape(3)
+        preview_takeoff = np.asarray(
+            takeoff_end_lla_request
+            if takeoff_end_lla_request is not None
+            else takeoff_end_lla_default,
+            dtype=float,
+        ).reshape(3)
+        preview_landing = np.asarray(
+            landing_end_lla_request
+            if landing_end_lla_request is not None
+            else landing_end_lla_default,
+            dtype=float,
+        ).reshape(3)
         takeoff_transition_profile = np.empty((0, 3), dtype=float)
         landing_transition_profile = np.empty((0, 3), dtype=float)
         landing_transition_profile_desc = np.empty((0, 3), dtype=float)
@@ -3908,8 +4177,6 @@ def attempt_run_once(
             emergency_points_preview,
             airspace_center_lla[:2],
             airspace_radius_m,
-            alt_min_m=airspace_alt_min_m,
-            alt_max_m=airspace_alt_max_m,
         )
 
     forbidden_zones_input = _parse_no_fly_zones_to_bbox(no_fly_zones)
@@ -3957,10 +4224,10 @@ def attempt_run_once(
             else:
                 print(
                     f"Clicked waypoint count {clicked_latlon.shape[0]} is less than "
-                    f"minimum {min_clicked_waypoints}. Using fallback corridor WPs."
+                    f"minimum {min_clicked_waypoints}. Continuing without middle waypoints."
                 )
         except Exception as e:
-            print(f"Click-based waypoint input failed; using fallback corridor WPs. Reason: {e}")
+            print(f"Click-based waypoint input failed; continuing without middle waypoints. Reason: {e}")
 
     if corridor_lat.shape[0] != corridor_lon.shape[0]:
         raise ValueError("corridor_lat_default and corridor_lon_default must have same length.")
@@ -3973,7 +4240,10 @@ def attempt_run_once(
         for i, wp in enumerate(waypoints, start=1):
             print(f"  WP{i:02d}: lat={wp[0]:.7f}, lon={wp[1]:.7f}, alt={wp[2]:.1f}m")
     else:
-        print("No middle waypoints provided. Optimization will run with start/end vertiports only.")
+        print(
+            "No middle waypoints provided. Optimization backbone will use only "
+            "the takeoff and landing endpoints."
+        )
 
     takeoff_target_alt = float(waypoint_alt_fixed_m)  # 이륙 전이 목표 고도(MSL, m)
     landing_target_alt = float(waypoint_alt_fixed_m)  # 착륙 전이 목표 고도(MSL, m)
@@ -3999,15 +4269,12 @@ def attempt_run_once(
         backbone,
         airspace_center_lla[:2],
         airspace_radius_m,
-        alt_min_m=airspace_alt_min_m,
-        alt_max_m=airspace_alt_max_m,
     ):
         _d_backbone = _dist_to_center_m(backbone[:, :2], airspace_center_lla[:2])
         raise ValueError(
-            "Backbone waypoints are outside airspace constraints. "
-            f"max_horizontal_dist_m={float(np.max(_d_backbone)):.1f} (radius={float(airspace_radius_m):.1f}), "
-            f"backbone_alt_range_m=[{float(np.min(backbone[:, 2])):.1f}, {float(np.max(backbone[:, 2])):.1f}] "
-            f"(allowed=[{float(airspace_alt_min_m):.1f}, {float(airspace_alt_max_m):.1f}])."
+            "Backbone waypoints are outside horizontal airspace constraints. "
+            f"max_horizontal_dist_m={float(np.max(_d_backbone)):.1f} "
+            f"(radius={float(airspace_radius_m):.1f})."
         )
     is_fixed = np.zeros(backbone.shape[0], dtype=bool)
     is_fixed[:] = True    # takeoff + 모든 입력 WP + landing 고정
@@ -4018,14 +4285,16 @@ def attempt_run_once(
             emergency_points,
             airspace_center_lla[:2],
             airspace_radius_m,
-            alt_min_m=airspace_alt_min_m,
-            alt_max_m=airspace_alt_max_m,
         )
     else:
         emergency_points = np.empty((0, 3), dtype=float)
 
     params_dict.update({
-        "waypoint_source": ("clicked_map" if clicked_wp_json_path is not None else "manual_or_empty_default"),
+        "waypoint_source": (
+            "clicked_map"
+            if clicked_wp_json_path is not None
+            else ("api_request" if has_middle_waypoints else "none")
+        ),
         "use_emergency_points": bool(use_emergency_points),
         "use_forbidden_zones": bool(use_forbidden_zones),
         "clicked_waypoints_json": (str(clicked_wp_json_path) if clicked_wp_json_path is not None else None),
@@ -4050,6 +4319,10 @@ def attempt_run_once(
         "landing_sector": 11,
         "actual_takeoff_angle_deg": float(takeoff_transition_meta["angle_deg"]),
         "alt_delta_m": float(abs(takeoff_target_alt - start_vertiport[2])),
+        "takeoff_end_lla": [float(v) for v in takeoff_complete.tolist()],
+        "landing_end_lla": [float(v) for v in landing_entry.tolist()],
+        "takeoff_endpoint_source": takeoff_endpoint_source,
+        "landing_endpoint_source": landing_endpoint_source,
         "takeoff_complete": {
             "lat": float(takeoff_complete[0]),
             "lon": float(takeoff_complete[1]),
@@ -4082,17 +4355,14 @@ def attempt_run_once(
         ],
         "airspace_info": {
             "type": "circle",
-            "center_lla": {
+            "center": {
                 "lat": float(airspace_center_lla[0]),
                 "lon": float(airspace_center_lla[1]),
-                "alt_m": float(airspace_center_lla[2]),
             },
             "radius_m": float(airspace_radius_m),
             "radius_km": float(airspace_radius_km),
-            "alt_min_m": float(airspace_alt_min_m),
-            "alt_max_m": float(airspace_alt_max_m),
-            "boundary_lla": [
-                {"lat": float(p[0]), "lon": float(p[1]), "alt_m": float(p[2])}
+            "boundary_latlon": [
+                {"lat": float(p[0]), "lon": float(p[1])}
                 for p in build_circle_lla(airspace_center_lla, airspace_radius_m, n_pts=180)
             ],
         },
@@ -4143,8 +4413,6 @@ def attempt_run_once(
             nodes_seg,
             airspace_center_lla[:2],
             airspace_radius_m,
-            alt_min_m=airspace_alt_min_m,
-            alt_max_m=airspace_alt_max_m,
         )
         if nodes_seg.size == 0:
             return np.empty((0, 3)), 0.0
@@ -4181,8 +4449,6 @@ def attempt_run_once(
             nodes_seg,
             airspace_center_lla[:2],
             airspace_radius_m,
-            alt_min_m=airspace_alt_min_m,
-            alt_max_m=airspace_alt_max_m,
         )
         if nodes_seg.size == 0:
             return np.empty((0, 3)), 0.0
@@ -4211,6 +4477,7 @@ def attempt_run_once(
             thr = float(risks[pick[-1]]) if pick.size > 0 else float(np.max(risks))
         return safe, thr
 
+    _emit_progress(progress_callback, 30, "safe_nodes", "Generating horizontal-airspace candidate nodes.")
     safe_nodes_by_seg = []
     safe_airrisk_by_seg = []
     thr_list = []
@@ -4291,6 +4558,7 @@ def attempt_run_once(
         f"(max {max_init_retries} retries, N_init={N_init}, "
         f"min_feasible_init_solutions={min_feasible_init_solutions}) ..."
     )
+    _emit_progress(progress_callback, 40, "initial_population", "Searching for a feasible initial population.")
     rf_corridor_start = np.asarray(takeoff_complete if not use_takeoff_landing_transition else start_vertiport, dtype=float)
     rf_corridor_end = np.asarray(landing_entry if not use_takeoff_landing_transition else end_vertiport, dtype=float)
     _apply_rf_for_init = partial(
@@ -4339,6 +4607,15 @@ def attempt_run_once(
 
     init_pop = None
     for _retry in range(1, max_init_retries + 1):
+        if _retry == 1 or _retry % 10 == 0:
+            _emit_progress(
+                progress_callback,
+                40.0 + 15.0 * float(_retry) / float(max(1, max_init_retries)),
+                "initial_population",
+                f"Initial population retry {_retry}/{max_init_retries}",
+                current=_retry,
+                total=max_init_retries,
+            )
         _candidate = _make_initial_population(
             N_init=N_init,
             use_wp_skip_generator=use_wp_skip_generator,
@@ -4359,14 +4636,32 @@ def attempt_run_once(
             min_seg_for_extra_nodes_m=min_seg_for_extra_nodes_m,
             airspace_center_lla=airspace_center_lla,
             airspace_radius_m=airspace_radius_m,
-            airspace_alt_min_m=airspace_alt_min_m,
-            airspace_alt_max_m=airspace_alt_max_m,
             enforce_mandatory_wp_order=enforce_mandatory_wp_order,
         )
         if len(_candidate) < N_init:
             print(f"  [Init] Airspace-filtered initial pop: {len(_candidate)}/{N_init}")
         _cand_n = len(_candidate)
         if not _candidate:
+            if progress_callback is not None:
+                progress_callback(
+                    _build_initial_population_diagnostic(
+                        retry=_retry,
+                        total_retries=max_init_retries,
+                        n_init=N_init,
+                        candidate_count=0,
+                        rf_count=0,
+                        rf_no_clamp_count=0,
+                        constraint_count=0,
+                        airspace_count=0,
+                        distance_count=0,
+                        feasible_count=0,
+                        target_count=min_feasible_init_solutions,
+                        reason_counts={},
+                        airspace_radius_km=airspace_radius_km,
+                        min_corridor_distance_km=min_corridor_distance_km,
+                        corridor_half_width_m=W_half,
+                    )
+                )
             if _retry % 50 == 0:
                 print(f"  [Init retry {_retry}/{max_init_retries}] candidate_after_initial_airspace: 0/{N_init}")
             continue
@@ -4379,8 +4674,6 @@ def attempt_run_once(
             eval_constraints_with_reason_fn=_eval_with_reason_for_init,
             airspace_center_lla=airspace_center_lla,
             airspace_radius_m=airspace_radius_m,
-            airspace_alt_min_m=airspace_alt_min_m,
-            airspace_alt_max_m=airspace_alt_max_m,
             min_corridor_distance_m=min_corridor_distance_m,
         )
         _rf_cnt = int(_init_eval["rf_cnt"])
@@ -4391,6 +4684,27 @@ def attempt_run_once(
         _dist_cnt = int(_init_eval["dist_cnt"])
         _reason_counts = dict(_init_eval["reason_counts"])
         _feasible_init = list(_init_eval["feasible_init"])
+
+        if progress_callback is not None:
+            progress_callback(
+                _build_initial_population_diagnostic(
+                    retry=_retry,
+                    total_retries=max_init_retries,
+                    n_init=N_init,
+                    candidate_count=_cand_n,
+                    rf_count=_rf_cnt,
+                    rf_no_clamp_count=_rf_no_clamp_cnt,
+                    constraint_count=_cst_cnt,
+                    airspace_count=_air_cnt,
+                    distance_count=_dist_cnt,
+                    feasible_count=_both_cnt,
+                    target_count=min_feasible_init_solutions,
+                    reason_counts=_reason_counts,
+                    airspace_radius_km=airspace_radius_km,
+                    min_corridor_distance_km=min_corridor_distance_km,
+                    corridor_half_width_m=W_half,
+                )
+            )
 
         if _retry % 50 == 0 or _rf_cnt > 0:
             _reason_txt = "none"
@@ -4415,6 +4729,14 @@ def attempt_run_once(
             print(
                 f"  -> {_both_cnt} RF+constraint feasible solution(s) found at retry {_retry} "
                 f"(target {min_feasible_init_solutions}). Proceeding with feasible-only init pop."
+            )
+            _emit_progress(
+                progress_callback,
+                55,
+                "initial_population",
+                f"Feasible initial population found at retry {_retry}/{max_init_retries}.",
+                current=_retry,
+                total=max_init_retries,
             )
             break
 
@@ -4734,6 +5056,7 @@ def attempt_run_once(
     print(f"Saved {out_dir / 'fig2b_init_before_after_rf.png'}")
     plt.close(fig2b)
 
+    _emit_progress(progress_callback, 60, "nsga3", "Starting NSGA-III optimization.", current=0, total=Nmax)
     print("Running NSGA-III ...")
     pop, fvals, gen_history = run_nsga3(
         nodes_pool=nodes_pool,
@@ -4766,11 +5089,11 @@ def attempt_run_once(
         takeoff_complete=takeoff_complete,
         airspace_center_latlon=airspace_center_lla[:2],
         airspace_radius_m=airspace_radius_m,
-        airspace_alt_min_m=airspace_alt_min_m,
-        airspace_alt_max_m=airspace_alt_max_m,
         min_corridor_distance_m=min_corridor_distance_m,
+        progress_callback=progress_callback,
     )
 
+    _emit_progress(progress_callback, 88, "final_evaluation", "Evaluating final population and generation artifacts.")
     _save_generation_snapshots(
         gen_history=gen_history,
         out_dir=out_dir,
@@ -4800,18 +5123,18 @@ def attempt_run_once(
         eval_corridor_objectives_fn=eval_corridor_fn,
         airspace_center_lla=airspace_center_lla,
         airspace_radius_m=airspace_radius_m,
-        airspace_alt_min_m=airspace_alt_min_m,
-        airspace_alt_max_m=airspace_alt_max_m,
         min_corridor_distance_m=min_corridor_distance_m,
     )
     print(f"Final feasible (constraints): {feasible_count}/{len(pop)}")
     print(f"RF geometric no-clamp: {rf_no_clamp_count}/{len(pop)}")
+    _emit_progress(progress_callback, 90, "final_evaluation", "Final feasible population evaluated.")
 
     if feasible_count == 0:
         print("No feasible solution. Retrying ...")
         return False, 0
 
     reps = pick_representatives(pop, fvals) if pop and fvals.size > 0 else []
+    _emit_progress(progress_callback, 95, "artifact_export", "Generating final figures and route artifacts.")
 
     obj_pairs = [(i, j) for i in range(len(objective_names)) for j in range(i + 1, len(objective_names))]
     n_pair = len(obj_pairs)
@@ -5110,15 +5433,13 @@ def attempt_run_once(
             airspace_center_lla=airspace_center_lla,
             airspace_radius_m=airspace_radius_m,
             airspace_radius_km=airspace_radius_km,
-            airspace_alt_min_m=airspace_alt_min_m,
-            airspace_alt_max_m=airspace_alt_max_m,
             forbidden_zones=forbidden_zones,
             use_takeoff_landing_transition=use_takeoff_landing_transition,
             end_vertiport=end_vertiport,
             takeoff_complete=takeoff_complete,
             landing_entry=landing_entry,
-            corridor_lat_default=corridor_lat_default,
-            corridor_lon_default=corridor_lon_default,
+            corridor_lat_default=corridor_lat,
+            corridor_lon_default=corridor_lon,
             waypoint_alt_fixed_m=waypoint_alt_fixed_m,
         )
 
@@ -5138,8 +5459,6 @@ def attempt_run_once(
         "emergency_points": emergency_points,
         "airspace_center_lla": airspace_center_lla,
         "airspace_radius_m": airspace_radius_m,
-        "airspace_alt_min_m": airspace_alt_min_m,
-        "airspace_alt_max_m": airspace_alt_max_m,
         "lat_lim": lat_lim,
         "lon_lim": lon_lim,
         "W_half": W_half,
@@ -5164,6 +5483,7 @@ def attempt_run_once(
     with open(out, "wb") as f:
         pickle.dump(result, f)
     print(f"Saved {out}")
+    _emit_progress(progress_callback, 99, "artifact_export", "Optimization artifacts generated.")
 
     return True, feasible_count
 
@@ -5192,6 +5512,50 @@ def _parse_lla_dict(lla_obj: Dict[str, Any], field_name: str) -> np.ndarray:
     return np.array([lat, lon, alt], dtype=float)
 
 
+def _parse_latlon_dict(latlon_obj: Dict[str, Any], field_name: str) -> np.ndarray:
+    """Parse one horizontal coordinate object {lat, lon}."""
+    try:
+        lat = float(latlon_obj["lat"])
+        lon = float(latlon_obj["lon"])
+    except Exception as e:
+        raise ValueError(f"Invalid {field_name}. Expected {{lat, lon}}.") from e
+    return np.array([lat, lon], dtype=float)
+
+
+def _normalize_transition_endpoint(
+    endpoint: Optional[Any],
+    cruise_altitude_m: float,
+    field_name: str,
+) -> Optional[np.ndarray]:
+    """Normalize an optional client endpoint and force its altitude to cruise MSL."""
+    if endpoint is None:
+        return None
+    if isinstance(endpoint, dict):
+        extra_fields = set(endpoint) - {"lat", "lon"}
+        if extra_fields:
+            raise ValueError(
+                f"Invalid {field_name}. Only lat and lon are accepted; "
+                f"unexpected field(s): {', '.join(sorted(str(v) for v in extra_fields))}."
+            )
+        latlon = _parse_latlon_dict(endpoint, field_name)
+    else:
+        try:
+            values = np.asarray(endpoint, dtype=float).ravel()
+        except Exception as e:
+            raise ValueError(f"Invalid {field_name}. Expected {{lat, lon}}.") from e
+        if values.size not in (2, 3):
+            raise ValueError(f"Invalid {field_name}. Expected {{lat, lon}}.")
+        latlon = values[:2]
+
+    lat = float(latlon[0])
+    lon = float(latlon[1])
+    if not np.isfinite(lat) or not np.isfinite(lon):
+        raise ValueError(f"{field_name} latitude and longitude must be finite.")
+    if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
+        raise ValueError(f"{field_name} latitude or longitude is outside its valid range.")
+    return np.array([lat, lon, float(cruise_altitude_m)], dtype=float)
+
+
 def _parse_corridor_points(raw_points: Optional[Sequence[Any]], default_alt_m: float) -> np.ndarray:
     """Parse corridor points from dict/list forms into (N, 3) float ndarray."""
     if raw_points is None:
@@ -5205,10 +5569,9 @@ def _parse_corridor_points(raw_points: Optional[Sequence[Any]], default_alt_m: f
             try:
                 lat = float(p["lat"])
                 lon = float(p["lon"])
-                alt = float(p.get("alt_m", default_alt_m))
             except Exception as e:
                 raise ValueError(f"Invalid corridor_points[{idx}] dict. Expected {{lat, lon, alt_m?}}.") from e
-            parsed.append([lat, lon, alt])
+            parsed.append([lat, lon, float(default_alt_m)])
             continue
 
         if isinstance(p, (list, tuple, np.ndarray)):
@@ -5217,7 +5580,7 @@ def _parse_corridor_points(raw_points: Optional[Sequence[Any]], default_alt_m: f
                 parsed.append([float(vals[0]), float(vals[1]), float(default_alt_m)])
                 continue
             if len(vals) == 3:
-                parsed.append([float(vals[0]), float(vals[1]), float(vals[2])])
+                parsed.append([float(vals[0]), float(vals[1]), float(default_alt_m)])
                 continue
             raise ValueError(f"Invalid corridor_points[{idx}] list length {len(vals)}. Use [lat, lon] or [lat, lon, alt].")
 
@@ -5311,32 +5674,62 @@ def _unpack_request_payload(path_request: Dict[str, Any]) -> Dict[str, Any]:
 
     start_obj = path_request.get("start_vertiport")
     end_obj = path_request.get("end_vertiport")
-    airspace_info = path_request.get("airspace_info", {})
+    takeoff_end_obj = path_request.get("takeoff_end")
+    landing_end_obj = path_request.get("landing_end")
+    airspace_info = path_request.get("airspace_info") or {}
     no_fly_zones = path_request.get("no_fly_zones", [])
-    min_corridor_distance_km = path_request.get("min_corridor_distance_km", 0.0)
+    min_corridor_distance_km = path_request.get("min_corridor_distance_km", 0.0) or 0.0
     cruise_altitude_m_raw = path_request.get("cruise_altitude_m")
 
-    corridor_points_raw = path_request.get("corridor_points")
-    if corridor_points_raw is None:
-        corridor_points_raw = path_request.get("waypoints")
-    if corridor_points_raw is None:
-        corridor_points_raw = path_request.get("middle_waypoints")
+    corridor_points_raw = None
+    for field_name in ("corridor_points", "waypoints", "middle_waypoints"):
+        candidate = path_request.get(field_name)
+        if candidate is None:
+            continue
+        if not isinstance(candidate, (list, tuple, np.ndarray)):
+            raise ValueError(f"{field_name} must be a list.")
+        if len(candidate) > 0:
+            corridor_points_raw = candidate
+            break
 
     missing_fields: List[str] = []
-    if not isinstance(start_obj, dict) or not isinstance(start_obj.get("lla"), dict):
-        missing_fields.append("start_vertiport.lla")
-    if not isinstance(end_obj, dict) or not isinstance(end_obj.get("lla"), dict):
-        missing_fields.append("end_vertiport.lla")
     if cruise_altitude_m_raw is None:
         missing_fields.append("cruise_altitude_m")
     if missing_fields:
         raise ValueError(f"Missing required field(s): {', '.join(missing_fields)}")
 
-    start_point = _parse_lla_dict(start_obj["lla"], "start_vertiport.lla")
-    end_point = _parse_lla_dict(end_obj["lla"], "end_vertiport.lla")
+    if start_obj is None:
+        start_point = np.asarray(DEFAULT_START_VERTIPORT, dtype=float)
+    elif isinstance(start_obj, dict) and isinstance(start_obj.get("lla"), dict):
+        start_point = _parse_lla_dict(start_obj["lla"], "start_vertiport.lla")
+    else:
+        raise ValueError("Invalid start_vertiport. Expected {lla: {lat, lon, alt_m}}.")
+
+    if end_obj is None:
+        end_point = np.asarray(DEFAULT_END_VERTIPORT, dtype=float)
+    elif isinstance(end_obj, dict) and isinstance(end_obj.get("lla"), dict):
+        end_point = _parse_lla_dict(end_obj["lla"], "end_vertiport.lla")
+    else:
+        raise ValueError("Invalid end_vertiport. Expected {lla: {lat, lon, alt_m}}.")
 
     if not isinstance(airspace_info, dict):
         raise ValueError("airspace_info must be an object when provided.")
+    normalized_airspace_info: Dict[str, Any] = {}
+    if airspace_info:
+        center_obj = airspace_info.get("center")
+        if not isinstance(center_obj, dict):
+            raise ValueError("airspace_info.center must be {lat, lon}.")
+        center_latlon = _parse_latlon_dict(center_obj, "airspace_info.center")
+        try:
+            radius_km = float(airspace_info["radius_km"])
+        except Exception as e:
+            raise ValueError("airspace_info.radius_km must be a number.") from e
+        if not np.isfinite(radius_km) or radius_km <= 0.0:
+            raise ValueError("airspace_info.radius_km must be greater than 0.")
+        normalized_airspace_info = {
+            "center": {"lat": float(center_latlon[0]), "lon": float(center_latlon[1])},
+            "radius_km": radius_km,
+        }
     if no_fly_zones is None:
         no_fly_zones = []
     if not isinstance(no_fly_zones, (list, tuple)):
@@ -5347,12 +5740,58 @@ def _unpack_request_payload(path_request: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         raise ValueError("cruise_altitude_m must be a number.") from e
 
-    corridor_points = _parse_corridor_points(corridor_points_raw, default_alt_m=float(cruise_altitude_m))
+    if takeoff_end_obj is None:
+        takeoff_end_lla = None
+    elif isinstance(takeoff_end_obj, dict) and isinstance(takeoff_end_obj.get("lla"), dict):
+        takeoff_end_lla = _normalize_transition_endpoint(
+            takeoff_end_obj["lla"],
+            cruise_altitude_m,
+            "takeoff_end.lla",
+        )
+    else:
+        raise ValueError("Invalid takeoff_end. Expected {lla: {lat, lon}}.")
+
+    if landing_end_obj is None:
+        landing_end_lla = None
+    elif isinstance(landing_end_obj, dict) and isinstance(landing_end_obj.get("lla"), dict):
+        landing_end_lla = _normalize_transition_endpoint(
+            landing_end_obj["lla"],
+            cruise_altitude_m,
+            "landing_end.lla",
+        )
+    else:
+        raise ValueError("Invalid landing_end. Expected {lla: {lat, lon}}.")
+    if normalized_airspace_info:
+        center = normalized_airspace_info["center"]
+        center_latlon = np.array([center["lat"], center["lon"]], dtype=float)
+        radius_m = float(normalized_airspace_info["radius_km"]) * 1000.0
+        for field_name, endpoint in (
+            ("takeoff_end.lla", takeoff_end_lla),
+            ("landing_end.lla", landing_end_lla),
+        ):
+            if endpoint is None:
+                continue
+            distance_m = float(_dist_to_center_m(endpoint[:2], center_latlon)[0])
+            if distance_m > radius_m:
+                raise ValueError(
+                    f"{field_name} is outside horizontal airspace constraints. "
+                    f"horizontal_dist_m={distance_m:.1f} (radius={radius_m:.1f})."
+                )
+    corridor_points = _parse_corridor_points(
+        corridor_points_raw,
+        default_alt_m=float(cruise_altitude_m),
+    )
 
     return {
         "start_point": start_point.tolist(),
         "end_point": end_point.tolist(),
-        "airspace_info": airspace_info,
+        "takeoff_end_lla": (
+            takeoff_end_lla.tolist() if takeoff_end_lla is not None else None
+        ),
+        "landing_end_lla": (
+            landing_end_lla.tolist() if landing_end_lla is not None else None
+        ),
+        "airspace_info": normalized_airspace_info,
         "no_fly_zones": no_fly_zones,
         "min_corridor_distance_km": float(min_corridor_distance_km),
         "corridor_points": corridor_points.tolist(),
@@ -5360,17 +5799,71 @@ def _unpack_request_payload(path_request: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _load_optimal_path_from_excel(run_dir: Path) -> List[List[float]]:
+    """Load the API route from the authoritative Route_Data Excel sheet."""
+    xlsx_path = Path(run_dir) / "route_data.xlsx"
+    if not xlsx_path.exists():
+        raise RuntimeError(f"Optimization route artifact is missing: {xlsx_path}")
+
+    try:
+        route_df = pd.read_excel(xlsx_path, sheet_name="Route_Data")
+    except Exception as e:
+        raise RuntimeError(f"Failed to read optimization route artifact: {xlsx_path}") from e
+
+    required_columns = ["Lat", "Lon", "Altitude_MSL_m"]
+    missing_columns = [name for name in required_columns if name not in route_df.columns]
+    if missing_columns:
+        raise RuntimeError(
+            "Route_Data is missing required column(s): "
+            + ", ".join(missing_columns)
+        )
+
+    route = route_df[required_columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    if route.shape[0] == 0:
+        raise RuntimeError("Route_Data contains no optimized path rows.")
+    if not np.all(np.isfinite(route)):
+        raise RuntimeError("Route_Data contains invalid Lat/Lon/Altitude_MSL_m values.")
+    return route.tolist()
+
+
 def run_path_engine(
-    start_point: Sequence[float],
-    end_point: Sequence[float],
+    start_point: Optional[Sequence[float]] = None,
+    end_point: Optional[Sequence[float]] = None,
+    takeoff_end_lla: Optional[Sequence[float]] = None,
+    landing_end_lla: Optional[Sequence[float]] = None,
     airspace_info: Optional[Dict[str, Any]] = None,
     no_fly_zones: Optional[Sequence[Dict[str, Any]]] = None,
     min_corridor_distance_km: float = 0.0,
     corridor_points: Optional[Sequence[Sequence[float]]] = None,
     cruise_altitude_m: Optional[float] = None,
     max_attempts: int = 1,
+    progress_callback: ProgressCallback = None,
 ) -> Dict[str, Any]:
     """Run engine with request-aligned inputs and collect run artifact metadata."""
+    if cruise_altitude_m is None:
+        raise ValueError("cruise_altitude_m is required.")
+    start_point = (
+        np.asarray(DEFAULT_START_VERTIPORT, dtype=float)
+        if start_point is None
+        else np.asarray(start_point, dtype=float).reshape(3)
+    )
+    end_point = (
+        np.asarray(DEFAULT_END_VERTIPORT, dtype=float)
+        if end_point is None
+        else np.asarray(end_point, dtype=float).reshape(3)
+    )
+    normalized_takeoff_end = _normalize_transition_endpoint(
+        takeoff_end_lla,
+        float(cruise_altitude_m),
+        "takeoff_end_lla",
+    )
+    normalized_landing_end = _normalize_transition_endpoint(
+        landing_end_lla,
+        float(cruise_altitude_m),
+        "landing_end_lla",
+    )
+    normalized_corridor = _parse_corridor_points(corridor_points, float(cruise_altitude_m))
+
     runs_dir = project_path("runs")
     runs_dir.mkdir(parents=True, exist_ok=True)
     last_run_dir: Optional[Path] = None
@@ -5378,13 +5871,24 @@ def run_path_engine(
     for attempt in range(1, int(max(1, max_attempts)) + 1):
         before = {p.resolve() for p in runs_dir.glob("*") if p.is_dir()}
         ok, feas = attempt_run_once(
-            start_point=start_point,
-            end_point=end_point,
+            start_point=start_point.tolist(),
+            end_point=end_point.tolist(),
+            takeoff_end_lla=(
+                normalized_takeoff_end.tolist()
+                if normalized_takeoff_end is not None
+                else None
+            ),
+            landing_end_lla=(
+                normalized_landing_end.tolist()
+                if normalized_landing_end is not None
+                else None
+            ),
             airspace_info=airspace_info,
             no_fly_zones=no_fly_zones,
             min_corridor_distance_km=min_corridor_distance_km,
-            corridor_points=corridor_points,
+            corridor_points=normalized_corridor.tolist(),
             cruise_altitude_m=cruise_altitude_m,
+            progress_callback=progress_callback,
         )
         after = [p.resolve() for p in runs_dir.glob("*") if p.is_dir()]
         new_dirs = sorted([p for p in after if p not in before], key=lambda p: p.name)
@@ -5410,13 +5914,16 @@ def run_path_engine(
                 with open(result_pkl, "rb") as f:
                     result_obj = pickle.load(f)
 
-            excel_corridor = result_obj.get("excel_corridor_llas", []) if result_obj is not None else []
+            if last_run_dir is None:
+                raise RuntimeError("Optimization succeeded but its run directory could not be resolved.")
+            optimal_path = _load_optimal_path_from_excel(last_run_dir)
+            _emit_progress(progress_callback, 100, "complete", "Optimization result is ready.")
             return {
                 "success": True,
                 "attempt": attempt,
                 "feasible_count": int(feas),
                 "run_dir": (str(last_run_dir) if last_run_dir is not None else None),
-                "optimal_path": [[pt["lat"], pt["lon"], pt["alt_m"]] for pt in excel_corridor] if excel_corridor else [],
+                "optimal_path": optimal_path,
                 "result": result_obj,
                 "artifact_files": (
                     sorted([str(p) for p in last_run_dir.glob("**/*") if p.is_file()])
@@ -5440,34 +5947,48 @@ def run_path_engine(
     }
 
 
-def find_optimal_path(path_request: Dict[str, Any]) -> List[List[float]]:
+def find_optimal_path(
+    path_request: Dict[str, Any],
+    progress_callback: ProgressCallback = None,
+) -> List[List[float]]:
     """Compatibility helper returning only optimal path waypoints."""
+    _emit_progress(progress_callback, 2, "request_validation", "Validating path request.")
     req = _unpack_request_payload(path_request)
     output = run_path_engine(
         start_point=req["start_point"],
         end_point=req["end_point"],
+        takeoff_end_lla=req["takeoff_end_lla"],
+        landing_end_lla=req["landing_end_lla"],
         airspace_info=req["airspace_info"],
         no_fly_zones=req["no_fly_zones"],
         min_corridor_distance_km=req["min_corridor_distance_km"],
         corridor_points=req["corridor_points"],
         cruise_altitude_m=req["cruise_altitude_m"],
         max_attempts=1,
+        progress_callback=progress_callback,
     )
     return output["optimal_path"]
 
 
-def find_optimal_path_with_artifacts(path_request: Dict[str, Any]) -> Dict[str, Any]:
+def find_optimal_path_with_artifacts(
+    path_request: Dict[str, Any],
+    progress_callback: ProgressCallback = None,
+) -> Dict[str, Any]:
     """Extended helper returning optimal path plus run artifact information."""
+    _emit_progress(progress_callback, 2, "request_validation", "Validating path request.")
     req = _unpack_request_payload(path_request)
     return run_path_engine(
         start_point=req["start_point"],
         end_point=req["end_point"],
+        takeoff_end_lla=req["takeoff_end_lla"],
+        landing_end_lla=req["landing_end_lla"],
         airspace_info=req["airspace_info"],
         no_fly_zones=req["no_fly_zones"],
         min_corridor_distance_km=req["min_corridor_distance_km"],
         corridor_points=req["corridor_points"],
         cruise_altitude_m=req["cruise_altitude_m"],
         max_attempts=1,
+        progress_callback=progress_callback,
     )
 
 
@@ -5497,4 +6018,3 @@ if __name__ == "__main__":
             except Exception:
                 pass
             os._exit(0)
-
