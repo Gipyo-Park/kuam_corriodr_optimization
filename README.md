@@ -94,6 +94,8 @@
 
 ## Optimization Workflow
 
+아래 6단계에 따라 안전한 후보 공간을 만들고, 여러 경로를 비교한 뒤 최종 회랑을 선택합니다. 각 그림은 해당 단계 바로 아래에 배치했습니다.
+
 | Stage | Description |
 | --- | --- |
 | 1. Scenario Configuration | 버티포트, 비행 고도, waypoint, 이착륙 섹터, 공역 및 위험도 데이터를 구성합니다. |
@@ -103,54 +105,57 @@
 | 5. NSGA-III Optimization | Crossover, mutation, non-dominated sorting과 niching을 반복합니다. |
 | 6. Corridor Selection | 목적별 대표 해와 균형 해를 선정하고 결과를 저장합니다. |
 
-<table>
-  <tr>
-    <th width="50%">Initial Corridors & RF Turns</th>
-    <th width="50%">Pareto Objective Analysis</th>
-  </tr>
-  <tr>
-    <td align="center"><a href="./assets/readme/initial-corridors-rf-450m.png"><img src="./assets/readme/initial-corridors-rf-450m.png" width="430" alt="Initial corridor candidates before and after RF turns"></a></td>
-    <td align="center"><a href="./assets/readme/pareto-analysis-450m.png"><img src="./assets/readme/pareto-analysis-450m.png" width="430" alt="Pareto objective analysis"></a></td>
-  </tr>
-</table>
+### Stage 1. Scenario Configuration — 조건과 평가 기준 설정
 
-초기 회랑과 Pareto 그림은 페이지 흐름을 방해하지 않도록 축소했으며, 클릭하면 원본을 확인할 수 있습니다.
+먼저 줄이고 싶은 값과 반드시 지켜야 할 비행조건을 정합니다. 경로는 짧을수록 좋지만, 위험지역과 장애물을 피하고 실제로 선회할 수 있어야 합니다.
 
-## Objectives & Constraints
-
-| Objectives | Operational Constraints |
+| 비교하는 목표 | 반드시 지키는 조건 |
 | --- | --- |
-| Flight distance | MOC-based obstacle avoidance |
-| Ground risk | No-Fly Zones |
-| Air risk | Airspace and altitude limits |
-| Noise risk | Corridor width and self-overlap |
-| Balanced multi-objective score | RF-turn feasibility and flight-distance limit |
+| 비행거리 | MOC 기반 장애물 회피 |
+| 지상 위험 | 비행금지구역 회피 |
+| 공중 위험 | 공역 및 고도 제한 |
+| 소음 위험 | 회랑 폭과 경로 겹침 제한 |
+| 여러 목표의 균형 | RF 선회 가능 여부와 최대 비행거리 |
 
-## Optimization Results
+### Stage 2. Safe Node Filtering — 안전한 후보 지점 찾기
 
-### Risk-Aware Search Space
-
-위험도 percentile과 MOC 조건을 적용해 backbone 주변의 후보 노드를 필터링하고, 최적화가 탐색할 수 있는 공간을 구성합니다.
+기준 경로 주변의 격자점 중 위험도와 장애물 조건을 통과한 지점만 남깁니다. 이 지점들이 최적화가 경로를 만들 수 있는 탐색 공간이 됩니다.
 
 <p align="center">
-  <a href="./assets/readme/safe-node-generation-450m.png"><img src="./assets/readme/safe-node-generation-450m.png" width="700" alt="Safe node generation at 450 m MSL and 300 m AGL"></a>
+  <a href="./assets/readme/safe-node-generation-450m.png"><img src="./assets/readme/safe-node-generation-450m.png" width="650" alt="Stage 2 안전한 후보 지점 생성"></a>
 </p>
 
-### Objective-Specific Corridors
+### Stage 3–4. Initial Population & Flight Constraint Check — 후보 경로 생성과 비행 가능성 확인
 
-거리·지상 위험·공중 위험·소음 위험 사이의 상충관계를 비교하고 목적별 대표 해와 균형 해를 선정합니다.
+안전한 후보 지점을 이용해 여러 초기 경로를 만들고, 꺾인 구간을 실제 비행 가능한 RF 선회 곡선으로 바꿉니다. 이후 장애물, 공역, 고도, 거리와 선회조건을 통과하는지 검사합니다.
 
-| Air Risk | Ground Risk | Noise Risk |
+<p align="center">
+  <a href="./assets/readme/initial-corridors-rf-450m.png"><img src="./assets/readme/initial-corridors-rf-450m.png" width="620" alt="Stage 3과 4 초기 경로 생성 및 RF 선회 적용"></a>
+</p>
+
+### Stage 5. NSGA-III Optimization — 거리와 위험도 함께 비교
+
+통과한 경로들을 비행거리, 지상 위험, 공중 위험, 소음 위험으로 반복 비교합니다. 한 기준만 가장 좋은 경로가 아니라 여러 기준에서 서로 다른 장점을 가진 후보를 남깁니다.
+
+<p align="center">
+  <a href="./assets/readme/pareto-analysis-450m.png"><img src="./assets/readme/pareto-analysis-450m.png" width="620" alt="Stage 5 거리와 위험도의 Pareto 비교"></a>
+</p>
+
+### Stage 6. Corridor Selection — 목적별·균형 회랑 선택
+
+마지막으로 무엇을 중요하게 보는지에 따라 목적별 대표 회랑을 선택하고, 여러 목표를 함께 고려한 균형 회랑도 선정합니다.
+
+| 공중 위험 최소 | 지상 위험 최소 | 소음 위험 최소 |
 | :---: | :---: | :---: |
-| <a href="./assets/readme/air-risk-corridor-450m.png"><img src="./assets/readme/air-risk-corridor-450m.png" width="300" alt="Air-risk corridor"></a> | <a href="./assets/readme/ground-risk-corridor-450m.png"><img src="./assets/readme/ground-risk-corridor-450m.png" width="300" alt="Ground-risk corridor"></a> | <a href="./assets/readme/noise-risk-corridor-450m.png"><img src="./assets/readme/noise-risk-corridor-450m.png" width="300" alt="Noise-risk corridor"></a> |
+| <a href="./assets/readme/air-risk-corridor-450m.png"><img src="./assets/readme/air-risk-corridor-450m.png" width="290" alt="공중 위험을 줄인 회랑"></a> | <a href="./assets/readme/ground-risk-corridor-450m.png"><img src="./assets/readme/ground-risk-corridor-450m.png" width="290" alt="지상 위험을 줄인 회랑"></a> | <a href="./assets/readme/noise-risk-corridor-450m.png"><img src="./assets/readme/noise-risk-corridor-450m.png" width="290" alt="소음 위험을 줄인 회랑"></a> |
 
-### Altitude Scenario Comparison
+#### 비행고도에 따른 균형 회랑 비교
 
-동일한 운항 환경에서도 고도에 따라 MOC 영역과 탐색 가능한 회랑 형상이 달라집니다. 아래 결과는 두 실행 시나리오에서 도출한 균형 회랑을 비교합니다.
+고도가 달라지면 피해야 할 장애물 영역과 선택 가능한 회랑도 달라집니다.
 
 | 450 m MSL / 300 m AGL | 550 m MSL / 400 m AGL |
 | :---: | :---: |
-| <a href="./assets/readme/balanced-corridor-450m.png"><img src="./assets/readme/balanced-corridor-450m.png" width="430" alt="Balanced corridor at 450 m MSL and 300 m AGL"></a> | <a href="./assets/readme/balanced-corridor-550m.png"><img src="./assets/readme/balanced-corridor-550m.png" width="430" alt="Balanced corridor at 550 m MSL and 400 m AGL"></a> |
+| <a href="./assets/readme/balanced-corridor-450m.png"><img src="./assets/readme/balanced-corridor-450m.png" width="400" alt="450 m MSL 균형 회랑"></a> | <a href="./assets/readme/balanced-corridor-550m.png"><img src="./assets/readme/balanced-corridor-550m.png" width="400" alt="550 m MSL 균형 회랑"></a> |
 
 ## Technical Highlights
 
