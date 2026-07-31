@@ -109,35 +109,35 @@
 
 먼저 줄이고 싶은 값과 반드시 지켜야 할 비행조건을 정합니다. 경로는 짧을수록 좋지만, 위험지역과 장애물을 피하고 실제로 선회할 수 있어야 합니다.
 
-<table>
+<table align="center">
   <tr>
-    <th width="28%">비교하는 목표</th>
-    <th width="28%">반드시 지키는 조건</th>
-    <th width="44%">경로 설정 예시</th>
+    <th width="28%" align="center">비교하는 목표</th>
+    <th width="28%" align="center">반드시 지키는 조건</th>
+    <th width="44%" align="center">경로 설정 예시</th>
   </tr>
   <tr>
-    <td>비행거리</td>
-    <td>MOC 기반 장애물 회피</td>
+    <td align="center">비행거리</td>
+    <td align="center">MOC 기반 장애물 회피</td>
     <td rowspan="5" align="center">
       <a href="./assets/readme/scenario-configuration-overview.svg"><img src="./assets/readme/scenario-configuration-overview.svg" width="390" alt="Stage 1 기준 회랑과 운항 제약조건 설정 예시"></a><br>
       <sub>기준 회랑, NFZ, 회랑 폭, 곡률·분리거리 조건</sub>
     </td>
   </tr>
   <tr>
-    <td>지상 위험</td>
-    <td>비행금지구역 회피</td>
+    <td align="center">지상 위험</td>
+    <td align="center">비행금지구역 회피</td>
   </tr>
   <tr>
-    <td>공중 위험</td>
-    <td>공역 및 고도 제한</td>
+    <td align="center">공중 위험</td>
+    <td align="center">공역 및 고도 제한</td>
   </tr>
   <tr>
-    <td>소음 위험</td>
-    <td>회랑 폭과 경로 겹침 제한</td>
+    <td align="center">소음 위험</td>
+    <td align="center">회랑 폭과 경로 겹침 제한</td>
   </tr>
   <tr>
-    <td>여러 목표의 균형</td>
-    <td>RF 선회 가능 여부와 최대 비행거리</td>
+    <td align="center">여러 목표의 균형</td>
+    <td align="center">RF 선회 가능 여부와 최대 비행거리</td>
   </tr>
 </table>
 
