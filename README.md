@@ -47,9 +47,9 @@
     <td align="center"><a href="./optimization_code/figure/air_risk_heatmaps.png"><img src="./optimization_code/figure/air_risk_heatmaps.png" width="300" alt="Combined air-risk masks by altitude"></a></td>
   </tr>
   <tr>
-    <td>기체 진행방향에 따라 지상 영향 footprint가 달라지는 방향별 인구 위험도</td>
-    <td>고도별 조류 위험 분포와 유효 데이터 영역</td>
-    <td>경로 평가·후보 필터링에 사용하는 고도별 이진 위험 클래스</td>
+    <td>지상의 인구·건물 피해를 나타내는 지상 위험도</td>
+    <td>고도별 조류·지상 장애물에 의한 공중 위험도</td>
+    <td>MSL 기준 순항시 제한되어야 할 지형 지도</td>
   </tr>
 </table>
 
