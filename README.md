@@ -16,8 +16,6 @@
 
 출발·도착 버티포트와 기준 경로를 바탕으로 후보 경로를 생성하고, 위험도 및 비행 제약을 평가한 뒤 NSGA-III로 목적별 대표 회랑과 균형 회랑을 도출합니다. 별도의 `wind_data` 분석은 월별 3차원 바람장을 12개 방위 섹터로 투영하여 이륙·착륙 방향 후보를 평가하고, MOC와 지상·공중 위험도를 함께 비교합니다.
 
-> Portfolio scope: this repository overview focuses on the implementation and results in [`optimization_code`](./optimization_code/).
-
 <p align="center">
   <img src="./assets/readme/system-architecture.png" width="900" alt="K-UAM corridor optimization architecture">
 </p>
@@ -220,62 +218,3 @@ The machine-readable results are available in [`sector_metrics.csv`](./optimizat
 - **Validation:** coordinate alignment, airspace, altitude, NFZ, MOC, sector, corridor width, self-overlap, and distance checks
 - **Reproducibility:** timestamped parameters, serialized results, CSV/JSON diagnostics, Excel route data, and generation snapshots
 
-## Repository Guide
-
-```text
-kuam_corriodr_optimization/
-├── README.md
-├── assets/readme/                  # Curated README figures
-└── optimization_code/
-    ├── MAIN_uam_corridor_optimizer.py
-    ├── *_GP.py                     # Population, objectives, crossover, mutation
-    ├── rf_turn.py                  # TF/RF turn geometry
-    ├── takeoff_landing_sector.py   # Sector masks and validation
-    ├── ground_risk_data/
-    ├── air_risk_data/
-    ├── noise_data/
-    ├── 260608_MOC/
-    ├── wind_data/
-    │   ├── AirRisk_Data_1..12.mat
-    │   ├── vertiport_wind_plot2.py
-    │   ├── plot_new_moc_top6.py
-    │   └── python_outputs/         # Figures, rankings, metrics, recommendations
-    ├── figure/                     # Risk alignment, terrain, 3D-route figures
-    ├── visualization_tools/
-    └── runs/                       # Timestamped optimization results
-```
-
-See [`optimization_code/README.md`](./optimization_code/README.md) for the code flow, core modules, input data, and generated outputs.
-
-## Generated Outputs
-
-### Corridor Optimization
-
-Each execution creates a timestamped folder under `optimization_code/runs/`.
-
-| Output | Description |
-| --- | --- |
-| `params.json` | Scenario configuration and optimization parameters |
-| `results.pkl` | Serialized population, objectives, and selected solutions |
-| `route_data.xlsx` | Final route, TF/RF segments, centers, and scenario information |
-| `fig*.png` | Safe nodes, initialization, Pareto analysis, and optimized corridors |
-| `gen_snapshots/` | Generation-by-generation corridor evolution |
-
-### Wind and Sector Diagnostics
-
-| Output | Description |
-| --- | --- |
-| `wind_sector_recommendations.json/.txt` | Monthly, seasonal, and annual sector recommendations |
-| `sector_metrics.csv` | Per-sector MOC, wind, and integrated-risk metrics |
-| `sector_combination_ranking.csv` | All 132 directed takeoff/landing combinations and pass/fail status |
-| `spatial_alignment_report.csv` | CRS, grid extent, spacing, and aligned-cell checks |
-| `sector_*.png`, `*_wind_*.png` | Sector diagnostics and monthly/altitude wind visualizations |
-
-<details>
-<summary><strong>End-to-end workflow overview</strong></summary>
-
-<p align="center">
-  <img src="./assets/readme/end-to-end-workflow.png" width="900" alt="End-to-end K-UAM corridor optimization workflow">
-</p>
-
-</details>
