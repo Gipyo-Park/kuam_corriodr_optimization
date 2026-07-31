@@ -54,99 +54,43 @@
 </table>
 
 
-### 2. Monthly and Altitude-Dependent Wind
+### 2. 바람을 보고 이륙·착륙 방향 결정
 
-[`vertiport_wind_plot2.py`](./optimization_code/wind_data/vertiport_wind_plot2.py)는 `AirRisk_Data_1.mat`부터 `AirRisk_Data_12.mat`까지의 `U3d`, `V3d`를 검증하고, 목표 고도에서 보간한 뒤 버티포트 중심 1 km 영역의 월별·계절별·연평균 바람벡터를 계산합니다. 화살표는 바람이 향하는 `TO` 방향이며, 기상학적 `FROM` 방향은 `TO + 180°`입니다.
-
-<table>
-  <tr>
-    <th width="50%">Monthly Mean Wind at 550 m MSL</th>
-    <th width="50%">Annual Mean Wind by Altitude</th>
-  </tr>
-  <tr>
-    <td align="center"><a href="./optimization_code/wind_data/python_outputs/monthly_wind_plot_py.png"><img src="./optimization_code/wind_data/python_outputs/monthly_wind_plot_py.png" width="440" alt="Monthly mean wind at 550 m MSL"></a></td>
-    <td align="center"><a href="./optimization_code/wind_data/python_outputs/annual_wind_by_altitude_from.png"><img src="./optimization_code/wind_data/python_outputs/annual_wind_by_altitude_from.png" width="440" alt="Annual mean wind by altitude"></a></td>
-  </tr>
-</table>
-
-현재 저장된 550 m MSL 연평균 결과는 `TO 50.610°`, `FROM 230.610°`, 평균 풍속 `4.842 m/s`입니다. 고도별 패널은 저고도 유효자료 범위와 고도 상승에 따른 풍향·풍속 변화를 한 번에 보여줍니다.
-
-### 3. Takeoff / Landing Sector Selection
-
-버티포트 주변 1 km 원을 북쪽 기준 시계방향의 12개 섹터(`S1`–`S12`, 각 30°)로 나눕니다. [`plot_new_moc_top6.py`](./optimization_code/wind_data/plot_new_moc_top6.py)는 각 섹터의 MOC, 연평균 바람, 지상 위험, 공중 위험을 같은 공간 범위에서 평가합니다.
-
-1. 각 셀의 12개월 유효 `U/V`를 평균하고 550 m MSL 바람장을 구성합니다.
-2. 섹터 단위벡터 `e`에 바람벡터 `W`를 내적하여 이륙·착륙 역풍성분을 분리합니다.
-3. 12개 섹터의 최대 역풍성분으로 0–1 정규화하고, 이륙·착륙 모두 `0.9` 이상인지 검사합니다.
-4. MOC 차단 셀이 0개인 조합만 통과시킨 뒤 `0.5 × 지상위험 + 0.5 × 공중위험`이 가장 낮은 조합을 선택합니다.
-
-| Metric | Definition |
-| --- | --- |
-| Takeoff headwind | `max(-W · e, 0)` |
-| Landing headwind | `max(W · e, 0)` |
-| Wind score | 해당 섹터 역풍성분 / 12개 섹터 중 최대 역풍성분 |
-| MOC safety | `1 - (차단 셀 수 / 전체 셀 수)`; 필수조건은 차단 셀 0개 |
-| Integrated risk | `0.5 × ground risk + 0.5 × air risk` |
+버티포트 주변을 12개 방향으로 나누고, 1년 동안의 바람과 장애물·위험도를 함께 비교했습니다.
 
 <table>
   <tr>
-    <th width="50%">Spatial Sector Diagnostics</th>
-    <th width="50%">Wind-Score Construction</th>
+    <th width="50%">월별 바람의 방향과 세기</th>
+    <th width="50%">12개 이착륙 방향 비교</th>
   </tr>
   <tr>
-    <td align="center"><a href="./optimization_code/wind_data/python_outputs/sector_map_diagnostics.png"><img src="./optimization_code/wind_data/python_outputs/sector_map_diagnostics.png" width="440" alt="MOC and annual wind diagnostic map for 12 sectors"></a></td>
-    <td align="center"><a href="./optimization_code/wind_data/python_outputs/wind_scoring_method_presentation.png"><img src="./optimization_code/wind_data/python_outputs/wind_scoring_method_presentation.png" width="440" alt="Wind scoring method for takeoff and landing sectors"></a></td>
+    <td align="center"><a href="./optimization_code/wind_data/python_outputs/monthly_wind_plot_py.png"><img src="./optimization_code/wind_data/python_outputs/monthly_wind_plot_py.png" width="420" alt="월별 평균 바람"></a></td>
+    <td align="center"><a href="./optimization_code/wind_data/python_outputs/sector_map_diagnostics.png"><img src="./optimization_code/wind_data/python_outputs/sector_map_diagnostics.png" width="420" alt="12개 이착륙 섹터 진단 지도"></a></td>
   </tr>
 </table>
 
-#### Stored 550 m MSL Diagnostic Snapshot
+- 화살표로 월별·고도별 바람의 방향과 세기를 확인합니다.
+- 바람을 정면으로 받기 좋은 방향과 장애물이 없는 방향을 먼저 찾습니다.
+- 남은 후보 중 지상·공중 위험이 낮은 이륙·착륙 조합을 선택합니다.
 
-| Item | Result |
-| --- | --- |
-| Evaluated takeoff/landing pairs | 132 (`12 × 11`) |
-| Pairs passing both MOC and wind requirements | 4 |
-| Best passing pair | **Takeoff S8 / Landing S3** |
-| Best pair integrated risk | **0.344** |
-| Next passing alternatives | S9/S3, S8/S2, S9/S2 |
-| Reference pair in the report | S7/S5: rank 29/132, condition-gap score 0.243 |
+> 현재 저장된 550 m 분석에서는 132개 조합을 비교했고, **이륙 S8 / 착륙 S3** 조합이 가장 좋은 후보로 선정되었습니다.
 
-이 결과에서 S7/S5는 MOC 차단 셀은 없지만 이륙 바람점수 `0.825`, 착륙 바람점수 `0.098`로 0.9 기준을 충족하지 못합니다. 이 진단은 저장된 550 m MSL 분석 스냅샷이며, 메인 최적화의 순항고도·섹터 설정은 실행 시나리오에서 별도로 지정됩니다.
+### 3. 지형을 반영한 3D 비행경로 구성
 
-<details>
-<summary><strong>Open the full sector-evaluation dashboard</strong></summary>
-
-<p align="center">
-  <a href="./optimization_code/wind_data/python_outputs/sector_evaluation_dashboard.png"><img src="./optimization_code/wind_data/python_outputs/sector_evaluation_dashboard.png" width="760" alt="Full takeoff and landing sector evaluation dashboard"></a>
-</p>
-
-The machine-readable results are available in [`sector_metrics.csv`](./optimization_code/wind_data/python_outputs/sector_metrics.csv), [`sector_combination_ranking.csv`](./optimization_code/wind_data/python_outputs/sector_combination_ranking.csv), and [`sector_selection_summary.txt`](./optimization_code/wind_data/python_outputs/sector_selection_summary.txt).
-
-</details>
-
-### 4. Terrain and 3D Flight Profile
-
-2차원 최적 회랑은 버티포트 고도에서 출발해 `Departure Climb → Level Turn → Climb to Cruise → Cruise` 구간으로 확장됩니다. 모든 고도는 MSL 기준으로 관리하고, DEM·MOC 지형과 경로를 함께 표시하여 수직 분리와 지형 여유를 확인합니다.
+평면에서 찾은 경로에 실제 상승·선회·순항 구간을 추가하고, 주변 지형과의 높이 차이를 3차원으로 확인했습니다.
 
 <table>
   <tr>
-    <th width="50%">Terrain Relief</th>
-    <th width="50%">Route over Terrain</th>
+    <th width="50%">분석지역의 3D 지형</th>
+    <th width="50%">지형 위에 배치한 UAM 경로</th>
   </tr>
   <tr>
-    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_terrain_only.png"><img src="./optimization_code/figure/uam_profile_3d_terrain_only.png" width="420" alt="3D terrain relief"></a></td>
-    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_route_transparent_surface.png"><img src="./optimization_code/figure/uam_profile_3d_route_transparent_surface.png" width="420" alt="Segmented UAM route over transparent terrain"></a></td>
-  </tr>
-  <tr>
-    <th>Corridor Spine</th>
-    <th>Segmented Route Only</th>
-  </tr>
-  <tr>
-    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_corridor_spine.png"><img src="./optimization_code/figure/uam_profile_3d_corridor_spine.png" width="420" alt="3D corridor spine and ground projection"></a></td>
-    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_route_only.png"><img src="./optimization_code/figure/uam_profile_3d_route_only.png" width="420" alt="Segmented 3D UAM route"></a></td>
+    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_terrain_only.png"><img src="./optimization_code/figure/uam_profile_3d_terrain_only.png" width="410" alt="분석지역 3D 지형"></a></td>
+    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_route_transparent_surface.png"><img src="./optimization_code/figure/uam_profile_3d_route_transparent_surface.png" width="410" alt="지형 위 UAM 3D 경로"></a></td>
   </tr>
 </table>
 
-파란색은 출발 상승, 주황색은 고도 유지 선회, 초록색은 순항고도까지의 상승, 보라색은 순항 구간을 나타냅니다. 점선·수직선은 지상 투영과 경로-지형 관계를 확인하기 위한 보조선입니다.
+경로 색상은 파란색부터 순서대로 **출발 상승 → 고도 유지 선회 → 순항고도까지 상승 → 순항** 구간을 나타냅니다.
 
 ## Optimization Workflow
 
@@ -216,4 +160,111 @@ The machine-readable results are available in [`sector_metrics.csv`](./optimizat
 - **Flight geometry:** TF/RF segment conversion with speed- and bank-angle-based turn radius
 - **Validation:** coordinate alignment, airspace, altitude, NFZ, MOC, sector, corridor width, self-overlap, and distance checks
 - **Reproducibility:** timestamped parameters, serialized results, CSV/JSON diagnostics, Excel route data, and generation snapshots
+
+## Appendix: Detailed Analysis
+
+아래 항목을 펼치면 바람 분석, 이착륙 섹터 선정, 지형·3D 비행경로 구성 방법을 자세히 확인할 수 있습니다.
+
+<details>
+<summary><strong>Appendix A — Monthly and Altitude-Dependent Wind</strong></summary>
+
+[`vertiport_wind_plot2.py`](./optimization_code/wind_data/vertiport_wind_plot2.py)는 `AirRisk_Data_1.mat`부터 `AirRisk_Data_12.mat`까지의 `U3d`, `V3d`를 검증하고, 목표 고도에서 보간한 뒤 버티포트 중심 1 km 영역의 월별·계절별·연평균 바람벡터를 계산합니다. 화살표는 바람이 향하는 `TO` 방향이며, 기상학적 `FROM` 방향은 `TO + 180°`입니다.
+
+<table>
+  <tr>
+    <th width="50%">Monthly Mean Wind at 550 m MSL</th>
+    <th width="50%">Annual Mean Wind by Altitude</th>
+  </tr>
+  <tr>
+    <td align="center"><a href="./optimization_code/wind_data/python_outputs/monthly_wind_plot_py.png"><img src="./optimization_code/wind_data/python_outputs/monthly_wind_plot_py.png" width="440" alt="Monthly mean wind at 550 m MSL"></a></td>
+    <td align="center"><a href="./optimization_code/wind_data/python_outputs/annual_wind_by_altitude_from.png"><img src="./optimization_code/wind_data/python_outputs/annual_wind_by_altitude_from.png" width="440" alt="Annual mean wind by altitude"></a></td>
+  </tr>
+</table>
+
+현재 저장된 550 m MSL 연평균 결과는 `TO 50.610°`, `FROM 230.610°`, 평균 풍속 `4.842 m/s`입니다. 고도별 패널은 저고도 유효자료 범위와 고도 상승에 따른 풍향·풍속 변화를 한 번에 보여줍니다.
+
+</details>
+
+<details>
+<summary><strong>Appendix B — Takeoff / Landing Sector Selection</strong></summary>
+
+버티포트 주변 1 km 원을 북쪽 기준 시계방향의 12개 섹터(`S1`–`S12`, 각 30°)로 나눕니다. [`plot_new_moc_top6.py`](./optimization_code/wind_data/plot_new_moc_top6.py)는 각 섹터의 MOC, 연평균 바람, 지상 위험, 공중 위험을 같은 공간 범위에서 평가합니다.
+
+1. 각 셀의 12개월 유효 `U/V`를 평균하고 550 m MSL 바람장을 구성합니다.
+2. 섹터 단위벡터 `e`에 바람벡터 `W`를 내적하여 이륙·착륙 역풍성분을 분리합니다.
+3. 12개 섹터의 최대 역풍성분으로 0–1 정규화하고, 이륙·착륙 모두 `0.9` 이상인지 검사합니다.
+4. MOC 차단 셀이 0개인 조합만 통과시킨 뒤 `0.5 × 지상위험 + 0.5 × 공중위험`이 가장 낮은 조합을 선택합니다.
+
+| Metric | Definition |
+| --- | --- |
+| Takeoff headwind | `max(-W · e, 0)` |
+| Landing headwind | `max(W · e, 0)` |
+| Wind score | 해당 섹터 역풍성분 / 12개 섹터 중 최대 역풍성분 |
+| MOC safety | `1 - (차단 셀 수 / 전체 셀 수)`; 필수조건은 차단 셀 0개 |
+| Integrated risk | `0.5 × ground risk + 0.5 × air risk` |
+
+<table>
+  <tr>
+    <th width="50%">Spatial Sector Diagnostics</th>
+    <th width="50%">Wind-Score Construction</th>
+  </tr>
+  <tr>
+    <td align="center"><a href="./optimization_code/wind_data/python_outputs/sector_map_diagnostics.png"><img src="./optimization_code/wind_data/python_outputs/sector_map_diagnostics.png" width="440" alt="MOC and annual wind diagnostic map for 12 sectors"></a></td>
+    <td align="center"><a href="./optimization_code/wind_data/python_outputs/wind_scoring_method_presentation.png"><img src="./optimization_code/wind_data/python_outputs/wind_scoring_method_presentation.png" width="440" alt="Wind scoring method for takeoff and landing sectors"></a></td>
+  </tr>
+</table>
+
+#### Stored 550 m MSL Diagnostic Snapshot
+
+| Item | Result |
+| --- | --- |
+| Evaluated takeoff/landing pairs | 132 (`12 × 11`) |
+| Pairs passing both MOC and wind requirements | 4 |
+| Best passing pair | **Takeoff S8 / Landing S3** |
+| Best pair integrated risk | **0.344** |
+| Next passing alternatives | S9/S3, S8/S2, S9/S2 |
+| Reference pair in the report | S7/S5: rank 29/132, condition-gap score 0.243 |
+
+이 결과에서 S7/S5는 MOC 차단 셀은 없지만 이륙 바람점수 `0.825`, 착륙 바람점수 `0.098`로 0.9 기준을 충족하지 못합니다. 이 진단은 저장된 550 m MSL 분석 스냅샷이며, 메인 최적화의 순항고도·섹터 설정은 실행 시나리오에서 별도로 지정됩니다.
+
+<details>
+<summary><strong>Open the full sector-evaluation dashboard</strong></summary>
+
+<p align="center">
+  <a href="./optimization_code/wind_data/python_outputs/sector_evaluation_dashboard.png"><img src="./optimization_code/wind_data/python_outputs/sector_evaluation_dashboard.png" width="760" alt="Full takeoff and landing sector evaluation dashboard"></a>
+</p>
+
+The machine-readable results are available in [`sector_metrics.csv`](./optimization_code/wind_data/python_outputs/sector_metrics.csv), [`sector_combination_ranking.csv`](./optimization_code/wind_data/python_outputs/sector_combination_ranking.csv), and [`sector_selection_summary.txt`](./optimization_code/wind_data/python_outputs/sector_selection_summary.txt).
+
+</details>
+
+</details>
+
+<details>
+<summary><strong>Appendix C — Terrain and 3D Flight Profile</strong></summary>
+
+2차원 최적 회랑은 버티포트 고도에서 출발해 `Departure Climb → Level Turn → Climb to Cruise → Cruise` 구간으로 확장됩니다. 모든 고도는 MSL 기준으로 관리하고, DEM·MOC 지형과 경로를 함께 표시하여 수직 분리와 지형 여유를 확인합니다.
+
+<table>
+  <tr>
+    <th width="50%">Terrain Relief</th>
+    <th width="50%">Route over Terrain</th>
+  </tr>
+  <tr>
+    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_terrain_only.png"><img src="./optimization_code/figure/uam_profile_3d_terrain_only.png" width="420" alt="3D terrain relief"></a></td>
+    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_route_transparent_surface.png"><img src="./optimization_code/figure/uam_profile_3d_route_transparent_surface.png" width="420" alt="Segmented UAM route over transparent terrain"></a></td>
+  </tr>
+  <tr>
+    <th>Corridor Spine</th>
+    <th>Segmented Route Only</th>
+  </tr>
+  <tr>
+    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_corridor_spine.png"><img src="./optimization_code/figure/uam_profile_3d_corridor_spine.png" width="420" alt="3D corridor spine and ground projection"></a></td>
+    <td align="center"><a href="./optimization_code/figure/uam_profile_3d_route_only.png"><img src="./optimization_code/figure/uam_profile_3d_route_only.png" width="420" alt="Segmented 3D UAM route"></a></td>
+  </tr>
+</table>
+
+파란색은 출발 상승, 주황색은 고도 유지 선회, 초록색은 순항고도까지의 상승, 보라색은 순항 구간을 나타냅니다. 점선·수직선은 지상 투영과 경로-지형 관계를 확인하기 위한 보조선입니다.
+
+</details>
 
