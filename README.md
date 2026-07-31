@@ -23,11 +23,11 @@
 ## What I Built
 
 - End-to-end risk-aware UAM corridor optimization pipeline
-- Ground population, bird-strike air, noise, terrain, and fixed-AGL MOC layer integration
+- Ground population, bird-strike air, noise, terrain, and MSL MOC layer integration
 - Monthly/seasonal wind analysis and 12-sector takeoff/landing direction diagnostics
 - TF/RF route geometry with speed- and bank-angle-based turn radius
 - Objective-specific Pareto solutions and a normalized balanced corridor
-- Repeatable run folders containing parameters, routes, figures, and optimization snapshots
+
 
 ## Data & Operational Modeling
 
