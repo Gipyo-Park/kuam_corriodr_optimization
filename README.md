@@ -136,7 +136,7 @@
     <td align="center">회랑 폭과 경로 겹침 제한</td>
   </tr>
   <tr>
-    <td align="center">여러 목표의 균형</td>
+    <td align="center"></td>
     <td align="center">RF 선회 가능 여부와 최대 비행거리</td>
   </tr>
 </table>
