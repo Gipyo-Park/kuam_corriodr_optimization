@@ -53,7 +53,6 @@
   </tr>
 </table>
 
-<sub>이미지를 클릭하면 원본 해상도로 확인할 수 있습니다.</sub>
 
 ### 2. Monthly and Altitude-Dependent Wind
 
