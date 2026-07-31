@@ -146,7 +146,7 @@
 기준 경로 주변의 격자점 중 위험도와 장애물 조건을 통과한 지점만 남깁니다. 이 지점들이 최적화가 경로를 만들 수 있는 탐색 공간이 됩니다.
 
 <p align="center">
-  <a href="./assets/readme/safe-node-generation-450m.png"><img src="./assets/readme/safe-node-generation-450m.png" width="650" alt="Stage 2 안전한 후보 지점 생성"></a>
+  <a href="./assets/readme/safe-node-generation-450m.png"><img src="./assets/readme/safe-node-generation-450m.png" width="400" alt="Stage 2 안전한 후보 지점 생성"></a>
 </p>
 
 ### Stage 3–4. Initial Population & Flight Constraint Check — 후보 경로 생성과 비행 가능성 확인
@@ -154,7 +154,7 @@
 안전한 후보 지점을 이용해 여러 초기 경로를 만들고, 꺾인 구간을 실제 비행 가능한 RF 선회 곡선으로 바꿉니다. 이후 장애물, 공역, 고도, 거리와 선회조건을 통과하는지 검사합니다.
 
 <p align="center">
-  <a href="./assets/readme/initial-corridors-rf-450m.png"><img src="./assets/readme/initial-corridors-rf-450m.png" width="620" alt="Stage 3과 4 초기 경로 생성 및 RF 선회 적용"></a>
+  <a href="./assets/readme/initial-corridors-rf-450m.png"><img src="./assets/readme/initial-corridors-rf-450m.png" width="400" alt="Stage 3과 4 초기 경로 생성 및 RF 선회 적용"></a>
 </p>
 
 ### Stage 5. NSGA-III Optimization — 거리와 위험도 함께 비교
@@ -162,7 +162,7 @@
 통과한 경로들을 비행거리, 지상 위험, 공중 위험, 소음 위험으로 반복 비교합니다. 한 기준만 가장 좋은 경로가 아니라 여러 기준에서 서로 다른 장점을 가진 후보를 남깁니다.
 
 <p align="center">
-  <a href="./assets/readme/pareto-analysis-450m.png"><img src="./assets/readme/pareto-analysis-450m.png" width="620" alt="Stage 5 거리와 위험도의 Pareto 비교"></a>
+  <a href="./assets/readme/pareto-analysis-450m.png"><img src="./assets/readme/pareto-analysis-450m.png" width="400" alt="Stage 5 거리와 위험도의 Pareto 비교"></a>
 </p>
 
 ### Stage 6. Corridor Selection — 목적별·균형 회랑 선택
