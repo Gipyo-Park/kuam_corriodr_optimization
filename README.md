@@ -187,11 +187,10 @@
 ## Technical Highlights
 
 - **Algorithm:** NSGA-III, non-dominated sorting, reference-point niching, crossover, mutation
-- **Risk integration:** ground population risk, bird-strike air risk, noise, fixed-AGL MOC maps
+- **Risk integration:** ground population risk, bird-strike air risk, noise risk, MSL based elevation map
 - **Wind analysis:** 12 monthly 3D `U/V` fields, altitude interpolation, 12-sector vector projection
 - **Flight geometry:** TF/RF segment conversion with speed- and bank-angle-based turn radius
-- **Validation:** coordinate alignment, airspace, altitude, NFZ, MOC, sector, corridor width, self-overlap, and distance checks
-- **Reproducibility:** timestamped parameters, serialized results, CSV/JSON diagnostics, Excel route data, and generation snapshots
+- **Validation:** RF turn, airspace, altitude, NFZ, MOC, corridor width, self-overlap, and distance checks
 
 ## Appendix: Detailed Analysis
 
