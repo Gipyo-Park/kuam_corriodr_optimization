@@ -38,22 +38,24 @@
 
 <table>
   <tr>
-    <th width="33%">Ground / Population Risk Map</th>
-    <th width="33%">Air Risk Map</th>
-    <th width="33%">MSL based Elevation Map</th>
+    <th width="25%">Ground / Population Risk Map</th>
+    <th width="25%">Air Risk Map</th>
+    <th width="25%">Noise Risk Map</th>
+    <th width="25%">MSL based Elevation Map</th>
   </tr>
   <tr>
-    <td align="center"><a href="./optimization_code/figure/Modified_ground_risk_heatmaps.png"><img src="./optimization_code/figure/Modified_ground_risk_heatmaps.png" width="300" alt="Heading-dependent ground and population risk maps"></a></td>
-    <td align="center"><a href="./optimization_code/figure/bird_riskmap_springfall_3d.png"><img src="./optimization_code/figure/bird_riskmap_springfall_3d.png" width="300" alt="Spring and fall bird risk by altitude"></a></td>
-    <td align="center"><a href="./optimization_code/figure/air_risk_heatmaps.png"><img src="./optimization_code/figure/air_risk_heatmaps.png" width="300" alt="Combined air-risk masks by altitude"></a></td>
+    <td align="center"><a href="./optimization_code/figure/Modified_ground_risk_heatmaps.png"><img src="./optimization_code/figure/Modified_ground_risk_heatmaps.png" width="220" alt="Heading-dependent ground and population risk maps"></a></td>
+    <td align="center"><a href="./optimization_code/figure/bird_riskmap_springfall_3d.png"><img src="./optimization_code/figure/bird_riskmap_springfall_3d.png" width="220" alt="Spring and fall bird risk by altitude"></a></td>
+    <td align="center"><a href="./optimization_code/figure/noise_analysis/noise_lden_interpolation.png"><img src="./optimization_code/figure/noise_analysis/noise_lden_interpolation.png" width="220" alt="Interpolated Lden noise risk map"></a></td>
+    <td align="center"><a href="./optimization_code/figure/air_risk_heatmaps.png"><img src="./optimization_code/figure/air_risk_heatmaps.png" width="220" alt="Combined air-risk masks by altitude"></a></td>
   </tr>
   <tr>
     <td>지상의 인구·건물 피해를 나타내는 지상 위험도</td>
     <td>고도별 조류·지상 장애물에 의한 공중 위험도</td>
+    <td>Lden 보간 결과를 이용한 소음 위험도</td>
     <td>MSL 기준 순항시 제한되어야 할 지형 지도</td>
   </tr>
 </table>
-
 
 ### 2. 바람을 보고 이륙·착륙 방향 결정
 
