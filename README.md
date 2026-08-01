@@ -110,20 +110,20 @@
 
 ### Stage 1. Scenario Configuration — 조건과 평가 기준 설정
 
-먼저 줄이고 싶은 값과 반드시 지켜야 할 비행조건을 정합니다. 경로는 짧을수록 좋지만, 위험지역과 장애물을 피하고 실제로 선회할 수 있어야 합니다.
+먼저 최소화 할 목적과 반드시 지켜야 할 비행조건을 설정합니다. 경로는 짧을수록 좋지만, 위험지역과 장애물을 피하고 실제로 선회할 수 있어야 합니다.
 
 <table align="center">
   <tr>
-    <th width="28%" align="center">비교하는 목표</th>
-    <th width="28%" align="center">반드시 지키는 조건</th>
-    <th width="44%" align="center">경로 설정 예시</th>
+    <th width="28%" align="center">최소화할 목표</th>
+    <th width="28%" align="center">제약 조건</th>
+    <th width="44%" align="center">제약 조건 예시</th>
   </tr>
   <tr>
     <td align="center">비행거리</td>
-    <td align="center">MOC 기반 장애물 회피</td>
+    <td align="center">장애물 회피</td>
     <td rowspan="5" align="center">
       <a href="./assets/readme/scenario-configuration-overview.svg"><img src="./assets/readme/scenario-configuration-overview.svg" width="390" alt="Stage 1 기준 회랑과 운항 제약조건 설정 예시"></a><br>
-      <sub>기준 회랑, NFZ, 회랑 폭, 곡률·분리거리 조건</sub>
+      <sub>RF turn, NFZ, 회랑 폭, 곡률·분리거리 조건</sub>
     </td>
   </tr>
   <tr>
@@ -140,7 +140,7 @@
   </tr>
   <tr>
     <td align="center"></td>
-    <td align="center">RF 선회 가능 여부와 최대 비행거리</td>
+    <td align="center">RF 선회 가능 여부</td>
   </tr>
 </table>
 
