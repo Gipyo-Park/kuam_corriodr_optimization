@@ -33,13 +33,14 @@
 
 ### 1. Risk Maps
 
-모든 위험도 레이어는 동일한 평가 격자와 좌표 방향으로 정렬됩니다. 현재 저장된 공간 정합 보고서는 공중 위험·연평균 바람·지상 위험을 `EPSG:5179`, 100 m 간격의 `128 × 143` 격자에 맞추고, 별도 MOC 원본 격자를 같은 분석영역에 대응시킵니다.
+모든 위험도 지도는 동일한 평가 격자와 좌표 방향으로 정렬됩니다. 공중 위험·소음 위험·지상 위험을 `EPSG:5179`, 100 m 간격의 `128 × 143` 격자 형식을 사용합니다.
+각 위험도 지도는 회랑 최적화시 위험도·거리 최소화를 위해 사용됩니다.
 
 <table>
   <tr>
-    <th width="33%">Ground / Population Risk</th>
-    <th width="33%">Bird Risk by Altitude</th>
-    <th width="33%">Combined Air-Risk Mask</th>
+    <th width="33%">Ground / Population Risk Map</th>
+    <th width="33%">Air Risk Map</th>
+    <th width="33%">MSL based Elevation Map</th>
   </tr>
   <tr>
     <td align="center"><a href="./optimization_code/figure/Modified_ground_risk_heatmaps.png"><img src="./optimization_code/figure/Modified_ground_risk_heatmaps.png" width="300" alt="Heading-dependent ground and population risk maps"></a></td>
