@@ -23,15 +23,15 @@
 ## What I Built
 
 - End-to-end risk-aware UAM corridor optimization pipeline
-- Ground population, bird-strike air, noise, terrain, and MSL MOC layer integration
+- Ground population, bird-strike air, noise, terrain, and MSL based MOC
 - Monthly/seasonal wind analysis and 12-sector takeoff/landing direction diagnostics
 - TF/RF route geometry with speed- and bank-angle-based turn radius
-- Objective-specific Pareto solutions and a normalized balanced corridor
+- Objective-specific Pareto solutions and a balanced corridor
 
 
-## Data & Operational Modeling
+## Data & Operational Constraints Modeling
 
-### 1. Risk Layers
+### 1. Risk Maps
 
 모든 위험도 레이어는 동일한 평가 격자와 좌표 방향으로 정렬됩니다. 현재 저장된 공간 정합 보고서는 공중 위험·연평균 바람·지상 위험을 `EPSG:5179`, 100 m 간격의 `128 × 143` 격자에 맞추고, 별도 MOC 원본 격자를 같은 분석영역에 대응시킵니다.
 
