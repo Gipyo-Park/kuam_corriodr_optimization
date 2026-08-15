@@ -31,7 +31,6 @@ flowchart TD
 | NSGA-III | `fast_non_dominated_sort.py`, `generate_reference_points.py`, `normalize_objectives.py`, `niching_selection.py` | Pareto sorting, normalization, reference association, and survivor selection |
 | Genetic operators | `crossover_GP.py`, `mutation_GP.py` | Produces and perturbs candidate corridors |
 | Flight geometry | `rf_turn.py` | Converts waypoint paths into TF/RF segments and validates turn geometry |
-| Flight sectors | `takeoff_landing_sector.py` | Builds and checks takeoff/landing sector conditions |
 | API layer | `api_service/` | Exposes the optimization engine through an optional service interface |
 
 ## Input Data
@@ -114,7 +113,6 @@ optimization_code/
 ├── normalize_objectives.py
 ├── niching_selection.py
 ├── rf_turn.py
-├── takeoff_landing_sector.py
 ├── api_service/
 ├── ground_risk_data/
 ├── air_risk_data/

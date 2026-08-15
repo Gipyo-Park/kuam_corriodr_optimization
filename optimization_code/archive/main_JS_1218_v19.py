@@ -36,12 +36,6 @@ from normalize_objectives import normalize_objectives
 from niching_selection import niching_selection
 from evaluate_objectives_with_constraints_GP import evaluate_objectives_with_constraints_gp
 from rf_turn import apply_rf_turns
-from takeoff_landing_sector import (
-    get_season_masks,
-    normalize_season,
-    sector_allowed,
-    validate_sector_1based,
-)
 
 
 TAKEOFF_TRANSITION_PROFILE = None
@@ -50,6 +44,13 @@ RF_ALLOW_TANGENT_CLAMP = True
 RF_CORNER_FIT_MARGIN = 0.95
 RF_CORNER_MIN_TANGENT_M = 1.0
 RF_MIN_TURN_ANGLE_DEG = 0.5
+
+
+def _validate_sector_1based(value, label):
+    sector = int(value)
+    if sector < 1 or sector > 12:
+        raise ValueError(f"{label} must be in [1, 12], got {value}")
+    return sector
 
 
 def cleanup_matplotlib_tk():
@@ -3092,38 +3093,15 @@ def attempt_run_once():
     altitude_levels = np.array([600.0], dtype=float)  # 순항 고도(MSL, m)
     use_heading_map = True
 
-    sector_mode_enabled = False  # True: season 마스크로 사용자 섹터 허용 여부 검사, False: 검사 없이 사용자 섹터 그대로 사용
-    sector_season = "annual"    # 시즌 키 (annual, spring, summer, autumn, winter). True일 때 허용 섹터 판정에 사용
     takeoff_sector_user = 7     # 이륙 섹터 번호 (1~12, 1=북쪽 시작, 시계방향)
     landing_sector_user = 4     # 착륙 섹터 번호 (1~12, 1=북쪽 시작, 시계방향)
     sector_half_width_deg = 15.0    # 플롯 wedge 반폭(deg): 섹터 중심 기준 ±각도
 
-    takeoff_heading_deg = float(np.rad2deg(_sector_angle(int(takeoff_sector_user))))
-    landing_heading_deg = float(np.rad2deg(_sector_angle(int(landing_sector_user))))
+    takeoff_sector_user = _validate_sector_1based(takeoff_sector_user, "takeoff_sector_user")
+    landing_sector_user = _validate_sector_1based(landing_sector_user, "landing_sector_user")
+    takeoff_heading_deg = float(np.rad2deg(_sector_angle(takeoff_sector_user)))
+    landing_heading_deg = float(np.rad2deg(_sector_angle(landing_sector_user)))
     use_takeoff_landing_transition = False   # 이착륙 전환 경로 사용 여부,  False이면 사용자가 지정한 takeoff_end_lla를 그대로 사용, 
-
-    if bool(sector_mode_enabled):
-        sector_season = normalize_season(sector_season)
-        takeoff_sector_user = validate_sector_1based(takeoff_sector_user, label="takeoff_sector_user")
-        landing_sector_user = validate_sector_1based(landing_sector_user, label="landing_sector_user")
-        season_takeoff_mask, season_landing_mask = get_season_masks(sector_season)
-
-        if not sector_allowed(season_takeoff_mask, takeoff_sector_user):
-            raise ValueError(
-                f"Takeoff sector {takeoff_sector_user} is not allowed for season '{sector_season}'. "
-                f"Allowed takeoff sectors={np.where(season_takeoff_mask)[0] + 1}"
-            )
-        if not sector_allowed(season_landing_mask, landing_sector_user):
-            raise ValueError(
-                f"Landing sector {landing_sector_user} is not allowed for season '{sector_season}'. "
-                f"Allowed landing sectors={np.where(season_landing_mask)[0] + 1}"
-            )
-
-        takeoff_heading_deg = float(np.rad2deg(_sector_angle(takeoff_sector_user)))
-        landing_heading_deg = float(np.rad2deg(_sector_angle(landing_sector_user)))
-    else:
-        sector_season = normalize_season(sector_season)
-        season_takeoff_mask, season_landing_mask = get_season_masks(sector_season)
 
     transition_max_climb_angle_deg = 8.0
     transition_max_descent_angle_deg = 8.0
@@ -3240,13 +3218,9 @@ def attempt_run_once():
         "w_ground": w_ground,
         "w_air": w_air,
         "w_noise": w_noise,
-        "sector_mode_enabled": bool(sector_mode_enabled),
-        "sector_season": str(sector_season),
         "takeoff_sector_user": int(takeoff_sector_user),
         "landing_sector_user": int(landing_sector_user),
         "sector_half_width_deg": float(sector_half_width_deg),
-        "season_takeoff_mask_12": [int(v) for v in season_takeoff_mask.astype(int).tolist()],
-        "season_landing_mask_12": [int(v) for v in season_landing_mask.astype(int).tolist()],
         "takeoff_heading_deg": float(takeoff_heading_deg),
         "landing_heading_deg": float(landing_heading_deg),
         "use_takeoff_landing_transition": bool(use_takeoff_landing_transition),

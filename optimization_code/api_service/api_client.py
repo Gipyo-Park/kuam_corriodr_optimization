@@ -22,20 +22,11 @@ USE_STREAMING = True
 payload_optimal_corridor = {
     # optional (engine default is used when omitted)
     "start_vertiport": {
-        "lla": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
+        "lla": {"lat": 35.603386, "lon": 129.078025, "alt_m": 150.0},
     },
     # optional (engine default is used when omitted)
     "end_vertiport": {
-        "lla": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
-    },
-    # optional transition endpoints; replace either object with None for automatic fallback
-    # "takeoff_end": None,
-    # "landing_end": None,
-    "takeoff_end": {
-        "lla": {"lat": 35.59468397, "lon": 129.07515721},
-    },
-    "landing_end": {
-        "lla": {"lat": 35.59701567, "lon": 129.08585995},
+        "lla": {"lat": 35.603386, "lon": 129.078025, "alt_m": 150.0},
     },
 
     # optional horizontal airspace
@@ -44,7 +35,11 @@ payload_optimal_corridor = {
         "radius_km": 5.0,
     },
     # Required fields
+    # MSL altitude in meters for the cruise segment
     "cruise_altitude_m": 600.0,
+    # optional transition angles in degrees (default: 6.0, valid range: 0 < angle < 90)
+    "takeoff_climb_angle_deg": 6.0,
+    "landing_descent_angle_deg": 6.0,
     # optional (default: []) [lon_min, lon_max, lat_min, lat_max]
     "no_fly_zones": [
         # {"bbox": [129.0700, 129.0820, 35.5980, 35.6100]},
@@ -52,27 +47,9 @@ payload_optimal_corridor = {
     # optional middle waypoints (missing/null/empty uses no middle waypoints)
     # alt_m is optional; every point uses cruise_altitude_m as its altitude.
     "corridor_points": [
-        {"lat": 35.5924808, "lon": 129.0628871},
-        {"lat": 35.6073229, "lon": 129.0684057},
-        {"lat": 35.6143978, "lon": 129.0620381},
-        {"lat": 35.6131899, "lon": 129.0448457},
-        {"lat": 35.6235425, "lon": 129.0524868},
-        {"lat": 35.6219897, "lon": 129.0734997},
-        {"lat": 35.6052521, "lon": 129.0866594},
-        {"lat": 35.6055972, "lon": 129.1078846},
-        {"lat": 35.6171586, "lon": 129.1153134},
-        {"lat": 35.6118095, "lon": 129.1261383},
-        {"lat": 35.5897192, "lon": 129.1246525},
-        {"lat": 35.5750464, "lon": 129.1106439},
-        {"lat": 35.5671048, "lon": 129.0970597},
-        {"lat": 35.5655509, "lon": 129.0817776},
-        {"lat": 35.5757370, "lon": 129.0764712},
-        {"lat": 35.5810885, "lon": 129.0979087},
-        {"lat": 35.5955875, "lon": 129.1157379},
-        {"lat": 35.5900644, "lon": 129.0913289},
+        # {"lat": 35.5667595, "lon": 129.0849083},
+        # {"lat": 35.5954149, "lon": 129.1250239}
     ],
-    # optional minimum corridor distance constraint (default: 0, meaning no constraint)
-    "min_corridor_distance_km": 0.0,
 }
 
 
@@ -86,6 +63,10 @@ def post_and_log(endpoint, payload):
         wps = body.get("waypoints", [])
         if wps:
             print(f"waypoints: {len(wps)}개, start={wps[0]}, end={wps[-1]}")
+            print(
+                f"transition_structure_mode={body.get('transition_structure_mode')} | "
+                f"path_scope={body.get('path_scope')}"
+            )
         else:
             print("waypoints: 0개")
         return body
@@ -104,8 +85,12 @@ def check_server_health():
         resp = requests.get(url, timeout=5)
         resp.raise_for_status()
         body = resp.json()
-        print(f"[health] connected: {body}")
-        return True
+        engine_ready = bool(body.get("engine_ready", False))
+        if engine_ready:
+            print(f"[health] ready: {body}")
+        else:
+            print(f"[health] degraded: {body}")
+        return engine_ready
     except Exception as e:
         print(f"[health] failed: {e}")
         return False
@@ -187,6 +172,12 @@ def post_and_log_stream(payload):
                     print(f"[server/progress] {percent}% {stage}{count_text}: {ev.get('message', '')}")
                 elif event_type == "diagnostic":
                     _print_diagnostic_event(ev)
+                elif event_type == "warning":
+                    print(
+                        f"[server/warning] code={ev.get('code')} "
+                        f"stage={ev.get('stage')} progress={ev.get('percent')}%: "
+                        f"{ev.get('message', '')}"
+                    )
                 elif event_type == "error":
                     print(
                         f"[server/error] status={ev.get('status_code')} "
@@ -194,6 +185,11 @@ def post_and_log_stream(payload):
                         f"progress={ev.get('percent')}% id={ev.get('error_id')}: "
                         f"{ev.get('message', '')}"
                     )
+                    for detail in ev.get("details", []) or []:
+                        print(
+                            f"  - {detail.get('field')}: {detail.get('message')} "
+                            f"[{detail.get('type')}]"
+                        )
                 elif event_type == "status":
                     stage = ev.get("stage")
                     percent = ev.get("percent")
@@ -209,6 +205,11 @@ def post_and_log_stream(payload):
                         wps = response.get("waypoints", [])
                         if wps:
                             print(f"[server/result] success, waypoints={len(wps)}, start={wps[0]}, end={wps[-1]}")
+                            print(
+                                "[server/result] "
+                                f"transition_structure_mode={response.get('transition_structure_mode')} | "
+                                f"path_scope={response.get('path_scope')}"
+                            )
                         else:
                             print("[server/result] success, waypoints=0")
                     else:

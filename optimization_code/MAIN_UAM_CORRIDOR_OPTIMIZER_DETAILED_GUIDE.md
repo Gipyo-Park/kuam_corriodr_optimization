@@ -55,7 +55,6 @@
 | `niching_selection.niching_selection` | NSGA-III niching selection |
 | `evaluate_objectives_with_constraints_GP.evaluate_objectives_with_constraints_gp` | 목적함수 계산과 제약조건 검사 |
 | `rf_turn.apply_rf_turns` | waypoint 경로에 RF turn 적용 |
-| `takeoff_landing_sector.*` | 계절별 이착륙 섹터 허용 여부 검증 |
 
 ## 지도와 데이터 범위
 
@@ -138,8 +137,6 @@ AGL 계산 예:
 
 | 파라미터 | 현재값 | 의미 | 바꾸면 생기는 변화 |
 |---|---:|---|---|
-| `sector_mode_enabled` | `False` | 계절별 허용 섹터 mask를 강제할지 여부 | `True`면 `sector_season`에 따라 허용되지 않는 섹터 입력 시 에러 |
-| `sector_season` | `"annual"` | 섹터 허용 mask 기준 계절 | `sector_mode_enabled=True`일 때만 검증에 사용 |
 | `takeoff_sector_user` | `7` | 이륙 섹터 번호 | 이륙 전이 방향이 바뀐다 |
 | `landing_sector_user` | `5` | 착륙 섹터 번호 | 착륙 전이 방향이 바뀐다 |
 | `sector_half_width_deg` | `15.0` | 지도에 그리는 섹터 wedge 반폭 | 시각화 wedge 폭이 바뀐다. 경로 계산 방향은 섹터 중심선 기준 |
