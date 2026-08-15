@@ -22,10 +22,15 @@ if USE_INTERACTIVE_BACKEND:
         USE_INTERACTIVE_BACKEND = False
 import matplotlib.pyplot as plt
 from matplotlib._pylab_helpers import Gcf
-from matplotlib.patches import Polygon
+from matplotlib.patches import Patch
 from scipy.ndimage import map_coordinates
+from scipy.interpolate import RegularGridInterpolator
+from scipy.io import loadmat
 import cartopy.crs as ccrs
 import cartopy.io.img_tiles as cimgt
+from pyproj import Transformer
+from shapely.geometry import LineString
+from shapely.ops import transform as shapely_transform
 
 from crossover_GP import crossover_gp
 from mutation_GP import mutation_gp
@@ -34,22 +39,63 @@ from generate_initial_population_GP import generate_initial_population_gp
 from generate_reference_points import generate_reference_points
 from normalize_objectives import normalize_objectives
 from niching_selection import niching_selection
-from evaluate_objectives_with_constraints_GP import evaluate_objectives_with_constraints_gp
-from rf_turn import apply_rf_turns
-from takeoff_landing_sector import (
-    get_season_masks,
-    normalize_season,
-    sector_allowed,
-    validate_sector_1based,
+from evaluate_objectives_with_constraints_GP import (
+    evaluate_objectives_with_constraints_gp as _evaluate_constraints_shared,
+    _corridor_violates_nfz_with_width as _corridor_violates_nfz_with_width_shared,
+    _segment_to_segment_min_distance_m as _segment_to_segment_min_distance_m_shared,
 )
+from rf_turn import apply_rf_turns
 
 
 TAKEOFF_TRANSITION_PROFILE = None
 LANDING_TRANSITION_PROFILE_DESC = None
+TRANSITION_CONTEXT = None
 RF_ALLOW_TANGENT_CLAMP = True
 RF_CORNER_FIT_MARGIN = 0.95
 RF_CORNER_MIN_TANGENT_M = 1.0
 RF_MIN_TURN_ANGLE_DEG = 0.5
+
+TAKEOFF_TRANSITION_COLOR = "blue"
+LANDING_TRANSITION_COLOR = "green"
+FLIGHT_PHASE_VERTIPORT = "vertiport"
+FLIGHT_PHASE_TAKEOFF_STAGE1 = "takeoff_stage1"
+FLIGHT_PHASE_TAKEOFF_STAGE2 = "takeoff_stage2"
+FLIGHT_PHASE_CRUISE = "cruise"
+FLIGHT_PHASE_LANDING_STAGE2 = "landing_stage2"
+FLIGHT_PHASE_LANDING_STAGE1 = "landing_stage1"
+TRANSITION_STRUCTURE_FIXED_ONLY = "fixed_straight_only"
+TRANSITION_STRUCTURE_FIXED_PLUS_OPTIMIZED = "fixed_straight_plus_optimized"
+TRANSITION_STRUCTURE_OPTIMIZED_ONLY = "optimized_only"
+TRANSITION_STRUCTURE_MODES = (
+    TRANSITION_STRUCTURE_FIXED_ONLY,
+    TRANSITION_STRUCTURE_FIXED_PLUS_OPTIMIZED,
+    TRANSITION_STRUCTURE_OPTIMIZED_ONLY,
+)
+
+
+class SectorSelectionInfeasibleError(ValueError):
+    """No MOC-safe automatic takeoff/landing sector pair can be selected."""
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = list(details or [])
+
+
+MOC_REFERENCE_MSL_M = 150.0
+MOC_AGL_LEVELS_M = np.arange(100.0, 1000.0, 100.0, dtype=float)
+TRANSITION_PHASE_NAMES = (
+    FLIGHT_PHASE_TAKEOFF_STAGE1,
+    FLIGHT_PHASE_TAKEOFF_STAGE2,
+    FLIGHT_PHASE_LANDING_STAGE2,
+    FLIGHT_PHASE_LANDING_STAGE1,
+)
+
+_CORRIDOR_TO_EPSG5179 = Transformer.from_crs(
+    "EPSG:4326", "EPSG:5179", always_xy=True
+)
+_CORRIDOR_FROM_EPSG5179 = Transformer.from_crs(
+    "EPSG:5179", "EPSG:4326", always_xy=True
+)
 
 
 def _title_with_altitude(title, altitude_levels, vertiport):
@@ -384,6 +430,872 @@ def build_transition_profile_by_mode(
     return end_lla.astype(float), path_distance_m, profile.astype(float), geometry
 
 
+def _validate_transition_angle(angle_deg, label):
+    try:
+        angle = float(angle_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{label} must satisfy 0 < angle < 90 degrees."
+        ) from exc
+    if not np.isfinite(angle) or not 0.0 < angle < 90.0:
+        raise ValueError(f"{label} must satisfy 0 < angle < 90 degrees.")
+    return angle
+
+
+def build_stage1_transition_profile(
+    port_lla,
+    target_alt_m,
+    heading_deg,
+    transition_structure_mode,
+    transition_mode,
+    straight_distance_m,
+    total_transition_horizontal_distance_m,
+    angle_deg,
+    sample_spacing_m,
+    mode_label,
+):
+    """Build one direction's fixed prefix and complete transition geometry."""
+    port = np.asarray(port_lla, dtype=float).reshape(3)
+    target_alt = float(target_alt_m)
+    structure_mode = str(transition_structure_mode).strip().lower()
+    if structure_mode not in TRANSITION_STRUCTURE_MODES:
+        raise ValueError(
+            "transition_structure_mode must be one of "
+            f"{TRANSITION_STRUCTURE_MODES}, got {transition_structure_mode!r}."
+        )
+    heading = float(heading_deg)
+    if not np.isfinite(heading):
+        raise ValueError(f"{mode_label}_heading_deg must be finite.")
+    height = target_alt - float(port[2])
+    if height < -1e-9:
+        raise ValueError(f"{mode_label} target altitude must not be below the vertiport.")
+
+    geometry_mode = str(transition_mode).strip().lower()
+    configured_angle = angle_deg
+    configured_total_distance = total_transition_horizontal_distance_m
+    configured_stage1 = straight_distance_m
+    if height <= 1e-9:
+        angle = 0.0
+        total_distance = 0.0
+        requested_stage1 = 0.0
+        if structure_mode == TRANSITION_STRUCTURE_OPTIMIZED_ONLY:
+            geometry_mode = "ignored"
+    elif structure_mode == TRANSITION_STRUCTURE_OPTIMIZED_ONLY:
+        angle = _validate_transition_angle(angle_deg, f"{mode_label}_angle_deg")
+        total_distance = float(height / np.tan(np.deg2rad(angle)))
+        requested_stage1 = 0.0
+        geometry_mode = "ignored"
+    else:
+        geometry = _calculate_transition_geometry(
+            height_m=height,
+            transition_mode=geometry_mode,
+            distance_m=total_transition_horizontal_distance_m,
+            angle_deg=angle_deg,
+        )
+        angle = float(geometry["angle_deg"])
+        total_distance = float(geometry["distance_m"])
+        if structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY:
+            requested_stage1 = total_distance
+        else:
+            configured_stage1 = float(straight_distance_m)
+            if not np.isfinite(configured_stage1) or configured_stage1 < 0.0:
+                raise ValueError(
+                    f"{mode_label}_stage1_straight_distance_m must be finite and >= 0."
+                )
+            requested_stage1 = configured_stage1
+
+    stage1_distance = (
+        total_distance
+        if structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+        else min(float(requested_stage1), total_distance)
+    )
+    stage1_clamped = bool(
+        structure_mode == TRANSITION_STRUCTURE_FIXED_PLUS_OPTIMIZED
+        and float(requested_stage1) > total_distance
+    )
+    stage2_distance = max(0.0, total_distance - stage1_distance)
+    stage2_actual = bool(
+        structure_mode != TRANSITION_STRUCTURE_FIXED_ONLY
+        and stage2_distance > 0.0
+    )
+    stage1_alt = float(port[2] + stage1_distance * np.tan(np.deg2rad(angle)))
+    if (
+        structure_mode != TRANSITION_STRUCTURE_OPTIMIZED_ONLY
+        and stage2_distance == 0.0
+    ):
+        stage1_alt = target_alt
+
+    heading_rad = np.deg2rad(heading)
+    end_lat, end_lon = _move_latlon(
+        float(port[0]),
+        float(port[1]),
+        heading_rad,
+        stage1_distance,
+    )
+    stage1_end = np.array([end_lat, end_lon, stage1_alt], dtype=float)
+    if stage1_distance <= 0.0:
+        profile = port.reshape(1, 3).copy()
+    else:
+        profile = build_transition_profile_linear(
+            port,
+            stage1_end,
+            sample_spacing_m=sample_spacing_m,
+        )
+        if profile.shape[0] == 2:
+            profile = np.vstack([
+                profile[0],
+                0.5 * (profile[0] + profile[1]),
+                profile[1],
+            ]).astype(float)
+
+    return stage1_end, profile, {
+        "mode": f"{structure_mode}_{geometry_mode}",
+        "transition_structure_mode": structure_mode,
+        "transition_mode": geometry_mode,
+        "angle_deg": angle,
+        "actual_angle_deg": angle,
+        "configured_angle_deg": (
+            (
+                None if configured_angle is None else float(configured_angle)
+            )
+            if (
+                height > 1e-9
+                and (
+                    structure_mode == TRANSITION_STRUCTURE_OPTIMIZED_ONLY
+                    or geometry_mode == "angle"
+                )
+            )
+            else configured_angle
+        ),
+        "altitude_profile_input": "angle",
+        "height_m": float(height),
+        "distance_m": total_distance,
+        "total_horizontal_distance_m": total_distance,
+        "configured_total_horizontal_distance_m": (
+            (
+                None
+                if configured_total_distance is None
+                else float(configured_total_distance)
+            )
+            if height > 1e-9 and geometry_mode == "distance"
+            else configured_total_distance
+        ),
+        "stage1_requested_straight_distance_m": float(requested_stage1),
+        "stage1_straight_distance_m": stage1_distance,
+        "stage1_effective_straight_distance_m": stage1_distance,
+        "stage1_clamped_to_cruise": stage1_clamped,
+        "stage2_horizontal_distance_m": stage2_distance,
+        "optimized_transition_actual": stage2_actual,
+        "stage2_collapsed_at_cruise": bool(
+            structure_mode == TRANSITION_STRUCTURE_FIXED_PLUS_OPTIMIZED
+            and stage2_distance == 0.0
+        ),
+        "fixed_straight_actual": bool(stage1_distance > 0.0),
+        "stage1_end_lla": stage1_end.copy(),
+        "heading_deg": heading,
+        "sample_spacing_m": float(sample_spacing_m),
+    }
+
+
+def _angular_difference_deg(a_deg, b_deg):
+    return float(abs((float(a_deg) - float(b_deg) + 180.0) % 360.0 - 180.0))
+
+
+def _polyline_cumulative_horizontal_m(points):
+    pts = np.asarray(points, dtype=float).reshape(-1, 3)
+    out = np.zeros(pts.shape[0], dtype=float)
+    for i in range(1, pts.shape[0]):
+        out[i] = out[i - 1] + _seg_dist_m(pts[i - 1], pts[i])
+    return out
+
+
+def _insert_polyline_distances(points, requested_local_distances_m):
+    """Insert exact along-track points into a polyline and return local distances."""
+    pts = np.asarray(points, dtype=float).reshape(-1, 3)
+    if pts.shape[0] <= 1:
+        return pts.copy(), np.zeros(pts.shape[0], dtype=float)
+
+    cumulative = _polyline_cumulative_horizontal_m(pts)
+    total = float(cumulative[-1])
+    requested = sorted({
+        float(np.clip(v, 0.0, total))
+        for v in requested_local_distances_m
+        if np.isfinite(v) and -1e-6 <= float(v) <= total + 1e-6
+    })
+    target_distances = list(cumulative.astype(float))
+    for requested_s in requested:
+        if not target_distances:
+            target_distances.append(requested_s)
+            continue
+        nearest_idx = int(np.argmin(np.abs(np.asarray(target_distances) - requested_s)))
+        nearest_gap = abs(float(target_distances[nearest_idx]) - requested_s)
+        nearest_is_endpoint = bool(
+            nearest_idx == 0 or nearest_idx == len(target_distances) - 1
+        )
+        strictly_interior = bool(0.0 < requested_s < total)
+        if nearest_gap <= 0.05 and not (
+            nearest_is_endpoint and strictly_interior
+        ):
+            # Preserve the exact requested phase boundary without creating a
+            # near-duplicate RF/TF point beside an existing sample.
+            target_distances[nearest_idx] = requested_s
+        else:
+            target_distances.append(requested_s)
+    target_distances = sorted(set(target_distances))
+
+    out = []
+    for s in target_distances:
+        if s <= 0.0:
+            out.append(pts[0].copy())
+            continue
+        if s >= total:
+            out.append(pts[-1].copy())
+            continue
+        hi = int(np.searchsorted(cumulative, s, side="right"))
+        hi = int(np.clip(hi, 1, pts.shape[0] - 1))
+        lo = hi - 1
+        span = float(cumulative[hi] - cumulative[lo])
+        tau = 0.0 if span <= 1e-12 else float((s - cumulative[lo]) / span)
+        out.append(pts[lo] * (1.0 - tau) + pts[hi] * tau)
+    return np.asarray(out, dtype=float), np.asarray(target_distances, dtype=float)
+
+
+def _profile_rf_segments_for_transition(rf, transition_context):
+    """Assign phase and angle-based altitude to RF/TF points after RF geometry."""
+    if not bool(transition_context.get("enabled", False)):
+        path = np.asarray(rf.get("path", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        phases = np.full(path.shape[0], FLIGHT_PHASE_CRUISE, dtype=object)
+        start_vertiport = transition_context.get("start_vertiport_lla")
+        end_vertiport = transition_context.get("end_vertiport_lla")
+        if path.shape[0] > 0:
+            if start_vertiport is not None and _seg_dist_3d_m(path[0], start_vertiport) <= 0.05:
+                phases[0] = FLIGHT_PHASE_VERTIPORT
+            if end_vertiport is not None and _seg_dist_3d_m(path[-1], end_vertiport) <= 0.05:
+                phases[-1] = FLIGHT_PHASE_VERTIPORT
+        rf["path"] = path
+        rf["flight_phases"] = phases
+        disabled_segments = list(rf.get("segments", []))
+        for seg_idx, seg in enumerate(disabled_segments):
+            seg_pts = np.asarray(seg.get("points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+            seg_phases = np.full(seg_pts.shape[0], FLIGHT_PHASE_CRUISE, dtype=object)
+            if seg_pts.shape[0] > 0:
+                if (
+                    seg_idx == 0
+                    and start_vertiport is not None
+                    and _seg_dist_3d_m(seg_pts[0], start_vertiport) <= 0.05
+                ):
+                    seg_phases[0] = FLIGHT_PHASE_VERTIPORT
+                if (
+                    seg_idx == len(disabled_segments) - 1
+                    and end_vertiport is not None
+                    and _seg_dist_3d_m(seg_pts[-1], end_vertiport) <= 0.05
+                ):
+                    seg_phases[-1] = FLIGHT_PHASE_VERTIPORT
+            seg["point_phases"] = seg_phases
+        rf["transition_feasible"] = True
+        rf["transition_fail_reason"] = "ok"
+        return rf
+
+    raw_segments = list(rf.get("segments", []))
+    if not raw_segments:
+        raw_path = np.asarray(rf.get("path", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        if raw_path.shape[0] >= 2:
+            raw_segments = [{"type": "TF", "points": raw_path}]
+
+    seg_lengths = []
+    for seg in raw_segments:
+        seg_pts = np.asarray(seg.get("points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        seg_lengths.append(float(_polyline_cumulative_horizontal_m(seg_pts)[-1]) if seg_pts.shape[0] else 0.0)
+    core_total = float(np.sum(seg_lengths))
+    station_eps = max(
+        1e-12,
+        16.0 * np.finfo(float).eps * max(1.0, abs(core_total)),
+    )
+    takeoff_remaining = float(transition_context["takeoff"]["stage2_horizontal_distance_m"])
+    landing_remaining = float(transition_context["landing"]["stage2_horizontal_distance_m"])
+    takeoff_stage2_actual = bool(
+        transition_context["takeoff"].get(
+            "optimized_transition_actual", takeoff_remaining > 0.0
+        )
+        and takeoff_remaining > 0.0
+    )
+    landing_stage2_actual = bool(
+        transition_context["landing"].get(
+            "optimized_transition_actual", landing_remaining > 0.0
+        )
+        and landing_remaining > 0.0
+    )
+    distance_feasible = bool(
+        core_total + station_eps >= takeoff_remaining + landing_remaining
+    )
+    fail_reasons = []
+    if not distance_feasible:
+        fail_reasons.append("transition_distance_overlap")
+
+    takeoff_boundary_s = float(takeoff_remaining)
+    landing_boundary_s = float(core_total - landing_remaining)
+    cruise_alt = float(transition_context["cruise_altitude_m"])
+    takeoff_start_alt = float(transition_context["takeoff"]["stage1_end_lla"][2])
+    landing_end_alt = float(transition_context["landing"]["stage1_end_lla"][2])
+    tan_takeoff = float(np.tan(np.deg2rad(transition_context["takeoff"]["angle_deg"])))
+    tan_landing = float(np.tan(np.deg2rad(transition_context["landing"]["angle_deg"])))
+
+    profiled_segments = []
+    offset = 0.0
+    takeoff_end_point = None
+    landing_end_point = None
+    takeoff_end_error_m = float("inf")
+    landing_end_error_m = float("inf")
+    requested_core_breaks = [takeoff_boundary_s, landing_boundary_s]
+    if landing_stage2_actual:
+        requested_core_breaks.append(
+            landing_boundary_s + 0.5 * landing_remaining
+        )
+    for seg, seg_len in zip(raw_segments, seg_lengths):
+        seg_pts = np.asarray(seg.get("points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        local_breaks = []
+        for boundary in requested_core_breaks:
+            if offset - station_eps <= boundary <= offset + seg_len + station_eps:
+                local_breaks.append(boundary - offset)
+        pts_i, local_s = _insert_polyline_distances(seg_pts, local_breaks)
+        global_s = offset + local_s
+
+        takeoff_alt = takeoff_start_alt + global_s * tan_takeoff
+        landing_alt = landing_end_alt + (core_total - global_s) * tan_landing
+        pts_i[:, 2] = np.minimum(cruise_alt, np.minimum(takeoff_alt, landing_alt))
+
+        phases_i = np.full(pts_i.shape[0], FLIGHT_PHASE_CRUISE, dtype=object)
+        if takeoff_stage2_actual:
+            phases_i[global_s < takeoff_boundary_s] = FLIGHT_PHASE_TAKEOFF_STAGE2
+        # The exact boundary still terminates the preceding edge. Mark only
+        # samples beyond it as landing so the boundary-to-next edge is green.
+        if landing_stage2_actual:
+            phases_i[global_s > landing_boundary_s] = FLIGHT_PHASE_LANDING_STAGE2
+
+        if global_s.size:
+            takeoff_idx = int(np.argmin(np.abs(global_s - takeoff_boundary_s)))
+            takeoff_error = float(abs(global_s[takeoff_idx] - takeoff_boundary_s))
+            if takeoff_error <= station_eps:
+                if takeoff_stage2_actual:
+                    phases_i[takeoff_idx] = FLIGHT_PHASE_TAKEOFF_STAGE2
+                if takeoff_error < takeoff_end_error_m:
+                    takeoff_end_error_m = takeoff_error
+                    takeoff_end_point = pts_i[takeoff_idx].copy()
+
+            landing_idx = int(np.argmin(np.abs(global_s - landing_boundary_s)))
+            landing_error = float(abs(global_s[landing_idx] - landing_boundary_s))
+            if landing_error <= station_eps:
+                if not (
+                    takeoff_stage2_actual
+                    and abs(landing_boundary_s - takeoff_boundary_s)
+                    <= station_eps
+                ):
+                    phases_i[landing_idx] = FLIGHT_PHASE_CRUISE
+                if landing_error < landing_end_error_m:
+                    landing_end_error_m = landing_error
+                    landing_end_point = pts_i[landing_idx].copy()
+
+        seg_new = dict(seg)
+        seg_new["points"] = pts_i
+        seg_new["point_phases"] = phases_i
+        seg_new["point_cumulative_core_m"] = global_s
+        profiled_segments.append(seg_new)
+        offset += seg_len
+
+    if takeoff_end_point is None and profiled_segments:
+        takeoff_end_point = np.asarray(profiled_segments[0]["points"], dtype=float)[0].copy()
+    if landing_end_point is None and profiled_segments:
+        landing_end_point = np.asarray(profiled_segments[-1]["points"], dtype=float)[-1].copy()
+
+    full_segments = []
+    takeoff_stage1_profile = np.asarray(
+        transition_context["takeoff"].get("stage1_profile", np.empty((0, 3))),
+        dtype=float,
+    ).reshape(-1, 3)
+    if takeoff_stage1_profile.shape[0] >= 2:
+        full_segments.append({
+            "type": "TF",
+            "points": takeoff_stage1_profile,
+            "point_phases": np.full(
+                takeoff_stage1_profile.shape[0], FLIGHT_PHASE_TAKEOFF_STAGE1, dtype=object
+            ),
+            "is_fixed_transition_stage1": True,
+        })
+    full_segments.extend(profiled_segments)
+
+    landing_stage1_profile_desc = np.asarray(
+        transition_context["landing"].get("stage1_profile_desc", np.empty((0, 3))),
+        dtype=float,
+    ).reshape(-1, 3)
+    if landing_stage1_profile_desc.shape[0] >= 2:
+        full_segments.append({
+            "type": "TF",
+            "points": landing_stage1_profile_desc,
+            "point_phases": np.full(
+                landing_stage1_profile_desc.shape[0], FLIGHT_PHASE_LANDING_STAGE1, dtype=object
+            ),
+            "is_fixed_transition_stage1": True,
+        })
+
+    if full_segments:
+        first_phases = np.asarray(full_segments[0]["point_phases"], dtype=object).copy()
+        if first_phases.size:
+            first_phases[0] = FLIGHT_PHASE_VERTIPORT
+            full_segments[0]["point_phases"] = first_phases
+        last_phases = np.asarray(full_segments[-1]["point_phases"], dtype=object).copy()
+        if last_phases.size:
+            last_phases[-1] = FLIGHT_PHASE_VERTIPORT
+            full_segments[-1]["point_phases"] = last_phases
+
+    path_parts = []
+    phase_parts = []
+    for seg in full_segments:
+        pts_i = np.asarray(seg["points"], dtype=float).reshape(-1, 3)
+        phases_i = np.asarray(seg["point_phases"], dtype=object).reshape(-1)
+        if pts_i.shape[0] == 0:
+            continue
+        if not path_parts:
+            path_parts.append(pts_i)
+            phase_parts.append(phases_i)
+        else:
+            skip = 1 if _seg_dist_3d_m(path_parts[-1][-1], pts_i[0]) <= 0.05 else 0
+            if pts_i[skip:].shape[0] > 0:
+                path_parts.append(pts_i[skip:])
+                phase_parts.append(phases_i[skip:])
+
+    if path_parts:
+        full_path = np.vstack([p for p in path_parts if p.size > 0])
+        full_phases = np.concatenate([p for p in phase_parts if p.size > 0])
+    else:
+        full_path = np.empty((0, 3), dtype=float)
+        full_phases = np.empty((0,), dtype=object)
+
+    core_path_parts = []
+    for seg in profiled_segments:
+        pts_i = np.asarray(seg["points"], dtype=float).reshape(-1, 3)
+        if pts_i.shape[0] == 0:
+            continue
+        if not core_path_parts:
+            core_path_parts.append(pts_i)
+        else:
+            skip = 1 if _seg_dist_3d_m(core_path_parts[-1][-1], pts_i[0]) <= 0.05 else 0
+            if pts_i[skip:].shape[0] > 0:
+                core_path_parts.append(pts_i[skip:])
+    core_path = (
+        np.vstack(core_path_parts).astype(float)
+        if core_path_parts else np.empty((0, 3), dtype=float)
+    )
+
+    takeoff_continuity_ok = False
+    landing_continuity_ok = False
+    if core_path.shape[0] == 0:
+        fail_reasons.append("transition_core_path_missing")
+    else:
+        expected_takeoff_boundary = (
+            takeoff_stage1_profile[-1]
+            if takeoff_stage1_profile.shape[0] >= 2
+            else np.asarray(
+                transition_context["takeoff"]["stage1_end_lla"], dtype=float
+            ).reshape(3)
+        )
+        expected_landing_boundary = (
+            landing_stage1_profile_desc[0]
+            if landing_stage1_profile_desc.shape[0] >= 2
+            else np.asarray(
+                transition_context["landing"]["stage1_end_lla"], dtype=float
+            ).reshape(3)
+        )
+        takeoff_continuity_ok = bool(
+            _seg_dist_3d_m(expected_takeoff_boundary, core_path[0]) <= 0.05
+        )
+        landing_continuity_ok = bool(
+            _seg_dist_3d_m(core_path[-1], expected_landing_boundary) <= 0.05
+        )
+        if not takeoff_continuity_ok:
+            fail_reasons.append("takeoff_stage1_core_discontinuity")
+        if not landing_continuity_ok:
+            fail_reasons.append("landing_core_stage1_discontinuity")
+
+    duplicate_endpoint_ok = True
+    for i in range(1, full_path.shape[0]):
+        if np.allclose(
+            full_path[i - 1],
+            full_path[i],
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            duplicate_endpoint_ok = False
+            break
+    if not duplicate_endpoint_ok:
+        fail_reasons.append("duplicate_consecutive_endpoint")
+
+    phase_order = {
+        FLIGHT_PHASE_TAKEOFF_STAGE1: 1,
+        FLIGHT_PHASE_TAKEOFF_STAGE2: 2,
+        FLIGHT_PHASE_CRUISE: 3,
+        FLIGHT_PHASE_LANDING_STAGE2: 4,
+        FLIGHT_PHASE_LANDING_STAGE1: 5,
+    }
+    phase_order_ok = bool(full_path.shape[0] == full_phases.shape[0] and full_path.shape[0] > 0)
+    phase_ranks = []
+    if phase_order_ok:
+        last_idx = full_phases.shape[0] - 1
+        for i, phase in enumerate(full_phases):
+            if phase == FLIGHT_PHASE_VERTIPORT:
+                rank = 0 if i == 0 else (6 if i == last_idx else None)
+            else:
+                rank = phase_order.get(str(phase))
+            if rank is None:
+                phase_order_ok = False
+                break
+            phase_ranks.append(int(rank))
+        if phase_order_ok and any(
+            phase_ranks[i] < phase_ranks[i - 1]
+            for i in range(1, len(phase_ranks))
+        ):
+            phase_order_ok = False
+    if not phase_order_ok:
+        fail_reasons.append("flight_phase_order_violation")
+
+    takeoff_indices = np.flatnonzero(
+        np.isin(
+            full_phases,
+            [FLIGHT_PHASE_TAKEOFF_STAGE1, FLIGHT_PHASE_TAKEOFF_STAGE2],
+        )
+    ).tolist()
+    if full_path.shape[0] > 0 and (not takeoff_indices or takeoff_indices[0] != 0):
+        takeoff_indices.insert(0, 0)
+    takeoff_monotonic_ok = True
+    if len(takeoff_indices) >= 2:
+        takeoff_alts = full_path[np.asarray(takeoff_indices, dtype=int), 2]
+        takeoff_monotonic_ok = bool(np.all(np.diff(takeoff_alts) >= -1e-6))
+    if not takeoff_monotonic_ok:
+        fail_reasons.append("takeoff_altitude_not_monotonic")
+
+    landing_indices = np.flatnonzero(
+        np.isin(
+            full_phases,
+            [FLIGHT_PHASE_LANDING_STAGE2, FLIGHT_PHASE_LANDING_STAGE1],
+        )
+    ).tolist()
+    if full_path.shape[0] > 0 and (not landing_indices or landing_indices[-1] != full_path.shape[0] - 1):
+        landing_indices.append(full_path.shape[0] - 1)
+    landing_monotonic_ok = True
+    if len(landing_indices) >= 2:
+        landing_alts = full_path[np.asarray(landing_indices, dtype=int), 2]
+        landing_monotonic_ok = bool(np.all(np.diff(landing_alts) <= 1e-6))
+    if not landing_monotonic_ok:
+        fail_reasons.append("landing_altitude_not_monotonic")
+
+    first_heading = None
+    last_heading = None
+    for i in range(core_path.shape[0] - 1):
+        if _seg_dist_m(core_path[i], core_path[i + 1]) > station_eps:
+            first_heading = _heading_deg_from_segment(core_path[i], core_path[i + 1])
+            break
+    for i in range(core_path.shape[0] - 1, 0, -1):
+        if _seg_dist_m(core_path[i - 1], core_path[i]) > station_eps:
+            last_heading = _heading_deg_from_segment(core_path[i - 1], core_path[i])
+            break
+
+    target_takeoff = float(transition_context["takeoff_heading_deg"])
+    target_landing_inbound = (
+        float(transition_context["landing_heading_deg"]) + 180.0
+    ) % 360.0
+    half_width = float(transition_context["sector_half_width_deg"])
+    require_takeoff_sector_heading = bool(
+        transition_context.get(
+            "require_takeoff_sector_heading",
+            transition_context.get("require_sector_heading", True),
+        )
+    )
+    require_landing_sector_heading = bool(
+        transition_context.get(
+            "require_landing_sector_heading",
+            transition_context.get("require_sector_heading", True),
+        )
+    )
+    takeoff_stage1_expected_m = float(
+        transition_context["takeoff"]["stage1_straight_distance_m"]
+    )
+    landing_stage1_expected_m = float(
+        transition_context["landing"]["stage1_straight_distance_m"]
+    )
+    takeoff_stage1_actual_m = (
+        float(_polyline_cumulative_horizontal_m(takeoff_stage1_profile)[-1])
+        if takeoff_stage1_profile.shape[0] >= 2 else 0.0
+    )
+    landing_stage1_actual_m = (
+        float(_polyline_cumulative_horizontal_m(landing_stage1_profile_desc)[-1])
+        if landing_stage1_profile_desc.shape[0] >= 2 else 0.0
+    )
+    takeoff_stage1_distance_tolerance_m = max(
+        0.5, abs(takeoff_stage1_expected_m) * 5e-4
+    )
+    landing_stage1_distance_tolerance_m = max(
+        0.5, abs(landing_stage1_expected_m) * 5e-4
+    )
+    takeoff_stage1_distance_ok = bool(
+        abs(takeoff_stage1_actual_m - takeoff_stage1_expected_m)
+        <= takeoff_stage1_distance_tolerance_m
+    )
+    landing_stage1_distance_ok = bool(
+        abs(landing_stage1_actual_m - landing_stage1_expected_m)
+        <= landing_stage1_distance_tolerance_m
+    )
+    takeoff_stage1_heading_ok = True
+    landing_stage1_heading_ok = True
+    if takeoff_stage1_profile.shape[0] >= 2:
+        stage1_heading = _heading_deg_from_segment(
+            takeoff_stage1_profile[0], takeoff_stage1_profile[-1]
+        )
+        takeoff_stage1_heading_ok = bool(
+            stage1_heading is not None
+            and _angular_difference_deg(stage1_heading, target_takeoff) <= 0.1
+        )
+    if landing_stage1_profile_desc.shape[0] >= 2:
+        stage1_heading = _heading_deg_from_segment(
+            landing_stage1_profile_desc[0], landing_stage1_profile_desc[-1]
+        )
+        landing_stage1_heading_ok = bool(
+            stage1_heading is not None
+            and _angular_difference_deg(stage1_heading, target_landing_inbound) <= 0.1
+        )
+    if not takeoff_stage1_distance_ok:
+        fail_reasons.append("takeoff_stage1_distance_mismatch")
+    if not landing_stage1_distance_ok:
+        fail_reasons.append("landing_stage1_distance_mismatch")
+    if not takeoff_stage1_heading_ok:
+        fail_reasons.append("takeoff_stage1_heading_violation")
+    if not landing_stage1_heading_ok:
+        fail_reasons.append("landing_stage1_heading_violation")
+    takeoff_sector_ok = True
+    landing_sector_ok = True
+    if require_takeoff_sector_heading:
+        takeoff_sector_ok = bool(
+            first_heading is not None
+            and _angular_difference_deg(first_heading, target_takeoff)
+            <= half_width + 1e-6
+        )
+        if first_heading is None:
+            fail_reasons.append("takeoff_sector_heading_unavailable")
+        elif not takeoff_sector_ok:
+            fail_reasons.append("takeoff_sector_heading_violation")
+    if require_landing_sector_heading:
+        landing_sector_ok = bool(
+            last_heading is not None
+            and _angular_difference_deg(last_heading, target_landing_inbound)
+            <= half_width + 1e-6
+        )
+        if last_heading is None:
+            fail_reasons.append("landing_sector_heading_unavailable")
+        elif not landing_sector_ok:
+            fail_reasons.append("landing_sector_heading_violation")
+
+    takeoff_transition_endpoint_ok = bool(
+        not distance_feasible
+        or (
+            takeoff_end_point is not None
+            and abs(float(takeoff_end_point[2]) - cruise_alt) <= 1e-4
+        )
+    )
+    landing_transition_endpoint_ok = bool(
+        not distance_feasible
+        or (
+            landing_end_point is not None
+            and abs(float(landing_end_point[2]) - cruise_alt) <= 1e-4
+        )
+    )
+    if not takeoff_transition_endpoint_ok:
+        fail_reasons.append("takeoff_transition_endpoint_missing_or_wrong_altitude")
+    if not landing_transition_endpoint_ok:
+        fail_reasons.append("landing_transition_endpoint_missing_or_wrong_altitude")
+
+    transition_feasible = bool(not fail_reasons)
+    fail_reason = fail_reasons[0] if fail_reasons else "ok"
+    validation_checks = {
+        "distance_non_overlapping": bool(distance_feasible),
+        "takeoff_stage1_core_continuity": bool(takeoff_continuity_ok),
+        "landing_core_stage1_continuity": bool(landing_continuity_ok),
+        "no_duplicate_consecutive_endpoint": bool(duplicate_endpoint_ok),
+        "flight_phase_order": bool(phase_order_ok),
+        "takeoff_altitude_monotonic": bool(takeoff_monotonic_ok),
+        "landing_altitude_monotonic": bool(landing_monotonic_ok),
+        "takeoff_stage1_distance": bool(takeoff_stage1_distance_ok),
+        "landing_stage1_distance": bool(landing_stage1_distance_ok),
+        "takeoff_stage1_heading": bool(takeoff_stage1_heading_ok),
+        "landing_stage1_heading": bool(landing_stage1_heading_ok),
+        "takeoff_transition_endpoint": bool(takeoff_transition_endpoint_ok),
+        "landing_transition_endpoint": bool(landing_transition_endpoint_ok),
+        "takeoff_sector_heading": bool(takeoff_sector_ok),
+        "landing_sector_heading": bool(landing_sector_ok),
+    }
+
+    rf["segments"] = full_segments
+    rf["path"] = full_path
+    rf["flight_phases"] = full_phases
+    rf["transition_feasible"] = bool(transition_feasible)
+    rf["transition_fail_reason"] = str(fail_reason)
+    rf["transition_fail_reasons"] = list(fail_reasons)
+    rf["feasible"] = bool(rf.get("feasible", True) and transition_feasible)
+    rf["transition_meta"] = {
+        "enabled": True,
+        "two_stage_enabled": bool(transition_context.get("two_stage_enabled", False)),
+        "transition_structure_mode": str(
+            transition_context.get(
+                "transition_structure_mode",
+                TRANSITION_STRUCTURE_FIXED_PLUS_OPTIMIZED,
+            )
+        ),
+        "core_horizontal_distance_m": core_total,
+        "validation_checks": validation_checks,
+        "takeoff_transition_end": None if takeoff_end_point is None else takeoff_end_point,
+        "landing_transition_end": None if landing_end_point is None else landing_end_point,
+        "takeoff_transition_total_horizontal_distance_m": float(
+            transition_context["takeoff"]["total_horizontal_distance_m"]
+        ),
+        "landing_transition_total_horizontal_distance_m": float(
+            transition_context["landing"]["total_horizontal_distance_m"]
+        ),
+        "takeoff_stage1_straight_distance_m": float(
+            transition_context["takeoff"]["stage1_straight_distance_m"]
+        ),
+        "landing_stage1_straight_distance_m": float(
+            transition_context["landing"]["stage1_straight_distance_m"]
+        ),
+        "takeoff_stage1_distance_tolerance_m": float(
+            takeoff_stage1_distance_tolerance_m
+        ),
+        "landing_stage1_distance_tolerance_m": float(
+            landing_stage1_distance_tolerance_m
+        ),
+        "takeoff_stage1_requested_straight_distance_m": float(
+            transition_context["takeoff"].get(
+                "stage1_requested_straight_distance_m",
+                transition_context["takeoff"]["stage1_straight_distance_m"],
+            )
+        ),
+        "landing_stage1_requested_straight_distance_m": float(
+            transition_context["landing"].get(
+                "stage1_requested_straight_distance_m",
+                transition_context["landing"]["stage1_straight_distance_m"],
+            )
+        ),
+        "takeoff_stage2_horizontal_distance_m": float(takeoff_remaining),
+        "landing_stage2_horizontal_distance_m": float(landing_remaining),
+        "takeoff_optimized_transition_actual": bool(takeoff_stage2_actual),
+        "landing_optimized_transition_actual": bool(landing_stage2_actual),
+        "takeoff_stage2_collapsed_at_cruise": bool(
+            transition_context["takeoff"].get("stage2_collapsed_at_cruise", False)
+        ),
+        "landing_stage2_collapsed_at_cruise": bool(
+            transition_context["landing"].get("stage2_collapsed_at_cruise", False)
+        ),
+        "takeoff_stage1_clamped_to_cruise": bool(
+            transition_context["takeoff"].get("stage1_clamped_to_cruise", False)
+        ),
+        "landing_stage1_clamped_to_cruise": bool(
+            transition_context["landing"].get("stage1_clamped_to_cruise", False)
+        ),
+        "fixed_transition_general_output_suppressed": bool(
+            transition_context.get("transition_structure_mode")
+            == TRANSITION_STRUCTURE_FIXED_ONLY
+        ),
+        "fixed_transition_evaluated_but_not_exported": bool(
+            transition_context.get("transition_structure_mode")
+            == TRANSITION_STRUCTURE_FIXED_ONLY
+        ),
+        "takeoff_climb_angle_deg": float(transition_context["takeoff"]["angle_deg"]),
+        "landing_descent_angle_deg": float(transition_context["landing"]["angle_deg"]),
+        "takeoff_stage1_end": np.asarray(
+            transition_context["takeoff"]["stage1_end_lla"], dtype=float
+        ).copy(),
+        "landing_stage1_start": np.asarray(
+            transition_context["landing"]["stage1_end_lla"], dtype=float
+        ).copy(),
+    }
+    rf["takeoff_stage1_end"] = rf["transition_meta"]["takeoff_stage1_end"]
+    rf["takeoff_transition_end"] = rf["transition_meta"]["takeoff_transition_end"]
+    rf["landing_transition_start"] = rf["transition_meta"]["landing_transition_end"]
+    rf["landing_stage1_start"] = rf["transition_meta"]["landing_stage1_start"]
+    return rf
+
+
+def _build_output_rf_view_v1(
+    rf,
+    transition_structure_mode,
+    transition_enabled=True,
+):
+    """Return the public corridor view without exposing fixed-only straight legs."""
+    structure_mode = str(transition_structure_mode).strip().lower()
+    suppress_fixed = bool(
+        transition_enabled
+        and structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+    )
+    if not suppress_fixed:
+        return rf
+
+    output_rf = dict(rf)
+    output_segments = []
+    for seg in rf.get("segments", []):
+        if bool(seg.get("is_fixed_transition_stage1", False)):
+            continue
+        seg_copy = dict(seg)
+        pts = np.asarray(
+            seg.get("points", np.empty((0, 3))), dtype=float
+        ).reshape(-1, 3).copy()
+        phases = np.asarray(
+            seg.get(
+                "point_phases",
+                np.full(pts.shape[0], FLIGHT_PHASE_CRUISE, dtype=object),
+            ),
+            dtype=object,
+        ).reshape(-1).copy()
+        if phases.size != pts.shape[0]:
+            raise RuntimeError(
+                "Output RF segment phase count mismatch: "
+                f"points={pts.shape[0]}, phases={phases.size}."
+            )
+        phases[:] = FLIGHT_PHASE_CRUISE
+        seg_copy["points"] = pts
+        seg_copy["point_phases"] = phases
+        output_segments.append(seg_copy)
+
+    path_parts = []
+    phase_parts = []
+    for seg in output_segments:
+        pts = np.asarray(seg["points"], dtype=float).reshape(-1, 3)
+        phases = np.asarray(seg["point_phases"], dtype=object).reshape(-1)
+        if pts.shape[0] == 0:
+            continue
+        skip = 0
+        if path_parts and _seg_dist_3d_m(path_parts[-1][-1], pts[0]) <= 0.05:
+            skip = 1
+        if pts[skip:].shape[0] > 0:
+            path_parts.append(pts[skip:])
+            phase_parts.append(phases[skip:])
+
+    output_path = (
+        np.vstack(path_parts).astype(float)
+        if path_parts else np.empty((0, 3), dtype=float)
+    )
+    output_phases = (
+        np.concatenate(phase_parts).astype(object)
+        if phase_parts else np.empty((0,), dtype=object)
+    )
+    if output_path.shape[0] != output_phases.size:
+        raise RuntimeError(
+            "Output RF path/phase mismatch after fixed-transition suppression."
+        )
+
+    output_rf["segments"] = output_segments
+    output_rf["path"] = output_path
+    output_rf["flight_phases"] = output_phases
+    output_rf["fixed_transition_general_output_suppressed"] = True
+    output_rf["fixed_transition_evaluated_but_not_exported"] = True
+    return output_rf
+
+
 def build_full_corridor_path(start_vertiport, takeoff_complete, path_core, landing_entry, end_vertiport):
     return np.vstack([start_vertiport, takeoff_complete, path_core, landing_entry, end_vertiport]).astype(float)
 
@@ -423,46 +1335,45 @@ def apply_rf_turns_full_corridor(
     corner_fit_margin=None,
     corner_min_tangent_m=None,
     min_turn_angle_deg=None,
+    transition_context=None,
 ):
-    """
-    Apply RF turns only to the cruise span between Takeoff_End and Landing_Start.
-
-    The transition profiles stay straight and are stitched back around the RF core
-    for the returned full-corridor path.
-    """
+    """Apply RF to the optimizable span, then apply the v1 transition profile."""
     core = np.asarray(path_core, dtype=float)
     if core.size == 0:
         core = np.empty((0, 3), dtype=float)
     else:
         core = core.reshape(-1, 3)
 
-    takeoff_profile = globals().get("TAKEOFF_TRANSITION_PROFILE", None)
-    landing_profile_desc = globals().get("LANDING_TRANSITION_PROFILE_DESC", None)
-    takeoff_complete = np.asarray(start_vertiport, dtype=float).reshape(3)
-    landing_entry = np.asarray(end_vertiport, dtype=float).reshape(3)
+    optimization_start = np.asarray(start_vertiport, dtype=float).reshape(3)
+    optimization_end = np.asarray(end_vertiport, dtype=float).reshape(3)
+    if transition_context is None:
+        transition_context = globals().get("TRANSITION_CONTEXT", None)
+    if transition_context is None:
+        transition_context = {"enabled": False}
 
-    if takeoff_profile is not None and np.size(takeoff_profile) > 0:
-        takeoff_profile = np.asarray(takeoff_profile, dtype=float).reshape(-1, 3)
-        takeoff_complete = takeoff_profile[-1].astype(float)
-    if landing_profile_desc is not None and np.size(landing_profile_desc) > 0:
-        landing_profile_desc = np.asarray(landing_profile_desc, dtype=float).reshape(-1, 3)
-        landing_entry = landing_profile_desc[0].astype(float)
+    backbone_parts = []
+    if core.shape[0] == 0 or _seg_dist_3d_m(core[0], optimization_start) > 0.05:
+        backbone_parts.append(optimization_start.reshape(1, 3))
+    if core.shape[0] > 0:
+        backbone_parts.append(core)
+    if core.shape[0] == 0 or _seg_dist_3d_m(core[-1], optimization_end) > 0.05:
+        backbone_parts.append(optimization_end.reshape(1, 3))
+    backbone = np.vstack(backbone_parts).astype(float)
 
+    # Optional RF boundary headings follow the actual candidate tangent rather
+    # than forcing a sector-center tangent. Sector compliance is validated on
+    # the resulting first/last non-zero legs independently.
     entry_heading_deg = None
     exit_heading_deg = None
     if bool(use_boundary_heading):
-        if takeoff_profile is not None and np.size(takeoff_profile) >= 6:
-            tp = np.asarray(takeoff_profile, dtype=float).reshape(-1, 3)
-            entry_heading_deg = _heading_deg_from_segment(tp[-2], tp[-1])
-        if landing_profile_desc is not None and np.size(landing_profile_desc) >= 6:
-            lp = np.asarray(landing_profile_desc, dtype=float).reshape(-1, 3)
-            exit_heading_deg = _heading_deg_from_segment(lp[0], lp[1])
-
-    backbone = np.vstack([
-        takeoff_complete,
-        core,
-        landing_entry,
-    ]).astype(float)
+        for i in range(backbone.shape[0] - 1):
+            if _seg_dist_m(backbone[i], backbone[i + 1]) > 0.05:
+                entry_heading_deg = _heading_deg_from_segment(backbone[i], backbone[i + 1])
+                break
+        for i in range(backbone.shape[0] - 1, 0, -1):
+            if _seg_dist_m(backbone[i - 1], backbone[i]) > 0.05:
+                exit_heading_deg = _heading_deg_from_segment(backbone[i - 1], backbone[i])
+                break
 
     if allow_tangent_clamp is None:
         allow_tangent_clamp = bool(RF_ALLOW_TANGENT_CLAMP)
@@ -489,22 +1400,11 @@ def apply_rf_turns_full_corridor(
         corner_min_tangent_m=corner_min_tangent_m,
         min_turn_angle_deg=min_turn_angle_deg,
     )
+    # Preserve RF-only geometry feasibility before transition profiling folds
+    # its independent validation result into rf["feasible"].
+    rf["rf_geometry_feasible"] = bool(rf.get("feasible", False))
 
-    core_path = np.asarray(rf["path"], dtype=float)
-    if core_path.ndim != 2:
-        core_path = core_path.reshape(-1, 3)
-
-    if takeoff_profile is not None and np.size(takeoff_profile) > 0 and landing_profile_desc is not None and np.size(landing_profile_desc) > 0:
-        full_path = _stitch_full_corridor_from_profiles(
-            takeoff_profile,
-            core_path,
-            landing_profile_desc,
-        )
-    else:
-        full_path = core_path
-
-    rf["path"] = np.asarray(full_path, dtype=float)
-    return rf
+    return _profile_rf_segments_for_transition(rf, transition_context)
 
 
 def draw_vertiport_radius_rings(gx, center_lla, radii_m=(4500.0, 5000.0, 5500.0), n_pts=240):
@@ -876,6 +1776,11 @@ def collect_waypoints_from_clicks(
     end_vertiport=None,
     takeoff_complete=None,
     landing_entry=None,
+    use_takeoff_landing_transition=False,
+    use_two_stage_transition=False,
+    transition_structure_mode=None,
+    takeoff_optimized_transition_actual=None,
+    landing_optimized_transition_actual=None,
     takeoff_heading_deg=None,
     landing_heading_deg=None,
     takeoff_sector_user=None,
@@ -1000,11 +1905,57 @@ def collect_waypoints_from_clicks(
         )
 
     if takeoff_complete is not None:
-        ax.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, c="blue",
-                   marker="^", transform=ccrs.Geodetic(), zorder=10, label="Takeoff_End")
+        if (
+            bool(use_takeoff_landing_transition)
+            and transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+        ):
+            ax.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                       c=TAKEOFF_TRANSITION_COLOR, marker="^", transform=ccrs.Geodetic(),
+                       zorder=10, label="Takeoff Transition End")
+        elif (
+            bool(use_takeoff_landing_transition)
+            and bool(use_two_stage_transition)
+            and start_vertiport is not None
+            and _seg_dist_m(start_vertiport, takeoff_complete) > 0.5
+        ):
+            if takeoff_optimized_transition_actual is not False:
+                ax.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, facecolors="none",
+                           edgecolors=TAKEOFF_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                           transform=ccrs.Geodetic(), zorder=10, label="Takeoff Stage1 End")
+            else:
+                ax.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                           c=TAKEOFF_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="^",
+                           transform=ccrs.Geodetic(), zorder=10, label="Takeoff Transition End")
+        elif not bool(use_takeoff_landing_transition):
+            ax.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                       c=TAKEOFF_TRANSITION_COLOR, marker="^", transform=ccrs.Geodetic(),
+                       zorder=10, label="Takeoff_End")
     if landing_entry is not None:
-        ax.scatter([landing_entry[1]], [landing_entry[0]], s=90, c="green",
-                   marker="v", transform=ccrs.Geodetic(), zorder=10, label="Landing_End")
+        if (
+            bool(use_takeoff_landing_transition)
+            and transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+        ):
+            ax.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                       c=LANDING_TRANSITION_COLOR, marker="v", transform=ccrs.Geodetic(),
+                       zorder=10, label="Landing Transition Start")
+        elif (
+            bool(use_takeoff_landing_transition)
+            and bool(use_two_stage_transition)
+            and end_vertiport is not None
+            and _seg_dist_m(end_vertiport, landing_entry) > 0.5
+        ):
+            if landing_optimized_transition_actual is not False:
+                ax.scatter([landing_entry[1]], [landing_entry[0]], s=90, facecolors="none",
+                           edgecolors=LANDING_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                           transform=ccrs.Geodetic(), zorder=10, label="Landing Stage1 Start")
+            else:
+                ax.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                           c=LANDING_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="v",
+                           transform=ccrs.Geodetic(), zorder=10, label="Landing Transition Start")
+        elif not bool(use_takeoff_landing_transition):
+            ax.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                       c=LANDING_TRANSITION_COLOR, marker="v", transform=ccrs.Geodetic(),
+                       zorder=10, label="Landing_End")
 
     if start_vertiport is not None:
         ax.scatter([start_vertiport[1]], [start_vertiport[0]], s=120, c="red",
@@ -1197,6 +2148,669 @@ def _path_total_3d_distance_m(path):
     return float(total)
 
 
+def _evaluate_objectives_altitude_aware_v1(
+    path,
+    Norm_RT,
+    AirRisk,
+    use_heading_map,
+    altitude_levels,
+    cell_size,
+    refine_scales,
+    air_risk_threshold,
+    w_dist,
+    w_ground,
+    w_air,
+    lat_lim,
+    lon_lim,
+    NoiseRisk=None,
+    noise_floor_db=0.0,
+    w_noise=1.0,
+):
+    """v1 objective evaluation with metre distance and per-sample MSL layers."""
+    p = np.asarray(path, dtype=float).reshape(-1, 3)
+    levels = np.asarray(altitude_levels, dtype=float).ravel()
+    if p.shape[0] < 2 or levels.size == 0:
+        n_obj = 4 if NoiseRisk is not None and np.size(NoiseRisk) > 0 else 3
+        return np.full(n_obj, 1e6, dtype=float)
+
+    total_dist = float(_path_total_3d_distance_m(p) * float(w_dist))
+    total_ground = 0.0
+    total_air = 0.0
+    total_noise = 0.0
+    _, _, Ny, Nx = np.asarray(Norm_RT).shape
+    min_lat, max_lat = [float(v) for v in lat_lim]
+    min_lon, max_lon = [float(v) for v in lon_lim]
+    d_lat = (max_lat - min_lat) / (Ny - 1) if Ny > 1 else 1.0
+    d_lon = (max_lon - min_lon) / (Nx - 1) if Nx > 1 else 1.0
+    noise = None if NoiseRisk is None or np.size(NoiseRisk) == 0 else np.asarray(NoiseRisk, dtype=float)
+    if noise is not None and noise.ndim == 2:
+        noise = noise[:, :, np.newaxis]
+
+    for i in range(p.shape[0] - 1):
+        p1 = p[i]
+        p2 = p[i + 1]
+        dist_2d_m = _seg_dist_m(p1, p2)
+        if dist_2d_m <= 1e-9:
+            continue
+
+        vec = p2[:2] - p1[:2]
+        if bool(use_heading_map):
+            theta = float(np.rad2deg(np.arctan2(vec[1], vec[0])))
+            if theta < 0.0:
+                theta += 360.0
+            heading_idx = int(round(theta / 45.0) % 8)
+        else:
+            heading_idx = 0
+
+        if dist_2d_m < 200.0:
+            refine_scale = float(refine_scales[3])
+        elif dist_2d_m < 500.0:
+            refine_scale = float(refine_scales[2])
+        elif dist_2d_m < 1000.0:
+            refine_scale = float(refine_scales[1])
+        else:
+            refine_scale = float(refine_scales[0])
+        n_samples = max(2, int(np.ceil(dist_2d_m / (float(cell_size) * refine_scale))))
+
+        tau = np.linspace(0.0, 1.0, n_samples)
+        sample_lat = p1[0] + tau * (p2[0] - p1[0])
+        sample_lon = p1[1] + tau * (p2[1] - p1[1])
+        sample_alt = p1[2] + tau * (p2[2] - p1[2])
+        sample_i = (sample_lon - min_lon) / d_lon
+        sample_j = (sample_lat - min_lat) / d_lat
+        coords = np.vstack([sample_j, sample_i])
+        altitude_idx = np.argmin(np.abs(sample_alt[:, None] - levels[None, :]), axis=1)
+
+        segment_ground = np.zeros(n_samples, dtype=float)
+        segment_air = np.zeros(n_samples, dtype=float)
+        segment_noise = np.zeros(n_samples, dtype=float)
+        for alt_idx in np.unique(altitude_idx):
+            mask = altitude_idx == alt_idx
+            coords_i = coords[:, mask]
+            segment_ground[mask] = map_coordinates(
+                Norm_RT[int(alt_idx), heading_idx], coords_i, order=1, cval=0.0
+            )
+            segment_air[mask] = map_coordinates(
+                AirRisk[:, :, int(alt_idx)], coords_i, order=1, cval=0.0
+            )
+            if noise is not None:
+                noise_idx = int(np.clip(int(alt_idx), 0, noise.shape[2] - 1))
+                segment_noise[mask] = map_coordinates(
+                    noise[:, :, noise_idx], coords_i, order=1, cval=0.0
+                )
+
+        total_ground += float(np.sum(segment_ground))
+        total_air += float(np.sum(segment_air))
+        if noise is not None:
+            # The loader applies the dB floor before normalizing to [0, 1].
+            # Do not compare normalized values against a dB threshold again.
+            active_noise = np.where(segment_noise > 0.0, segment_noise, 0.0)
+            total_noise += float(np.sum(active_noise))
+
+    values = [
+        total_dist,
+        total_ground,
+        total_air,
+    ]
+    if noise is not None:
+        values.append(total_noise * float(w_noise))
+    return np.asarray(values, dtype=float)
+
+
+def _moc_floor_layer_index_v1(altitude_msl_m, layer_count):
+    agl_m = float(altitude_msl_m) - float(MOC_REFERENCE_MSL_M)
+    # Treat a numerically exact layer boundary as that layer.  This keeps an
+    # exact clearance-limit contact feasible instead of selecting the layer
+    # below it because of sub-micrometre floating-point drift.
+    idx = int(np.searchsorted(MOC_AGL_LEVELS_M, agl_m + 1e-6, side="right") - 1)
+    return int(np.clip(idx, 0, max(0, int(layer_count) - 1)))
+
+
+def _validate_transition_corridor_cfg_v1(transition_corridor_cfg):
+    cfg = transition_corridor_cfg or {}
+    if not bool(cfg.get("enabled", False)):
+        return cfg
+    for key in ("half_width_m", "downward_clearance_m"):
+        value = cfg.get(key)
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            numeric_value = float("nan")
+        if not np.isfinite(numeric_value) or numeric_value <= 0.0:
+            raise ValueError(f"invalid_transition_corridor_{key}: must be finite and > 0")
+    if abs(float(cfg["half_width_m"]) - float(cfg["downward_clearance_m"])) > 1e-9:
+        raise ValueError(
+            "transition_corridor_width_clearance_mismatch: horizontal half-width "
+            "and downward clearance must use the same parameter"
+        )
+    for key in ("start_vertiport_msl_m", "end_vertiport_msl_m"):
+        value = cfg.get(key)
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            numeric_value = float("nan")
+        if not np.isfinite(numeric_value):
+            raise ValueError(f"invalid_transition_corridor_{key}: must be finite")
+    return cfg
+
+
+def _edge_phase_values_v1(path, flight_phases, transition_corridor_cfg=None):
+    """Return one phase per edge using the exported destination-phase rule."""
+    points = np.asarray(path, dtype=float).reshape(-1, 3)
+    cfg = _validate_transition_corridor_cfg_v1(transition_corridor_cfg)
+    enabled = bool(cfg.get("enabled", False))
+
+    if flight_phases is None:
+        if enabled:
+            raise ValueError(
+                "flight_phase_length_mismatch: "
+                f"path_points={points.shape[0]}, flight_phases=0."
+            )
+        return np.full(max(0, points.shape[0] - 1), FLIGHT_PHASE_CRUISE, dtype=object)
+
+    phases = np.asarray(flight_phases, dtype=object).reshape(-1)
+    if phases.size != points.shape[0]:
+        raise ValueError(
+            "flight_phase_length_mismatch: "
+            f"path_points={points.shape[0]}, flight_phases={phases.size}."
+        )
+    if not enabled:
+        return np.full(max(0, points.shape[0] - 1), FLIGHT_PHASE_CRUISE, dtype=object)
+
+    valid_phases = set(TRANSITION_PHASE_NAMES) | {
+        FLIGHT_PHASE_CRUISE,
+        FLIGHT_PHASE_VERTIPORT,
+    }
+    invalid_phases = sorted({str(value) for value in phases if str(value) not in valid_phases})
+    if invalid_phases:
+        raise ValueError(
+            "invalid_flight_phase: " + ", ".join(invalid_phases)
+        )
+    vertiport_indices = np.flatnonzero(phases == FLIGHT_PHASE_VERTIPORT)
+    if any(int(idx) not in (0, points.shape[0] - 1) for idx in vertiport_indices):
+        raise ValueError("invalid_flight_phase: vertiport is allowed only at path endpoints")
+    edge_phases = phases[1:].copy()
+    vertiport_edges = edge_phases == FLIGHT_PHASE_VERTIPORT
+    edge_phases[vertiport_edges] = phases[:-1][vertiport_edges]
+    return edge_phases.astype(object)
+
+
+def _transition_direction_from_phase_value_v1(phase):
+    phase_text = str(phase)
+    if phase_text.startswith("takeoff_"):
+        return "takeoff"
+    if phase_text.startswith("landing_"):
+        return "landing"
+    return None
+
+
+def _edge_corridor_half_width_v1(phase, cruise_half_width_m, transition_corridor_cfg=None):
+    cfg = _validate_transition_corridor_cfg_v1(transition_corridor_cfg)
+    if bool(cfg.get("enabled", False)) and str(phase) in TRANSITION_PHASE_NAMES:
+        return float(cfg["half_width_m"])
+    return float(cruise_half_width_m)
+
+
+def _transition_reference_msl_v1(phase, transition_corridor_cfg=None):
+    cfg = _validate_transition_corridor_cfg_v1(transition_corridor_cfg)
+    direction = _transition_direction_from_phase_value_v1(phase)
+    if direction == "takeoff":
+        return float(cfg["start_vertiport_msl_m"])
+    if direction == "landing":
+        return float(cfg["end_vertiport_msl_m"])
+    return None
+
+
+def _effective_downward_clearance_v1(
+    center_msl_m,
+    phase,
+    transition_corridor_cfg=None,
+):
+    cfg = _validate_transition_corridor_cfg_v1(transition_corridor_cfg)
+    if not bool(cfg.get("enabled", False)) or str(phase) not in TRANSITION_PHASE_NAMES:
+        return 0.0
+    configured = float(cfg["downward_clearance_m"])
+    reference_msl = _transition_reference_msl_v1(phase, cfg)
+    return float(min(configured, max(0.0, float(center_msl_m) - float(reference_msl))))
+
+
+def _iter_corridor_moc_samples_v1(
+    p1,
+    p2,
+    half_width_m,
+    moc_risk,
+    lat_lim,
+    lon_lim,
+    along_step_m=80.0,
+    phase=FLIGHT_PHASE_CRUISE,
+    transition_corridor_cfg=None,
+):
+    """Yield the exact along/cross-track samples used by the v1 MOC checker."""
+    if moc_risk is None or np.size(moc_risk) == 0:
+        return
+    cfg = _validate_transition_corridor_cfg_v1(transition_corridor_cfg)
+    phase = str(phase)
+    valid_edge_phases = set(TRANSITION_PHASE_NAMES) | {FLIGHT_PHASE_CRUISE}
+    if bool(cfg.get("enabled", False)) and phase not in valid_edge_phases:
+        raise ValueError(f"invalid_flight_phase: {phase}")
+    is_transition = bool(
+        cfg.get("enabled", False) and phase in TRANSITION_PHASE_NAMES
+    )
+    try:
+        sampling_half_width_m = float(half_width_m)
+    except (TypeError, ValueError):
+        sampling_half_width_m = float("nan")
+    if is_transition and (
+        not np.isfinite(sampling_half_width_m)
+        or sampling_half_width_m <= 0.0
+        or abs(sampling_half_width_m - float(cfg["half_width_m"])) > 1e-9
+    ):
+        raise ValueError(
+            "transition_corridor_half_width_mismatch: MOC sampling width must "
+            "match transition_corridor_half_width_m"
+        )
+    configured_clearance_m = (
+        float(cfg["downward_clearance_m"]) if is_transition else 0.0
+    )
+    reference_msl_m = (
+        float(_transition_reference_msl_v1(phase, cfg)) if is_transition else None
+    )
+    moc = np.asarray(moc_risk, dtype=float)
+    if moc.ndim == 2:
+        moc = moc[:, :, np.newaxis]
+    Ny, Nx, Nz = moc.shape
+    min_lat, max_lat = [float(v) for v in lat_lim]
+    min_lon, max_lon = [float(v) for v in lon_lim]
+    d_lat = (max_lat - min_lat) / (Ny - 1) if Ny > 1 else 1.0
+    d_lon = (max_lon - min_lon) / (Nx - 1) if Nx > 1 else 1.0
+
+    p1 = np.asarray(p1, dtype=float).reshape(3)
+    p2 = np.asarray(p2, dtype=float).reshape(3)
+    mean_lat = 0.5 * (float(p1[0]) + float(p2[0]))
+    m_lat = 111000.0
+    m_lon = 111000.0 * np.cos(np.deg2rad(mean_lat))
+    dx = (float(p2[1]) - float(p1[1])) * m_lon
+    dy = (float(p2[0]) - float(p1[0])) * m_lat
+    seg_len = float(np.hypot(dx, dy))
+    if seg_len <= 1e-9:
+        return
+    ux, uy = dx / seg_len, dy / seg_len
+    nx, ny = -uy, ux
+    n_along = max(2, int(np.ceil(seg_len / max(10.0, float(along_step_m)))) + 1)
+    s_values = np.linspace(0.0, seg_len, n_along)
+    half_width = max(0.0, sampling_half_width_m)
+    if half_width <= 1e-9:
+        t_values = np.array([0.0], dtype=float)
+    else:
+        cross_step = float(np.clip(half_width / 3.0, 20.0, 100.0))
+        n_cross = max(3, int(np.ceil(2.0 * half_width / cross_step)) + 1)
+        t_values = np.linspace(-half_width, half_width, n_cross)
+
+    for s in s_values:
+        tau = float(s / seg_len)
+        center_alt_msl = float(p1[2]) + tau * (float(p2[2]) - float(p1[2]))
+        center_layer_idx = _moc_floor_layer_index_v1(center_alt_msl, Nz)
+        effective_clearance_m = (
+            min(
+                configured_clearance_m,
+                max(0.0, center_alt_msl - reference_msl_m),
+            )
+            if is_transition else 0.0
+        )
+        query_alt_msl = float(center_alt_msl - effective_clearance_m)
+        layer_idx = _moc_floor_layer_index_v1(query_alt_msl, Nz)
+        center_x = float(s) * ux
+        center_y = float(s) * uy
+        for t in t_values:
+            qx = center_x + float(t) * nx
+            qy = center_y + float(t) * ny
+            lon = float(p1[1]) + qx / m_lon
+            lat = float(p1[0]) + qy / m_lat
+            grid_i = int(np.round((lon - min_lon) / d_lon))
+            grid_j = int(np.round((lat - min_lat) / d_lat))
+            in_grid = bool(0 <= grid_i < Nx and 0 <= grid_j < Ny)
+            blocked = bool(
+                in_grid and float(moc[grid_j, grid_i, layer_idx]) >= 0.5
+            )
+            yield (
+                float(s),
+                float(t),
+                tau,
+                lat,
+                lon,
+                center_alt_msl,
+                int(center_layer_idx),
+                float(effective_clearance_m),
+                float(query_alt_msl),
+                int(layer_idx),
+                int(grid_j),
+                int(grid_i),
+                in_grid,
+                blocked,
+            )
+
+
+def _corridor_hits_moc_v1(
+    p1,
+    p2,
+    half_width_m,
+    moc_risk,
+    lat_lim,
+    lon_lim,
+    along_step_m=80.0,
+    phase=FLIGHT_PHASE_CRUISE,
+    transition_corridor_cfg=None,
+):
+    """MOC footprint check using conservative fixed-AGL floor selection."""
+    for sample in _iter_corridor_moc_samples_v1(
+        p1,
+        p2,
+        half_width_m,
+        moc_risk,
+        lat_lim,
+        lon_lim,
+        along_step_m=along_step_m,
+        phase=phase,
+        transition_corridor_cfg=transition_corridor_cfg,
+    ):
+        if bool(sample[-1]):
+            return True
+    return False
+
+
+def _phase_specific_nfz_hit_v1(
+    path,
+    edge_phases,
+    cruise_half_width_m,
+    transition_corridor_cfg,
+    forbidden_zones,
+    direction_filter=None,
+):
+    points = np.asarray(path, dtype=float).reshape(-1, 3)
+    if forbidden_zones is None or np.size(forbidden_zones) == 0:
+        return True, "ok"
+    for edge_idx in range(points.shape[0] - 1):
+        phase = str(edge_phases[edge_idx])
+        direction = _transition_direction_from_phase_value_v1(phase)
+        if direction_filter is not None and direction != str(direction_filter):
+            continue
+        half_width_m = _edge_corridor_half_width_v1(
+            phase,
+            cruise_half_width_m,
+            transition_corridor_cfg,
+        )
+        if half_width_m <= 0.0:
+            continue
+        for rect in forbidden_zones:
+            if _corridor_violates_nfz_with_width_shared(
+                points[edge_idx],
+                points[edge_idx + 1],
+                half_width_m,
+                rect,
+            ):
+                if direction is not None:
+                    return False, f"{direction}_transition_nfz_corridor_width_intersection"
+                return False, "nfz_corridor_width_intersection"
+    return True, "ok"
+
+
+def _phase_specific_nfz_centerline_reason_v1(
+    path,
+    edge_phases,
+    forbidden_zones,
+):
+    """Return the phase-aware reason for the first actual centerline NFZ hit."""
+    points = np.asarray(path, dtype=float).reshape(-1, 3)
+    if forbidden_zones is None or np.size(forbidden_zones) == 0:
+        return "ok"
+    for edge_idx in range(points.shape[0] - 1):
+        phase = str(edge_phases[edge_idx])
+        direction = _transition_direction_from_phase_value_v1(phase)
+        for rect in forbidden_zones:
+            if _corridor_violates_nfz_with_width_shared(
+                points[edge_idx], points[edge_idx + 1], 0.0, rect
+            ):
+                if direction is not None:
+                    return f"{direction}_transition_nfz_centerline_intersection"
+                return "nfz_centerline_intersection"
+    return "ok"
+
+
+def _phase_specific_self_overlap_v1(
+    path,
+    edge_phases,
+    cruise_half_width_m,
+    transition_corridor_cfg,
+    eps_m=1.0,
+    direction_filter=None,
+):
+    points = np.asarray(path, dtype=float).reshape(-1, 3)
+    if points.shape[0] < 4:
+        return False, "ok"
+    mean_lat = float(np.mean(points[:, 0]))
+    m_lat = 111000.0
+    m_lon = 111000.0 * np.cos(np.deg2rad(mean_lat))
+    xy = np.column_stack([points[:, 1] * m_lon, points[:, 0] * m_lat])
+    widths = np.asarray([
+        _edge_corridor_half_width_v1(
+            phase,
+            cruise_half_width_m,
+            transition_corridor_cfg,
+        )
+        for phase in edge_phases
+    ], dtype=float)
+    for i in range(points.shape[0] - 1):
+        for j in range(i + 2, points.shape[0] - 1):
+            threshold_m = float(widths[i] + widths[j] - max(0.0, float(eps_m)))
+            if threshold_m <= 0.0:
+                continue
+            distance_m = _segment_to_segment_min_distance_m_shared(
+                xy[i], xy[i + 1], xy[j], xy[j + 1]
+            )
+            if distance_m < threshold_m:
+                directions = {
+                    value
+                    for value in (
+                        _transition_direction_from_phase_value_v1(edge_phases[i]),
+                        _transition_direction_from_phase_value_v1(edge_phases[j]),
+                    )
+                    if value is not None
+                }
+                if (
+                    direction_filter is not None
+                    and str(direction_filter) not in directions
+                ):
+                    continue
+                if directions == {"takeoff"}:
+                    reason = "takeoff_transition_self_corridor_width_overlap"
+                elif directions == {"landing"}:
+                    reason = "landing_transition_self_corridor_width_overlap"
+                elif directions == {"takeoff", "landing"}:
+                    reason = "takeoff_landing_transition_self_corridor_width_overlap"
+                else:
+                    reason = "self_corridor_width_overlap"
+                return True, reason
+    return False, "ok"
+
+
+def evaluate_objectives_with_constraints_gp(
+    path,
+    Norm_RT,
+    AirRisk,
+    use_heading_map,
+    flight_dist_limit,
+    forbidden_zones,
+    delta_z_max,
+    altitude_levels,
+    cell_size,
+    refine_scales,
+    air_risk_threshold,
+    w_dist,
+    w_ground,
+    w_air,
+    lat_lim,
+    lon_lim,
+    NoiseRisk=None,
+    noise_floor_db=0.0,
+    w_noise=1.0,
+    W_half=None,
+    check_corridor_nfz=False,
+    MOCRisk=None,
+    check_corridor_moc=False,
+    check_corridor_self_overlap=True,
+    vertiport=None,
+    landing_entry=None,
+    takeoff_complete=None,
+    return_reason=False,
+    flight_phases=None,
+    transition_corridor_cfg=None,
+):
+    """v1-only wrapper: shared geometric checks plus altitude-aware objectives/MOC."""
+    transition_width_enabled = bool(
+        (transition_corridor_cfg or {}).get("enabled", False)
+    )
+    cruise_half_width_m = float(W_half) if W_half is not None else 0.0
+    shared_result = _evaluate_constraints_shared(
+        path,
+        Norm_RT,
+        AirRisk,
+        use_heading_map,
+        flight_dist_limit,
+        forbidden_zones,
+        delta_z_max,
+        altitude_levels,
+        1.0e12,
+        np.ones(4, dtype=float),
+        air_risk_threshold,
+        w_dist,
+        w_ground,
+        w_air,
+        lat_lim,
+        lon_lim,
+        NoiseRisk=NoiseRisk,
+        noise_floor_db=noise_floor_db,
+        w_noise=w_noise,
+        W_half=W_half,
+        check_corridor_nfz=(bool(check_corridor_nfz) and not transition_width_enabled),
+        MOCRisk=None,
+        check_corridor_moc=False,
+        check_corridor_self_overlap=(
+            bool(check_corridor_self_overlap) and not transition_width_enabled
+        ),
+        vertiport=vertiport,
+        landing_entry=landing_entry,
+        takeoff_complete=takeoff_complete,
+        return_reason=True,
+    )
+    _, shared_ok, shared_reason = shared_result
+    objective_values = _evaluate_objectives_altitude_aware_v1(
+        path,
+        Norm_RT,
+        AirRisk,
+        use_heading_map,
+        altitude_levels,
+        cell_size,
+        refine_scales,
+        air_risk_threshold,
+        w_dist,
+        w_ground,
+        w_air,
+        lat_lim,
+        lon_lim,
+        NoiseRisk=NoiseRisk,
+        noise_floor_db=noise_floor_db,
+        w_noise=w_noise,
+    )
+
+    ok = bool(shared_ok)
+    reason = str(shared_reason)
+    check_path = np.asarray(path, dtype=float).reshape(-1, 3)
+    try:
+        edge_phases = _edge_phase_values_v1(
+            check_path,
+            flight_phases,
+            transition_corridor_cfg,
+        )
+    except ValueError as exc:
+        edge_phases = np.empty((0,), dtype=object)
+        ok = False
+        reason = str(exc).split(":", 1)[0]
+
+    if (
+        not ok
+        and transition_width_enabled
+        and reason == "nfz_centerline_intersection"
+        and edge_phases.size == max(0, check_path.shape[0] - 1)
+    ):
+        phase_nfz_reason = _phase_specific_nfz_centerline_reason_v1(
+            check_path,
+            edge_phases,
+            forbidden_zones,
+        )
+        if phase_nfz_reason != "ok":
+            reason = phase_nfz_reason
+
+    if (
+        ok and transition_width_enabled and bool(check_corridor_nfz)
+    ):
+        ok, reason = _phase_specific_nfz_hit_v1(
+            check_path,
+            edge_phases,
+            cruise_half_width_m,
+            transition_corridor_cfg,
+            forbidden_zones,
+        )
+
+    if ok and bool(check_corridor_moc) and (
+        transition_width_enabled or cruise_half_width_m > 0.0
+    ):
+        for i in range(check_path.shape[0] - 1):
+            phase = str(edge_phases[i])
+            half_width_m = _edge_corridor_half_width_v1(
+                phase,
+                cruise_half_width_m,
+                transition_corridor_cfg,
+            )
+            if half_width_m <= 0.0:
+                continue
+            if _corridor_hits_moc_v1(
+                check_path[i],
+                check_path[i + 1],
+                half_width_m,
+                MOCRisk,
+                lat_lim,
+                lon_lim,
+                phase=phase,
+                transition_corridor_cfg=transition_corridor_cfg,
+            ):
+                ok = False
+                direction = _transition_direction_from_phase_value_v1(phase)
+                reason = (
+                    f"{direction}_transition_moc_3d_intersection"
+                    if direction is not None else "moc_corridor_width_intersection"
+                )
+                break
+
+    if (
+        ok and transition_width_enabled and bool(check_corridor_self_overlap)
+    ):
+        overlap, overlap_reason = _phase_specific_self_overlap_v1(
+            check_path,
+            edge_phases,
+            cruise_half_width_m,
+            transition_corridor_cfg,
+        )
+        if overlap:
+            ok = False
+            reason = overlap_reason
+
+    if not ok:
+        objective_values = np.full(objective_values.shape, 1e6, dtype=float)
+    if return_reason:
+        return objective_values, ok, reason
+    return objective_values, ok
+
+
 def _enforce_mandatory_wp_order(path, mandatory_backbone, xy_tol_m=5.0):
     """
     Keep mandatory waypoints in fixed order and reinsert optional nodes by segment projection.
@@ -1337,8 +2951,6 @@ def _aggregate_path_risks(path, Norm_RT, AirRisk, altitude_levels,
     minLon, maxLon = lon_lim
     dLat_deg = (maxLat - minLat) / (Ny - 1) if Ny > 1 else 1.0
     dLon_deg = (maxLon - minLon) / (Nx - 1) if Nx > 1 else 1.0
-    mean_lat = float(np.mean(path[:, 0]))
-
     total_ground = 0.0
     total_air = 0.0
     total_combined = 0.0
@@ -1356,8 +2968,7 @@ def _aggregate_path_risks(path, Norm_RT, AirRisk, altitude_levels,
         else:
             head_idx = 0
 
-        alt_idx = int(np.argmin(np.abs(altitude_levels - p1[2])))
-        dist_2d_m = float(np.linalg.norm(vec) * 111000.0 * np.cos(np.deg2rad(mean_lat)))
+        dist_2d_m = _seg_dist_m(p1, p2)
         if dist_2d_m < 1e-6:
             continue
 
@@ -1376,15 +2987,26 @@ def _aggregate_path_risks(path, Norm_RT, AirRisk, altitude_levels,
 
         yq_lat = np.linspace(p1[0], p2[0], num_samples)
         xq_lon = np.linspace(p1[1], p2[1], num_samples)
+        yq_alt = np.linspace(p1[2], p2[2], num_samples)
 
         Iq = (xq_lon - minLon) / dLon_deg
         Jq = (yq_lat - minLat) / dLat_deg
         coords = np.vstack((Jq, Iq))
 
-        ground_map = Norm_RT[alt_idx, head_idx, :, :]
-        air_map = AirRisk[:, :, alt_idx]
-        interp_ground = map_coordinates(ground_map, coords, order=1, cval=0.0)
-        interp_air = map_coordinates(air_map, coords, order=1, cval=0.0)
+        altitude_idx = np.argmin(
+            np.abs(yq_alt[:, None] - np.asarray(altitude_levels, dtype=float)[None, :]),
+            axis=1,
+        )
+        interp_ground = np.zeros(num_samples, dtype=float)
+        interp_air = np.zeros(num_samples, dtype=float)
+        for alt_idx in np.unique(altitude_idx):
+            mask = altitude_idx == alt_idx
+            interp_ground[mask] = map_coordinates(
+                Norm_RT[int(alt_idx), head_idx], coords[:, mask], order=1, cval=0.0
+            )
+            interp_air[mask] = map_coordinates(
+                AirRisk[:, :, int(alt_idx)], coords[:, mask], order=1, cval=0.0
+            )
         additive_air = np.where(interp_air > air_risk_threshold, interp_air, 0.0)
         interp_combined = (interp_ground * interp_air) + additive_air
 
@@ -1440,16 +3062,11 @@ def _aggregate_path_noise(path, NoiseMap, altitude_levels, cell_size, refine_sca
     minLon, maxLon = lon_lim
     dLat_deg = (maxLat - minLat) / (Ny - 1) if Ny > 1 else 1.0
     dLon_deg = (maxLon - minLon) / (Nx - 1) if Nx > 1 else 1.0
-    mean_lat = float(np.mean(path[:, 0]))
-
     total_noise = 0.0
     for i in range(path.shape[0] - 1):
         p1 = path[i, :]
         p2 = path[i + 1, :]
-        vec = p2[:2] - p1[:2]
-
-        alt_idx = int(np.argmin(np.abs(altitude_levels - p1[2]))) if nm.shape[2] > 1 else 0
-        dist_2d_m = float(np.linalg.norm(vec) * 111000.0 * np.cos(np.deg2rad(mean_lat)))
+        dist_2d_m = _seg_dist_m(p1, p2)
         if dist_2d_m < 1e-6:
             continue
 
@@ -1468,12 +3085,24 @@ def _aggregate_path_noise(path, NoiseMap, altitude_levels, cell_size, refine_sca
 
         yq_lat = np.linspace(p1[0], p2[0], num_samples)
         xq_lon = np.linspace(p1[1], p2[1], num_samples)
+        yq_alt = np.linspace(p1[2], p2[2], num_samples)
         Iq = (xq_lon - minLon) / dLon_deg
         Jq = (yq_lat - minLat) / dLat_deg
         coords = np.vstack((Jq, Iq))
 
-        noise_map = nm[:, :, alt_idx]
-        interp_noise = map_coordinates(noise_map, coords, order=1, cval=0.0)
+        if nm.shape[2] > 1:
+            altitude_idx = np.argmin(
+                np.abs(yq_alt[:, None] - np.asarray(altitude_levels, dtype=float)[None, :]),
+                axis=1,
+            )
+        else:
+            altitude_idx = np.zeros(num_samples, dtype=int)
+        interp_noise = np.zeros(num_samples, dtype=float)
+        for alt_idx in np.unique(altitude_idx):
+            mask = altitude_idx == alt_idx
+            interp_noise[mask] = map_coordinates(
+                nm[:, :, int(alt_idx)], coords[:, mask], order=1, cval=0.0
+            )
         total_noise += float(np.sum(interp_noise))
 
     return float(total_noise)
@@ -1514,6 +3143,178 @@ def is_path_inside_airspace(path, center_latlon, radius_m, alt_min_m=None, alt_m
     if alt_max_m is not None:
         mask &= path[:, 2] <= float(alt_max_m)
     return bool(np.all(mask))
+
+
+def _edge_lateral_boundary_points_v1(p1, p2, half_width_m):
+    p1 = np.asarray(p1, dtype=float).reshape(3)
+    p2 = np.asarray(p2, dtype=float).reshape(3)
+    half_width = float(max(0.0, half_width_m))
+    if half_width <= 1e-9:
+        return np.vstack([p1[:2], p2[:2]])
+    mean_lat = 0.5 * (float(p1[0]) + float(p2[0]))
+    m_lat = 111000.0
+    m_lon = 111000.0 * np.cos(np.deg2rad(mean_lat))
+    dx = (float(p2[1]) - float(p1[1])) * m_lon
+    dy = (float(p2[0]) - float(p1[0])) * m_lat
+    seg_len = float(np.hypot(dx, dy))
+    if seg_len <= 1e-9:
+        lat_off = half_width / m_lat
+        lon_off = half_width / max(1e-9, abs(m_lon))
+        return np.asarray([
+            [p1[0] + lat_off, p1[1]],
+            [p1[0] - lat_off, p1[1]],
+            [p1[0], p1[1] + lon_off],
+            [p1[0], p1[1] - lon_off],
+        ], dtype=float)
+    nx = -dy / seg_len
+    ny = dx / seg_len
+    lon_off = nx * half_width / m_lon
+    lat_off = ny * half_width / m_lat
+    return np.asarray([
+        [p1[0] + lat_off, p1[1] + lon_off],
+        [p1[0] - lat_off, p1[1] - lon_off],
+        [p2[0] + lat_off, p2[1] + lon_off],
+        [p2[0] - lat_off, p2[1] - lon_off],
+    ], dtype=float)
+
+
+def _is_path_inside_airspace_envelope_v1(
+    path,
+    flight_phases,
+    center_latlon,
+    radius_m,
+    alt_min_m=None,
+    alt_max_m=None,
+    transition_corridor_cfg=None,
+):
+    """Check legacy cruise centerlines and the complete transition lower envelope."""
+    points = np.asarray(path, dtype=float).reshape(-1, 3)
+    audit = {
+        "status": "FAIL",
+        "reason": "path_too_short",
+        "horizontal_min_margin_m": None,
+        "vertical_lower_min_margin_m": None,
+        "vertical_upper_min_margin_m": None,
+        "directions": {},
+    }
+    if points.shape[0] < 2:
+        return False, "path_too_short", audit
+    try:
+        edge_phases = _edge_phase_values_v1(
+            points,
+            flight_phases,
+            transition_corridor_cfg,
+        )
+    except ValueError as exc:
+        failure_reason = str(exc).split(":", 1)[0]
+        audit["reason"] = failure_reason
+        return False, failure_reason, audit
+
+    first_reason = "ok"
+    horizontal_margins = []
+    lower_margins = []
+    upper_margins = []
+    direction_values = {"takeoff": [], "landing": []}
+    for edge_idx in range(points.shape[0] - 1):
+        p1 = points[edge_idx]
+        p2 = points[edge_idx + 1]
+        phase = str(edge_phases[edge_idx])
+        direction = _transition_direction_from_phase_value_v1(phase)
+        is_transition = bool(
+            (transition_corridor_cfg or {}).get("enabled", False)
+            and direction is not None
+        )
+        if is_transition:
+            horizontal_points = _edge_lateral_boundary_points_v1(
+                p1,
+                p2,
+                float(transition_corridor_cfg["half_width_m"]),
+            )
+        else:
+            horizontal_points = np.vstack([p1[:2], p2[:2]])
+        max_distance_m = float(np.max(_dist_to_center_m(horizontal_points, center_latlon)))
+        horizontal_margin_m = float(radius_m) - max_distance_m
+        horizontal_margins.append(horizontal_margin_m)
+
+        if alt_min_m is None:
+            lower_margin_m = float("inf")
+        else:
+            lower_values = []
+            for point in (p1, p2):
+                effective = _effective_downward_clearance_v1(
+                    point[2], phase, transition_corridor_cfg
+                ) if is_transition else 0.0
+                lower_values.append(float(point[2]) - float(effective))
+            lower_margin_m = float(min(lower_values) - float(alt_min_m))
+            lower_margins.append(lower_margin_m)
+
+        if alt_max_m is None:
+            upper_margin_m = float("inf")
+        else:
+            upper_margin_m = float(float(alt_max_m) - max(float(p1[2]), float(p2[2])))
+            upper_margins.append(upper_margin_m)
+
+        edge_ok = True
+        edge_reason = "ok"
+        if horizontal_margin_m < -1e-6:
+            edge_ok = False
+            edge_reason = (
+                f"{direction}_transition_airspace_horizontal_envelope_outside"
+                if direction is not None else "airspace_horizontal_centerline_outside"
+            )
+        elif lower_margin_m < -1e-6:
+            edge_ok = False
+            edge_reason = (
+                f"{direction}_transition_airspace_vertical_envelope_outside"
+                if direction is not None else "airspace_altitude_centerline_outside"
+            )
+        elif upper_margin_m < -1e-6:
+            edge_ok = False
+            edge_reason = (
+                f"{direction}_transition_airspace_vertical_envelope_outside"
+                if direction is not None else "airspace_altitude_centerline_outside"
+            )
+        if first_reason == "ok" and not edge_ok:
+            first_reason = edge_reason
+        if direction is not None:
+            direction_values[direction].append({
+                "horizontal_margin_m": horizontal_margin_m,
+                "vertical_lower_margin_m": lower_margin_m,
+                "vertical_upper_margin_m": upper_margin_m,
+                "ok": bool(edge_ok),
+                "reason": str(edge_reason),
+            })
+
+    for direction, values in direction_values.items():
+        if not values:
+            audit["directions"][direction] = {"status": "NOT APPLICABLE"}
+            continue
+        audit["directions"][direction] = {
+            "status": "PASS" if all(v["ok"] for v in values) else "FAIL",
+            "reason": next(
+                (str(v["reason"]) for v in values if not v["ok"]),
+                "ok",
+            ),
+            "horizontal_min_margin_m": float(min(v["horizontal_margin_m"] for v in values)),
+            "vertical_lower_min_margin_m": float(min(v["vertical_lower_margin_m"] for v in values)),
+            "vertical_upper_min_margin_m": float(min(v["vertical_upper_margin_m"] for v in values)),
+        }
+
+    ok = bool(first_reason == "ok")
+    audit.update({
+        "status": "PASS" if ok else "FAIL",
+        "reason": first_reason,
+        "horizontal_min_margin_m": (
+            float(min(horizontal_margins)) if horizontal_margins else None
+        ),
+        "vertical_lower_min_margin_m": (
+            float(min(lower_margins)) if lower_margins else None
+        ),
+        "vertical_upper_min_margin_m": (
+            float(min(upper_margins)) if upper_margins else None
+        ),
+    })
+    return ok, first_reason, audit
 
 
 def generate_single_initial_solution(
@@ -1692,33 +3493,106 @@ def generate_single_initial_solution_with_skip(
     return np.array(path_pts, dtype=float)
 
 
+def _build_corridor_buffer_geometry_v1(path, half_width_m):
+    """Build a valid metric corridor buffer around a WGS84 centerline."""
+    if path is None:
+        return None
+    points = np.asarray(path, dtype=float)
+    width = float(half_width_m)
+    if (
+        points.ndim != 2
+        or points.shape[0] < 2
+        or points.shape[1] < 2
+        or not np.isfinite(width)
+        or width <= 0.0
+    ):
+        return None
+    if not np.all(np.isfinite(points[:, :2])):
+        return None
+
+    x, y = _CORRIDOR_TO_EPSG5179.transform(points[:, 1], points[:, 0])
+    xy = np.column_stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float)])
+    keep = np.r_[True, np.linalg.norm(np.diff(xy, axis=0), axis=1) > 1e-6]
+    xy = xy[keep]
+    if xy.shape[0] < 2:
+        return None
+
+    geometry = LineString(xy).buffer(
+        width,
+        cap_style="flat",
+        join_style="round",
+    )
+    if geometry.is_empty:
+        return None
+    if not geometry.is_valid:
+        geometry = geometry.buffer(0)
+    return None if geometry.is_empty else geometry
+
+
 def plot_corridor_width(gx, path, W_half, color="yellow", alpha=0.2):
-    if path is None or path.shape[0] < 2:
+    geometry_m = _build_corridor_buffer_geometry_v1(path, W_half)
+    if geometry_m is None:
         return
-    m_lat = 111000.0
-    m_lon = 111000.0 * np.cos(np.deg2rad(float(np.mean(path[:, 0]))))
-    wlat = W_half / m_lat
-    wlon = W_half / m_lon
-    left, right = [], []
-    for i in range(len(path)):
-        if i == 0:
-            vec = path[1, :2] - path[0, :2]
-        elif i == len(path) - 1:
-            vec = path[-1, :2] - path[-2, :2]
-        else:
-            vec = path[i + 1, :2] - path[i - 1, :2]
-        n = np.linalg.norm(vec)
-        if n < 1e-10:
+    geometry_lonlat = shapely_transform(
+        _CORRIDOR_FROM_EPSG5179.transform,
+        geometry_m,
+    )
+    gx.add_geometries(
+        [geometry_lonlat],
+        crs=ccrs.PlateCarree(),
+        facecolor=color,
+        edgecolor="none",
+        alpha=alpha,
+        zorder=2,
+    )
+
+
+def _plot_corridor_width_by_phase_v1(
+    gx,
+    rf,
+    cruise_half_width_m,
+    transition_corridor_cfg,
+    color="yellow",
+    alpha=0.2,
+):
+    """Draw the same corridor fill style with the width selected per flight phase."""
+    if not bool((transition_corridor_cfg or {}).get("enabled", False)):
+        path = np.asarray(rf.get("path", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        plot_corridor_width(gx, path, cruise_half_width_m, color=color, alpha=alpha)
+        return
+    for seg in rf.get("segments", []):
+        points = np.asarray(seg.get("points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        if points.shape[0] < 2:
             continue
-        perp = np.array([-vec[1], vec[0]]) / n
-        left.append([path[i, 0] + perp[0] * wlat, path[i, 1] + perp[1] * wlon])
-        right.append([path[i, 0] - perp[0] * wlat, path[i, 1] - perp[1] * wlon])
-    if len(left) < 2:
-        return
-    pts = np.array(left + right[::-1])
-    poly = Polygon(pts[:, [1, 0]], closed=True, facecolor=color, edgecolor="none",
-                   alpha=alpha, transform=ccrs.Geodetic(), zorder=2)
-    gx.add_patch(poly)
+        phases = np.asarray(
+            seg.get("point_phases", np.empty((0,), dtype=object)), dtype=object
+        ).reshape(-1)
+        edge_phases = _edge_phase_values_v1(
+            points,
+            phases,
+            transition_corridor_cfg,
+        )
+        widths = np.asarray([
+            _edge_corridor_half_width_v1(
+                phase,
+                cruise_half_width_m,
+                transition_corridor_cfg,
+            )
+            for phase in edge_phases
+        ], dtype=float)
+        start = 0
+        while start < widths.size:
+            end = start + 1
+            while end < widths.size and abs(widths[end] - widths[start]) <= 1e-9:
+                end += 1
+            plot_corridor_width(
+                gx,
+                points[start:end + 1],
+                float(widths[start]),
+                color=color,
+                alpha=alpha,
+            )
+            start = end
 
 
 def plot_forbidden_zones(gx, forbidden_zones,
@@ -1800,6 +3674,941 @@ def plot_moc_binary_overlay(gx, moc_2d, lat_lim, lon_lim,
     )
 
 
+def _sector_wind_months_v1(season):
+    """Return the wind months represented by the configured sector season."""
+    season = str(season).strip().lower()
+    month_groups = {
+        "annual": tuple(range(1, 13)),
+        "spring": (3, 4, 5),
+        "summer": (6, 7, 8),
+        "autumn": (9, 10, 11),
+        "winter": (12, 1, 2),
+    }
+    if season not in month_groups:
+        raise ValueError(
+            f"sector_season must be one of {tuple(month_groups)}, got {season!r}."
+        )
+    return month_groups[season]
+
+
+def _validate_sector_1based_v1(value, label):
+    sector = int(value)
+    if sector < 1 or sector > 12:
+        raise ValueError(f"{label} must be in [1, 12], got {value}")
+    return sector
+
+
+def _sector_rectilinear_axes_v1(x_2d, y_2d, source_name):
+    """Extract increasing X/Y axes and report whether spatial data need transposing."""
+    x_arr = np.asarray(x_2d, dtype=float)
+    y_arr = np.asarray(y_2d, dtype=float)
+    if x_arr.ndim != 2 or x_arr.shape != y_arr.shape:
+        raise ValueError(f"{source_name}: X_2d/Y_2d must be equal-shape 2D arrays.")
+
+    x_axis = np.asarray(x_arr[0, :], dtype=float)
+    y_axis = np.asarray(y_arr[:, 0], dtype=float)
+    transpose_spatial = False
+    if not (
+        np.allclose(x_arr, x_axis[np.newaxis, :])
+        and np.allclose(y_arr, y_axis[:, np.newaxis])
+    ):
+        x_axis = np.asarray(x_arr[:, 0], dtype=float)
+        y_axis = np.asarray(y_arr[0, :], dtype=float)
+        transpose_spatial = True
+        if not (
+            np.allclose(x_arr, x_axis[:, np.newaxis])
+            and np.allclose(y_arr, y_axis[np.newaxis, :])
+        ):
+            raise ValueError(f"{source_name}: wind grid must be rectilinear.")
+    if np.any(np.diff(x_axis) <= 0.0) or np.any(np.diff(y_axis) <= 0.0):
+        raise ValueError(f"{source_name}: wind grid axes must be strictly increasing.")
+    return x_axis, y_axis, transpose_spatial
+
+
+def _load_sector_wind_data_v1(wind_data_dir, months):
+    """Load only the seasonal monthly U/V fields needed by automatic sector selection."""
+    try:
+        import pyproj
+    except Exception as exc:
+        raise RuntimeError("pyproj is required for automatic sector wind sampling.") from exc
+
+    wind_dir = Path(wind_data_dir)
+    month_numbers = tuple(int(value) for value in months)
+    paths = [wind_dir / f"AirRisk_Data_{month}.mat" for month in month_numbers]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Missing sector wind file(s):\n" + "\n".join(missing))
+
+    base_x = base_y = base_z = None
+    loaded_months = []
+    for month, path in zip(month_numbers, paths):
+        raw = loadmat(
+            str(path),
+            variable_names=["X_2d", "Y_2d", "z_vec", "U3d", "V3d", "theta3d"],
+        )
+        x_axis, y_axis, transpose_spatial = _sector_rectilinear_axes_v1(
+            raw["X_2d"], raw["Y_2d"], path.name
+        )
+        z_axis = np.asarray(raw["z_vec"], dtype=float).reshape(-1)
+        u = np.asarray(raw["U3d"], dtype=float)
+        v = np.asarray(raw["V3d"], dtype=float)
+        theta = np.asarray(raw["theta3d"], dtype=float)
+        if transpose_spatial:
+            u = np.transpose(u, (1, 0, 2))
+            v = np.transpose(v, (1, 0, 2))
+            theta = np.transpose(theta, (1, 0, 2))
+        expected_shape = (y_axis.size, x_axis.size, z_axis.size)
+        if u.shape != expected_shape or v.shape != expected_shape or theta.shape != expected_shape:
+            raise ValueError(
+                f"{path.name}: U/V/theta shape must be {expected_shape}, "
+                f"got U={u.shape}, V={v.shape}, theta={theta.shape}."
+            )
+        if base_x is None:
+            base_x, base_y, base_z = x_axis, y_axis, z_axis
+        elif (
+            not np.array_equal(x_axis, base_x)
+            or not np.array_equal(y_axis, base_y)
+            or not np.array_equal(z_axis, base_z)
+        ):
+            raise ValueError("Monthly sector wind grids must have identical X/Y/Z axes.")
+
+        valid = (
+            np.isfinite(u)
+            & np.isfinite(v)
+            & np.isfinite(theta)
+            & (u != -1.0)
+            & (v != -1.0)
+            & (theta != -1.0)
+            & ~((u == 0.0) & (v == 0.0))
+        )
+        axes = (y_axis, x_axis, z_axis)
+        loaded_months.append({
+            "month": int(month),
+            "u_numerator": RegularGridInterpolator(
+                axes, np.where(valid, u, 0.0), bounds_error=False, fill_value=0.0
+            ),
+            "v_numerator": RegularGridInterpolator(
+                axes, np.where(valid, v, 0.0), bounds_error=False, fill_value=0.0
+            ),
+            "valid_weight": RegularGridInterpolator(
+                axes, valid.astype(float), bounds_error=False, fill_value=0.0
+            ),
+        })
+
+    return {
+        "months": loaded_months,
+        "month_numbers": [int(value) for value in month_numbers],
+        "x_axis": np.asarray(base_x, dtype=float),
+        "y_axis": np.asarray(base_y, dtype=float),
+        "z_axis": np.asarray(base_z, dtype=float),
+        "to_epsg5179": pyproj.Transformer.from_crs(
+            "EPSG:4326", "EPSG:5179", always_xy=True
+        ),
+    }
+
+
+def _sample_sector_wind_v1(wind_data, latitudes, longitudes, altitudes_msl):
+    """Sample seasonal U/V fields with validity-weighted trilinear interpolation."""
+    lats = np.asarray(latitudes, dtype=float)
+    lons = np.asarray(longitudes, dtype=float)
+    alts = np.asarray(altitudes_msl, dtype=float)
+    x, y = wind_data["to_epsg5179"].transform(lons, lats)
+    query = np.column_stack([np.asarray(y), np.asarray(x), alts])
+    samples = []
+    for month_data in wind_data["months"]:
+        weight = np.asarray(month_data["valid_weight"](query), dtype=float)
+        valid = weight >= 0.5
+        u = np.full(weight.shape, np.nan, dtype=float)
+        v = np.full(weight.shape, np.nan, dtype=float)
+        u_num = np.asarray(month_data["u_numerator"](query), dtype=float)
+        v_num = np.asarray(month_data["v_numerator"](query), dtype=float)
+        u[valid] = u_num[valid] / weight[valid]
+        v[valid] = v_num[valid] / weight[valid]
+        samples.append((u, v, valid))
+    return samples
+
+
+def _sector_nominal_geometry_v1(
+    port_altitude_msl,
+    target_altitude_msl,
+    transition_structure_mode,
+    transition_mode,
+    configured_total_distance_m,
+    angle_deg,
+    direction_label,
+):
+    """Resolve the full nominal port-to-cruise slope used for sector screening."""
+    height = float(target_altitude_msl) - float(port_altitude_msl)
+    if height < -1e-9:
+        raise ValueError(f"{direction_label} target altitude is below the vertiport.")
+    if height <= 1e-9:
+        return {"height_m": 0.0, "distance_m": 0.0, "angle_deg": 0.0, "mode": "zero_height"}
+    if str(transition_structure_mode) == TRANSITION_STRUCTURE_OPTIMIZED_ONLY:
+        angle = _validate_transition_angle(angle_deg, f"{direction_label}_angle_deg")
+        return {
+            "height_m": float(height),
+            "distance_m": float(height / np.tan(np.deg2rad(angle))),
+            "angle_deg": float(angle),
+            "mode": "optimized_only_angle",
+        }
+    return _calculate_transition_geometry(
+        height_m=height,
+        transition_mode=transition_mode,
+        distance_m=configured_total_distance_m,
+        angle_deg=angle_deg,
+    )
+
+
+def _sector_normalize01_v1(values):
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    normalized = np.ones(values.shape, dtype=float)
+    if not np.any(finite):
+        return normalized, None, None
+    minimum = float(np.min(values[finite]))
+    maximum = float(np.max(values[finite]))
+    if maximum - minimum <= 1e-12:
+        normalized[finite] = 0.0
+    else:
+        normalized[finite] = (values[finite] - minimum) / (maximum - minimum)
+    return normalized, minimum, maximum
+
+
+def _sector_finite_or_none_v1(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def _sector_json_safe_v1(value):
+    if isinstance(value, dict):
+        return {str(key): _sector_json_safe_v1(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sector_json_safe_v1(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return [_sector_json_safe_v1(item) for item in value.tolist()]
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+    return value
+
+
+def _evaluate_sector_direction_v1(
+    sector,
+    direction,
+    port_lla,
+    target_altitude_msl,
+    geometry,
+    corridor_half_width_m,
+    along_track_step_m,
+    transition_corridor_cfg,
+    Norm_RT,
+    AirRisk,
+    risk_altitude_levels,
+    MOCRisk,
+    lat_lim,
+    lon_lim,
+    use_heading_map,
+    wind_data,
+):
+    """Evaluate one direction/sector over the same 3D footprint used by the v1 MOC checker."""
+    port = np.asarray(port_lla, dtype=float).reshape(3)
+    total_distance_m = float(geometry["distance_m"])
+    bearing_out_deg = float(((int(sector) - 0.5) * 30.0) % 360.0)
+    heading_math_deg = float(90.0 - bearing_out_deg)
+    outer_lat, outer_lon = _move_latlon(
+        float(port[0]), float(port[1]), np.deg2rad(heading_math_deg), total_distance_m
+    )
+    outer = np.array([outer_lat, outer_lon, float(target_altitude_msl)], dtype=float)
+    if direction == "takeoff":
+        p1, p2 = port, outer
+        phase = FLIGHT_PHASE_TAKEOFF_STAGE2
+        flight_heading_deg = bearing_out_deg
+    elif direction == "landing":
+        p1, p2 = outer, port
+        phase = FLIGHT_PHASE_LANDING_STAGE2
+        flight_heading_deg = float((bearing_out_deg + 180.0) % 360.0)
+    else:
+        raise ValueError(f"Unknown sector direction: {direction}")
+
+    samples = list(_iter_corridor_moc_samples_v1(
+        p1,
+        p2,
+        corridor_half_width_m,
+        MOCRisk,
+        lat_lim,
+        lon_lim,
+        along_step_m=along_track_step_m,
+        phase=phase,
+        transition_corridor_cfg=transition_corridor_cfg,
+    ))
+    if not samples:
+        raise RuntimeError(f"No MOC samples generated for {direction} sector S{sector}.")
+
+    lats = np.asarray([row[3] for row in samples], dtype=float)
+    lons = np.asarray([row[4] for row in samples], dtype=float)
+    center_altitudes = np.asarray([row[5] for row in samples], dtype=float)
+    layer_indices = np.asarray([row[9] for row in samples], dtype=int)
+    grid_rows = np.asarray([row[10] for row in samples], dtype=int)
+    grid_cols = np.asarray([row[11] for row in samples], dtype=int)
+    in_grid = np.asarray([row[12] for row in samples], dtype=bool)
+    blocked = np.asarray([row[13] for row in samples], dtype=bool)
+    effective_clearance = np.asarray([row[7] for row in samples], dtype=float)
+    lower_face_msl = np.asarray([row[8] for row in samples], dtype=float)
+
+    tested_cells = {
+        (int(layer), int(row), int(col))
+        for layer, row, col, valid in zip(layer_indices, grid_rows, grid_cols, in_grid)
+        if bool(valid)
+    }
+    blocked_cells = {
+        (int(layer), int(row), int(col))
+        for layer, row, col, hit in zip(layer_indices, grid_rows, grid_cols, blocked)
+        if bool(hit)
+    }
+    blocked_sample_count = int(np.count_nonzero(blocked))
+    out_of_grid_count = int(np.count_nonzero(~in_grid))
+    moc_pass = bool(blocked_sample_count == 0 and out_of_grid_count == 0 and tested_cells)
+    moc_issue_ratio = float(
+        (blocked_sample_count + out_of_grid_count) / max(1, len(samples))
+    )
+
+    _, heading_count, Ny, Nx = Norm_RT.shape
+    risk_inside = (
+        (lats >= float(lat_lim[0]))
+        & (lats <= float(lat_lim[1]))
+        & (lons >= float(lon_lim[0]))
+        & (lons <= float(lon_lim[1]))
+    )
+    Iq = (lons - float(lon_lim[0])) / (
+        (float(lon_lim[1]) - float(lon_lim[0])) / max(1, Nx - 1)
+    )
+    Jq = (lats - float(lat_lim[0])) / (
+        (float(lat_lim[1]) - float(lat_lim[0])) / max(1, Ny - 1)
+    )
+    altitude_indices = np.argmin(
+        np.abs(
+            center_altitudes[:, None]
+            - np.asarray(risk_altitude_levels, dtype=float)[None, :]
+        ),
+        axis=1,
+    )
+    heading_index = (
+        int(round(flight_heading_deg / 45.0) % heading_count)
+        if bool(use_heading_map) else 0
+    )
+    ground_values = np.full(len(samples), np.nan, dtype=float)
+    air_values = np.full(len(samples), np.nan, dtype=float)
+    coords = np.vstack([Jq, Iq])
+    for altitude_index in np.unique(altitude_indices):
+        mask = risk_inside & (altitude_indices == int(altitude_index))
+        if not np.any(mask):
+            continue
+        ground_values[mask] = map_coordinates(
+            Norm_RT[int(altitude_index), heading_index],
+            coords[:, mask],
+            order=1,
+            mode="constant",
+            cval=np.nan,
+        )
+        air_values[mask] = map_coordinates(
+            AirRisk[:, :, int(altitude_index)],
+            coords[:, mask],
+            order=1,
+            mode="constant",
+            cval=np.nan,
+        )
+
+    wind_samples = _sample_sector_wind_v1(
+        wind_data, lats, lons, center_altitudes
+    )
+    bearing_rad = np.deg2rad(flight_heading_deg)
+    east_unit = float(np.sin(bearing_rad))
+    north_unit = float(np.cos(bearing_rad))
+    tailwind_values = []
+    crosswind_values = []
+    headwind_values = []
+    valid_wind_count = 0
+    for u, v, valid in wind_samples:
+        along = u * east_unit + v * north_unit
+        cross = np.abs(u * north_unit - v * east_unit)
+        tailwind_values.append(np.where(valid, np.maximum(along, 0.0), np.nan))
+        crosswind_values.append(np.where(valid, cross, np.nan))
+        headwind_values.append(np.where(valid, np.maximum(-along, 0.0), np.nan))
+        valid_wind_count += int(np.count_nonzero(valid))
+    tailwind_stack = np.asarray(tailwind_values, dtype=float)
+    crosswind_stack = np.asarray(crosswind_values, dtype=float)
+    headwind_stack = np.asarray(headwind_values, dtype=float)
+
+    def _finite_mean(values):
+        arr = np.asarray(values, dtype=float)
+        finite = np.isfinite(arr)
+        return float(np.mean(arr[finite])) if np.any(finite) else float("nan")
+
+    used_layers_agl = sorted({
+        int(MOC_AGL_LEVELS_M[int(np.clip(index, 0, len(MOC_AGL_LEVELS_M) - 1))])
+        for index in layer_indices.tolist()
+    })
+    return {
+        "sector": int(sector),
+        "direction": str(direction),
+        "bearing_out_deg": bearing_out_deg,
+        "flight_heading_deg": float(flight_heading_deg),
+        "ground_heading_index": int(heading_index),
+        "nominal_total_distance_m": float(total_distance_m),
+        "nominal_angle_deg": float(geometry["angle_deg"]),
+        "sample_count": int(len(samples)),
+        "moc_tested_sample_count": int(np.count_nonzero(in_grid)),
+        "moc_blocked_sample_count": blocked_sample_count,
+        "moc_out_of_grid_sample_count": out_of_grid_count,
+        "moc_tested_cell_count": int(len(tested_cells)),
+        "moc_blocked_cell_count": int(len(blocked_cells)),
+        "moc_issue_ratio": moc_issue_ratio,
+        "moc_pass": moc_pass,
+        "used_moc_agl_layers_m": used_layers_agl,
+        "minimum_effective_clearance_m": float(np.min(effective_clearance)),
+        "maximum_effective_clearance_m": float(np.max(effective_clearance)),
+        "minimum_lower_face_msl_m": float(np.min(lower_face_msl)),
+        "maximum_lower_face_msl_m": float(np.max(lower_face_msl)),
+        "tailwind_mps_raw": _finite_mean(tailwind_stack),
+        "crosswind_mps_raw": _finite_mean(crosswind_stack),
+        "headwind_mps_raw": _finite_mean(headwind_stack),
+        "ground_risk_raw": _finite_mean(ground_values),
+        "air_risk_raw": _finite_mean(air_values),
+        "wind_coverage_ratio": float(
+            valid_wind_count / max(1, len(samples) * len(wind_samples))
+        ),
+        "ground_coverage_ratio": float(np.mean(np.isfinite(ground_values))),
+        "air_coverage_ratio": float(np.mean(np.isfinite(air_values))),
+        "risk_data_available": bool(
+            np.any(np.isfinite(tailwind_stack))
+            and np.any(np.isfinite(crosswind_stack))
+            and np.any(np.isfinite(ground_values))
+            and np.any(np.isfinite(air_values))
+        ),
+        "_blocked_lats": lats[blocked].copy(),
+        "_blocked_lons": lons[blocked].copy(),
+    }
+
+
+def _plot_sector_selection_diagnostics_v1(
+    analysis,
+    moc_risk,
+    lat_lim,
+    lon_lim,
+    start_vertiport,
+    end_vertiport,
+    output_path,
+    request=None,
+    map_zoom=13,
+):
+    """Save one PNG containing map-backed takeoff and landing sector wheels."""
+    output_path = Path(output_path)
+    direction_metrics = analysis["direction_metrics"]
+    selected_pair = analysis["selected_pair"]
+
+    def _osm_preflight():
+        if request is None:
+            return False, "map_request_unavailable"
+        try:
+            zoom = int(map_zoom)
+            lon = float(start_vertiport[1])
+            lat = float(np.clip(start_vertiport[0], -85.05112878, 85.05112878))
+            tile_count = 2 ** zoom
+            tile_x = int(np.floor((lon + 180.0) / 360.0 * tile_count))
+            lat_rad = np.deg2rad(lat)
+            tile_y = int(np.floor(
+                (1.0 - np.arcsinh(np.tan(lat_rad)) / np.pi) * 0.5 * tile_count
+            ))
+            tile_image, _, _ = request.get_image((tile_x, tile_y, zoom))
+            tile_pixels = np.asarray(tile_image, dtype=float)
+            if tile_pixels.size == 0 or float(np.nanstd(tile_pixels)) < 1e-6:
+                raise RuntimeError("OSM returned an empty placeholder tile")
+            return True, None
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def _render(use_osm):
+        projection = request.crs if request is not None else ccrs.PlateCarree()
+        fig = plt.figure(figsize=(20, 11))
+        grid = fig.add_gridspec(2, 2, height_ratios=[7.5, 1.6], hspace=0.08, wspace=0.05)
+        axes = {
+            "takeoff": fig.add_subplot(grid[0, 0], projection=projection),
+            "landing": fig.add_subplot(grid[0, 1], projection=projection),
+        }
+        summary_ax = fig.add_subplot(grid[1, :])
+        summary_ax.axis("off")
+        cmap = plt.get_cmap("RdYlGn_r")
+
+        for direction, port, selected_sector, selected_color in (
+            ("takeoff", start_vertiport, selected_pair["takeoff_sector"], "blue"),
+            ("landing", end_vertiport, selected_pair["landing_sector"], "green"),
+        ):
+            ax = axes[direction]
+            metrics = [row for row in direction_metrics if row["direction"] == direction]
+            radius_m = max(float(row["nominal_total_distance_m"]) for row in metrics)
+            circle_points = np.asarray(build_circle_lla(port, radius_m * 1.08), dtype=float)
+            extent = compute_centered_map_extent(
+                circle_points[:, :2], port, ring_radii_m=(radius_m * 1.08,), pad_ratio=0.02
+            )
+            ax.set_extent(extent, crs=ccrs.PlateCarree())
+            if use_osm and request is not None:
+                ax.add_image(request, int(map_zoom))
+            else:
+                ax.set_facecolor("#eef2f3")
+            ax.gridlines(
+                crs=ccrs.PlateCarree(), draw_labels=False,
+                linewidth=0.45, color="gray", alpha=0.35, linestyle="--"
+            )
+
+            used_layer_indices = sorted({
+                int(np.where(MOC_AGL_LEVELS_M == float(agl))[0][0])
+                for row in metrics
+                for agl in row["used_moc_agl_layers_m"]
+                if np.any(MOC_AGL_LEVELS_M == float(agl))
+            })
+            if used_layer_indices:
+                moc_union = np.max(
+                    np.asarray(moc_risk, dtype=float)[:, :, used_layer_indices], axis=2
+                )
+                Ny, Nx = moc_union.shape
+                map_lats = np.linspace(float(lat_lim[0]), float(lat_lim[1]), Ny)
+                map_lons = np.linspace(float(lon_lim[0]), float(lon_lim[1]), Nx)
+                LON, LAT = np.meshgrid(map_lons, map_lats)
+                m_lat = 111000.0
+                m_lon = 111000.0 * np.cos(np.deg2rad(float(port[0])))
+                radial = np.hypot(
+                    (LAT - float(port[0])) * m_lat,
+                    (LON - float(port[1])) * m_lon,
+                )
+                visible_moc = np.where(radial <= radius_m * 1.02, moc_union, 0.0)
+                if np.any(visible_moc >= 0.5):
+                    ax.contourf(
+                        LON, LAT, visible_moc,
+                        levels=[0.5, 1.5], colors=["magenta"], alpha=0.18,
+                        transform=ccrs.PlateCarree(), zorder=2,
+                    )
+
+            for row in metrics:
+                sector = int(row["sector"])
+                heading_math_deg = float(np.rad2deg(_sector_angle(sector)))
+                wedge_lon, wedge_lat = _build_sector_wedge_lonlat(
+                    port,
+                    heading_math_deg,
+                    float(analysis["sector_half_width_deg"]),
+                    row["nominal_total_distance_m"],
+                    n_pts=30,
+                )
+                risk_score = float(np.clip(row["combined_risk_score"], 0.0, 1.0))
+                ax.fill(
+                    wedge_lon, wedge_lat,
+                    facecolor=cmap(risk_score), edgecolor="black", linewidth=0.75,
+                    alpha=0.36, transform=ccrs.PlateCarree(), zorder=4,
+                )
+                if not bool(row["moc_pass"]):
+                    ax.fill(
+                        wedge_lon, wedge_lat, facecolor="none", edgecolor="red",
+                        linewidth=1.1, hatch="///", transform=ccrs.PlateCarree(), zorder=6,
+                    )
+                if int(row["moc_out_of_grid_sample_count"]) > 0:
+                    ax.fill(
+                        wedge_lon, wedge_lat, facecolor="none", edgecolor="darkorange",
+                        linewidth=1.1, hatch="..", transform=ccrs.PlateCarree(), zorder=7,
+                    )
+                if sector == int(selected_sector):
+                    ax.plot(
+                        wedge_lon, wedge_lat, color=selected_color, linewidth=4.0,
+                        transform=ccrs.PlateCarree(), zorder=10,
+                    )
+
+                blocked_lats = np.asarray(row.get("_blocked_lats", []), dtype=float)
+                blocked_lons = np.asarray(row.get("_blocked_lons", []), dtype=float)
+                if blocked_lats.size:
+                    unique_points = np.unique(
+                        np.round(np.column_stack([blocked_lats, blocked_lons]), 7), axis=0
+                    )
+                    if unique_points.shape[0] > 120:
+                        pick = np.linspace(0, unique_points.shape[0] - 1, 120).astype(int)
+                        unique_points = unique_points[pick]
+                    ax.scatter(
+                        unique_points[:, 1], unique_points[:, 0], marker="x", s=12,
+                        color="red", linewidths=0.8, transform=ccrs.PlateCarree(), zorder=9,
+                    )
+
+                label_lat, label_lon = _move_latlon(
+                    float(port[0]), float(port[1]), np.deg2rad(heading_math_deg),
+                    0.68 * float(row["nominal_total_distance_m"]),
+                )
+                label = (
+                    f"S{sector}  R {row['combined_risk_score']:.2f}\n"
+                    f"W/G/A {row['wind_risk_score']:.2f}/"
+                    f"{row['ground_risk_score']:.2f}/{row['air_risk_score']:.2f}\n"
+                    f"MOC {row['moc_blocked_cell_count']}/{row['moc_tested_cell_count']}"
+                )
+                if int(row["moc_out_of_grid_sample_count"]) > 0:
+                    label += f"  OOG {row['moc_out_of_grid_sample_count']}"
+                ax.text(
+                    label_lon, label_lat, label,
+                    fontsize=6.7, fontweight="bold", ha="center", va="center",
+                    bbox=dict(facecolor="white", alpha=0.76, edgecolor="none", pad=1.2),
+                    transform=ccrs.PlateCarree(), zorder=12,
+                )
+
+            ax.scatter(
+                [float(port[1])], [float(port[0])], marker="s", s=85,
+                facecolor="red", edgecolor="black", linewidth=1.2,
+                transform=ccrs.PlateCarree(), zorder=15,
+            )
+            ax.set_title(
+                f"{direction.title()} sectors | selected S{int(selected_sector)} | "
+                f"nominal radius {radius_m / 1000.0:.2f} km",
+                fontsize=13, fontweight="bold",
+            )
+
+        color_mappable = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, 1.0))
+        color_mappable.set_array([])
+        fig.colorbar(
+            color_mappable, ax=list(axes.values()), orientation="horizontal",
+            fraction=0.035, pad=0.03, label="Normalized combined risk (lower is better)",
+        )
+        fig.legend(
+            handles=[
+                Patch(facecolor="magenta", alpha=0.22, label="MOC blocked union (used layers)"),
+                Patch(facecolor="none", edgecolor="red", hatch="///", label="MOC fail"),
+                Patch(facecolor="none", edgecolor="darkorange", hatch="..", label="OUT_OF_GRID"),
+                Patch(facecolor="none", edgecolor="blue", linewidth=3.0, label="Selected takeoff"),
+                Patch(facecolor="none", edgecolor="green", linewidth=3.0, label="Selected landing"),
+            ],
+            loc="upper center", bbox_to_anchor=(0.5, 0.965), ncol=5, fontsize=9,
+        )
+
+        summary = (
+            f"Selection: S{selected_pair['takeoff_sector']} takeoff / "
+            f"S{selected_pair['landing_sector']} landing    |    "
+            f"Status: {analysis['status']}    |    "
+            f"Wind period: {analysis['season']} (months {analysis['wind_months']})\n"
+            f"Pair risk={selected_pair['combined_risk_score']:.4f}  "
+            f"[wind={selected_pair['wind_risk_score']:.4f}, "
+            f"ground={selected_pair['ground_risk_score']:.4f}, "
+            f"air={selected_pair['air_risk_score']:.4f}]    |    "
+            f"MOC issue={selected_pair['moc_issue_ratio']:.4f}    |    "
+            f"MOC-safe pairs={analysis['moc_safe_pair_count']}/{analysis['combination_count']}"
+        )
+        summary_ax.text(
+            0.5, 0.52, summary, ha="center", va="center", fontsize=11,
+            bbox=dict(boxstyle="round,pad=0.65", facecolor="#f7f7f7", edgecolor="#666666"),
+        )
+        fig.suptitle(
+            "Automatic sector selection: seasonal wind + ground risk + air risk, with mandatory MOC screening",
+            fontsize=16, fontweight="bold", y=0.995,
+        )
+        fig.savefig(output_path, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+
+    osm_available, preflight_reason = _osm_preflight()
+    if not osm_available:
+        if request is not None:
+            print(
+                "Warning: sector diagnostic OSM background unavailable; "
+                f"using neutral fallback: {preflight_reason}"
+            )
+        _render(False)
+        return {"used_osm": False, "fallback_reason": preflight_reason}
+    try:
+        _render(True)
+        return {"used_osm": True, "fallback_reason": None}
+    except Exception as exc:
+        plt.close("all")
+        print(
+            "Warning: sector diagnostic OSM background failed; using neutral fallback: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _render(False)
+        return {
+            "used_osm": False,
+            "fallback_reason": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _automatic_sector_selection_v1(
+    start_vertiport,
+    end_vertiport,
+    target_altitude_msl,
+    transition_structure_mode,
+    transition_mode,
+    takeoff_total_distance_m,
+    landing_total_distance_m,
+    takeoff_angle_deg,
+    landing_angle_deg,
+    corridor_half_width_m,
+    sector_half_width_deg,
+    along_track_step_m,
+    sector_season,
+    wind_tail_weight,
+    wind_cross_weight,
+    wind_risk_weight,
+    ground_risk_weight,
+    air_risk_weight,
+    wind_data_dir,
+    Norm_RT,
+    AirRisk,
+    risk_altitude_levels,
+    MOCRisk,
+    lat_lim,
+    lon_lim,
+    use_heading_map,
+    transition_corridor_cfg,
+    output_png_path,
+    request=None,
+    warning_callback=None,
+):
+    """Evaluate 24 directional sectors, rank 132 pairs, and save one diagnostic PNG."""
+    if not np.isclose(float(wind_tail_weight) + float(wind_cross_weight), 1.0):
+        raise ValueError("sector wind tail/cross weights must sum to 1.0.")
+    if not np.isclose(
+        float(wind_risk_weight) + float(ground_risk_weight) + float(air_risk_weight),
+        1.0,
+    ):
+        raise ValueError("sector wind/ground/air weights must sum to 1.0.")
+    if not np.isfinite(float(along_track_step_m)) or float(along_track_step_m) <= 0.0:
+        raise ValueError("sector along-track sample spacing must be finite and > 0.")
+    if not np.isfinite(float(sector_half_width_deg)) or not 0.0 < float(sector_half_width_deg) <= 15.0:
+        raise ValueError("sector_half_width_deg must satisfy 0 < value <= 15 degrees.")
+
+    season = str(sector_season).strip().lower()
+    wind_months = _sector_wind_months_v1(season)
+    wind_data = _load_sector_wind_data_v1(wind_data_dir, wind_months)
+    target_altitude_msl = float(target_altitude_msl)
+    takeoff_geometry = _sector_nominal_geometry_v1(
+        start_vertiport[2], target_altitude_msl,
+        transition_structure_mode, transition_mode,
+        takeoff_total_distance_m, takeoff_angle_deg, "takeoff",
+    )
+    landing_geometry = _sector_nominal_geometry_v1(
+        end_vertiport[2], target_altitude_msl,
+        transition_structure_mode, transition_mode,
+        landing_total_distance_m, landing_angle_deg, "landing",
+    )
+
+    direction_metrics = []
+    for sector in range(1, 13):
+        direction_metrics.append(_evaluate_sector_direction_v1(
+            sector, "takeoff", start_vertiport, target_altitude_msl,
+            takeoff_geometry, corridor_half_width_m, along_track_step_m,
+            transition_corridor_cfg,
+            Norm_RT, AirRisk, risk_altitude_levels, MOCRisk,
+            lat_lim, lon_lim, use_heading_map, wind_data,
+        ))
+        direction_metrics.append(_evaluate_sector_direction_v1(
+            sector, "landing", end_vertiport, target_altitude_msl,
+            landing_geometry, corridor_half_width_m, along_track_step_m,
+            transition_corridor_cfg,
+            Norm_RT, AirRisk, risk_altitude_levels, MOCRisk,
+            lat_lim, lon_lim, use_heading_map, wind_data,
+        ))
+
+    normalization = {}
+    raw_fields = {
+        "tailwind": "tailwind_mps_raw",
+        "crosswind": "crosswind_mps_raw",
+        "ground": "ground_risk_raw",
+        "air": "air_risk_raw",
+    }
+    normalized_by_field = {}
+    for label, field in raw_fields.items():
+        normalized, minimum, maximum = _sector_normalize01_v1(
+            [row[field] for row in direction_metrics]
+        )
+        normalized_by_field[label] = normalized
+        normalization[label] = {"minimum": minimum, "maximum": maximum}
+
+    for index, row in enumerate(direction_metrics):
+        row["tailwind_risk_score"] = float(normalized_by_field["tailwind"][index])
+        row["crosswind_risk_score"] = float(normalized_by_field["crosswind"][index])
+        row["wind_risk_score"] = float(
+            float(wind_tail_weight) * row["tailwind_risk_score"]
+            + float(wind_cross_weight) * row["crosswind_risk_score"]
+        )
+        row["ground_risk_score"] = float(normalized_by_field["ground"][index])
+        row["air_risk_score"] = float(normalized_by_field["air"][index])
+        row["combined_risk_score"] = float(
+            float(wind_risk_weight) * row["wind_risk_score"]
+            + float(ground_risk_weight) * row["ground_risk_score"]
+            + float(air_risk_weight) * row["air_risk_score"]
+        )
+
+    metric_lookup = {
+        (int(row["sector"]), str(row["direction"])): row
+        for row in direction_metrics
+    }
+    combinations = []
+    for takeoff_sector in range(1, 13):
+        for landing_sector in range(1, 13):
+            if takeoff_sector == landing_sector:
+                continue
+            takeoff = metric_lookup[(takeoff_sector, "takeoff")]
+            landing = metric_lookup[(landing_sector, "landing")]
+            moc_pass = bool(takeoff["moc_pass"] and landing["moc_pass"])
+            risk_data_available = bool(
+                takeoff["risk_data_available"] and landing["risk_data_available"]
+            )
+            combinations.append({
+                "takeoff_sector": int(takeoff_sector),
+                "landing_sector": int(landing_sector),
+                "moc_pass": moc_pass,
+                "risk_data_available": risk_data_available,
+                "eligible": bool(moc_pass and risk_data_available),
+                "moc_issue_ratio": float(
+                    0.5 * (takeoff["moc_issue_ratio"] + landing["moc_issue_ratio"])
+                ),
+                "wind_risk_score": float(
+                    0.5 * (takeoff["wind_risk_score"] + landing["wind_risk_score"])
+                ),
+                "ground_risk_score": float(
+                    0.5 * (takeoff["ground_risk_score"] + landing["ground_risk_score"])
+                ),
+                "air_risk_score": float(
+                    0.5 * (takeoff["air_risk_score"] + landing["air_risk_score"])
+                ),
+                "combined_risk_score": float(
+                    0.5 * (takeoff["combined_risk_score"] + landing["combined_risk_score"])
+                ),
+                "takeoff_moc_blocked_cell_count": int(takeoff["moc_blocked_cell_count"]),
+                "landing_moc_blocked_cell_count": int(landing["moc_blocked_cell_count"]),
+                "takeoff_moc_tested_cell_count": int(takeoff["moc_tested_cell_count"]),
+                "landing_moc_tested_cell_count": int(landing["moc_tested_cell_count"]),
+                "takeoff_moc_out_of_grid_sample_count": int(
+                    takeoff["moc_out_of_grid_sample_count"]
+                ),
+                "landing_moc_out_of_grid_sample_count": int(
+                    landing["moc_out_of_grid_sample_count"]
+                ),
+            })
+    if len(combinations) != 132:
+        raise RuntimeError(f"Expected 132 sector pairs, generated {len(combinations)}.")
+
+    eligible = [row for row in combinations if row["eligible"]]
+    if not eligible:
+        moc_safe_pair_count = int(sum(bool(row["moc_pass"]) for row in combinations))
+        risk_covered_pair_count = int(
+            sum(bool(row["risk_data_available"]) for row in combinations)
+        )
+        raise SectorSelectionInfeasibleError(
+            "No MOC-safe takeoff/landing sector pair has enough wind/ground/air "
+            "data; automatic selection will not choose an MOC-violating pair.",
+            details=[
+                {
+                    "field": "sector_selection",
+                    "message": f"0 of {len(combinations)} sector pairs are eligible.",
+                    "type": "no_eligible_sector_pair",
+                },
+                {
+                    "field": "sector_selection.moc",
+                    "message": (
+                        f"{moc_safe_pair_count} of {len(combinations)} pairs passed "
+                        "mandatory MOC screening."
+                    ),
+                    "type": "moc_screening_summary",
+                },
+                {
+                    "field": "sector_selection.risk_coverage",
+                    "message": (
+                        f"{risk_covered_pair_count} of {len(combinations)} pairs have "
+                        "wind, ground-risk, and air-risk coverage."
+                    ),
+                    "type": "risk_coverage_summary",
+                },
+            ],
+        )
+    selected_pair = min(
+        eligible,
+        key=lambda row: (
+            row["combined_risk_score"], row["takeoff_sector"], row["landing_sector"]
+        ),
+    )
+    selection_status = "OPTIMAL_MOC_FEASIBLE"
+
+    for rank, row in enumerate(sorted(
+        combinations,
+        key=lambda value: (
+            not value["eligible"],
+            value["moc_issue_ratio"] if not value["eligible"] else 0.0,
+            value["combined_risk_score"],
+            value["takeoff_sector"], value["landing_sector"],
+        ),
+    ), start=1):
+        row["comparison_rank"] = int(rank)
+
+    selected_pair = dict(selected_pair)
+    selected_pair["selection_status"] = selection_status
+    analysis = {
+        "enabled": True,
+        "mode": "automatic",
+        "status": selection_status,
+        "season": season,
+        "wind_months": [int(value) for value in wind_months],
+        "weights": {
+            "wind": float(wind_risk_weight),
+            "ground": float(ground_risk_weight),
+            "air": float(air_risk_weight),
+            "tailwind_within_wind": float(wind_tail_weight),
+            "crosswind_within_wind": float(wind_cross_weight),
+        },
+        "moc_selection_enforced_independently_of_optimizer_switch": True,
+        "selection_priority": "MOC_PASS_FIRST_THEN_MINIMUM_COMBINED_RISK",
+        "nominal_screening_path_policy": "sector_center_straight_from_vertiport_to_cruise",
+        "along_track_sample_spacing_m": float(along_track_step_m),
+        "corridor_half_width_m": float(corridor_half_width_m),
+        "sector_half_width_deg": float(sector_half_width_deg),
+        "takeoff_nominal_geometry": {
+            key: _sector_finite_or_none_v1(value) if key != "mode" else str(value)
+            for key, value in takeoff_geometry.items()
+        },
+        "landing_nominal_geometry": {
+            key: _sector_finite_or_none_v1(value) if key != "mode" else str(value)
+            for key, value in landing_geometry.items()
+        },
+        "normalization": normalization,
+        "direction_count": int(len(direction_metrics)),
+        "combination_count": int(len(combinations)),
+        "eligible_pair_count": int(len(eligible)),
+        "moc_safe_pair_count": int(len(eligible)),
+        "selected_pair": selected_pair,
+        "direction_metrics": direction_metrics,
+        "combinations": combinations,
+        "diagnostic_figure": str(Path(output_png_path)),
+    }
+    plot_status = _plot_sector_selection_diagnostics_v1(
+        analysis,
+        MOCRisk,
+        lat_lim,
+        lon_lim,
+        start_vertiport,
+        end_vertiport,
+        output_png_path,
+        request=request,
+    )
+    analysis["diagnostic_figure_used_osm"] = bool(plot_status["used_osm"])
+    analysis["diagnostic_figure_fallback_reason"] = plot_status["fallback_reason"]
+    if not bool(plot_status["used_osm"]) and warning_callback is not None:
+        warning_callback(
+            "osm_background_fallback",
+            "OSM background was unavailable; the sector diagnostic used a neutral background.",
+            fallback_reason=plot_status["fallback_reason"],
+        )
+    analysis["direction_metrics"] = [
+        {key: value for key, value in row.items() if not str(key).startswith("_")}
+        for row in direction_metrics
+    ]
+    return _sector_json_safe_v1(analysis)
+
+
 def _plot_masked_chunks(ax, lons, lats, mask, **plot_kwargs):
     mask = np.asarray(mask, dtype=bool).ravel()
     if lons is None or lats is None:
@@ -1830,11 +4639,42 @@ def _plot_masked_chunks(ax, lons, lats, mask, **plot_kwargs):
         ax.plot(lons[seg_idx], lats[seg_idx], **kwargs_i)
 
 
+def _plot_masked_edges(ax, lons, lats, edge_mask, **plot_kwargs):
+    """Plot contiguous path edges without dropping one-edge phase spans."""
+    edge_mask = np.asarray(edge_mask, dtype=bool).ravel()
+    if lons is None or lats is None:
+        return
+    if edge_mask.size == 0 or lons.size < 2 or lats.size < 2:
+        return
+    if not (edge_mask.size == lons.size - 1 == lats.size - 1):
+        return
+
+    idx = np.flatnonzero(edge_mask)
+    if idx.size == 0:
+        return
+
+    label = plot_kwargs.pop("label", None)
+    cuts = np.where(np.diff(idx) > 1)[0]
+    starts = np.r_[0, cuts + 1]
+    ends = np.r_[cuts, idx.size - 1]
+    first_label_used = False
+
+    for s, e in zip(starts, ends):
+        first_edge = int(idx[s])
+        last_edge = int(idx[e])
+        point_slice = slice(first_edge, last_edge + 2)
+        kwargs_i = dict(plot_kwargs)
+        if label is not None and not first_label_used:
+            kwargs_i["label"] = label
+            first_label_used = True
+        ax.plot(lons[point_slice], lats[point_slice], **kwargs_i)
+
+
 def save_excel_route_map_figure(xlsx_path, out_png_path=None, figure_title=None, use_takeoff_landing_transition=True):
     """
     Route_Data 시트의 경로를 지도 위에 시각화해 PNG로 저장한다.
     표시 요소:
-    - Cruise Section, Takeoff Section, Landing Section
+    - Flight_Phase-based cruise, takeoff transition, landing transition
     - TF_End, RF_Start, RF arc points, Arc center
     - NFZ, Airspace boundary
     """
@@ -1926,12 +4766,28 @@ def save_excel_route_map_figure(xlsx_path, out_png_path=None, figure_title=None,
         return None
 
     type_text = plot_route["Type"].astype(str).str.lower() if "Type" in plot_route.columns else pd.Series("", index=plot_route.index)
-    mask_takeoff = type_text.str.contains("takeoff_path", na=False).to_numpy(dtype=bool)
-    mask_landing = type_text.str.contains("landing_path", na=False).to_numpy(dtype=bool)
-    mask_vertiport = type_text.eq("vertiport").to_numpy(dtype=bool)
+    has_flight_phase = "Flight_Phase" in plot_route.columns
+    if has_flight_phase:
+        phase_text = plot_route["Flight_Phase"].astype(str).str.strip().str.lower()
+        mask_takeoff = phase_text.isin([
+            FLIGHT_PHASE_TAKEOFF_STAGE1,
+            FLIGHT_PHASE_TAKEOFF_STAGE2,
+        ]).to_numpy(dtype=bool)
+        mask_landing = phase_text.isin([
+            FLIGHT_PHASE_LANDING_STAGE2,
+            FLIGHT_PHASE_LANDING_STAGE1,
+        ]).to_numpy(dtype=bool)
+        mask_vertiport = phase_text.eq(FLIGHT_PHASE_VERTIPORT).to_numpy(dtype=bool)
+        mask_cruise = phase_text.eq(FLIGHT_PHASE_CRUISE).to_numpy(dtype=bool)
+    else:
+        # Backward-compatible fallback for workbooks created before Flight_Phase.
+        phase_text = pd.Series("", index=plot_route.index)
+        mask_takeoff = type_text.str.contains("takeoff", na=False).to_numpy(dtype=bool)
+        mask_landing = type_text.str.contains("landing", na=False).to_numpy(dtype=bool)
+        mask_vertiport = type_text.eq("vertiport").to_numpy(dtype=bool)
+        mask_cruise = ~(mask_takeoff | mask_landing | mask_vertiport)
     mask_rf = type_text.str.contains("rf_arc", na=False).to_numpy(dtype=bool)
     mask_tf = (type_text.str.contains("tf_point|takeoff_path_point|landing_path_point", na=False, regex=True)).to_numpy(dtype=bool)
-    mask_cruise = ~(mask_takeoff | mask_landing | mask_vertiport)
 
     def _flag_mask(col_name):
         if col_name not in plot_route.columns:
@@ -1945,18 +4801,58 @@ def save_excel_route_map_figure(xlsx_path, out_png_path=None, figure_title=None,
 
     lons = plot_route["Lon"].to_numpy(dtype=float)
     lats = plot_route["Lat"].to_numpy(dtype=float)
+    transition_marker_plot_mask = np.zeros(plot_route.shape[0], dtype=bool)
+    for point_name in (
+        "takeoff_stage1_end",
+        "landing_stage1_start",
+        "takeoff_transition_end",
+        "landing_transition_start",
+    ):
+        boundary_lonlat = input_point_map.get(point_name)
+        if boundary_lonlat is None:
+            continue
+        boundary_lla = np.array([boundary_lonlat[1], boundary_lonlat[0], 0.0], dtype=float)
+        for point_idx in range(plot_route.shape[0]):
+            route_lla = np.array([lats[point_idx], lons[point_idx], 0.0], dtype=float)
+            if _seg_dist_m(route_lla, boundary_lla) <= 0.5:
+                transition_marker_plot_mask[point_idx] = True
+    tf_start_mask &= ~transition_marker_plot_mask
+    tf_end_mask &= ~transition_marker_plot_mask
+    rf_start_mask &= ~transition_marker_plot_mask
+    rf_end_mask &= ~transition_marker_plot_mask
 
     
     ax.plot(lons, lats, "-", color="gray", linewidth=2.5, alpha=0.4, zorder=3, label="Route Outline")
     
-    _plot_masked_chunks(ax, lons, lats, mask_cruise, color="black", linewidth=2.8, alpha=1.0,
-                        zorder=5, label="Cruise Section")
-    
-    _plot_masked_chunks(ax, lons, lats, mask_takeoff, color="royalblue", linewidth=3.2, alpha=0.95,
-                        zorder=6, label="Takeoff Section")
-    
-    _plot_masked_chunks(ax, lons, lats, mask_landing, color="seagreen", linewidth=3.2, alpha=0.95,
-                        zorder=6, label="Landing Section")
+    if has_flight_phase:
+        phase_values = phase_text.to_numpy(dtype=object)
+        edge_phases = phase_values[1:].copy()
+        # The final edge terminates at a vertiport; retain its source landing phase.
+        vertiport_edges = edge_phases == FLIGHT_PHASE_VERTIPORT
+        edge_phases[vertiport_edges] = phase_values[:-1][vertiport_edges]
+        _plot_masked_edges(
+            ax, lons, lats, edge_phases == FLIGHT_PHASE_CRUISE,
+            color="black", linewidth=2.8, alpha=1.0, zorder=5, label="Cruise Section",
+        )
+        _plot_masked_edges(
+            ax, lons, lats,
+            np.isin(edge_phases, [FLIGHT_PHASE_TAKEOFF_STAGE1, FLIGHT_PHASE_TAKEOFF_STAGE2]),
+            color=TAKEOFF_TRANSITION_COLOR, linewidth=3.2, alpha=0.95,
+            zorder=6, label="Takeoff Transition",
+        )
+        _plot_masked_edges(
+            ax, lons, lats,
+            np.isin(edge_phases, [FLIGHT_PHASE_LANDING_STAGE2, FLIGHT_PHASE_LANDING_STAGE1]),
+            color=LANDING_TRANSITION_COLOR, linewidth=3.2, alpha=0.95,
+            zorder=6, label="Landing Transition",
+        )
+    else:
+        _plot_masked_chunks(ax, lons, lats, mask_cruise, color="black", linewidth=2.8, alpha=1.0,
+                            zorder=5, label="Cruise Section")
+        _plot_masked_chunks(ax, lons, lats, mask_takeoff, color=TAKEOFF_TRANSITION_COLOR,
+                            linewidth=3.2, alpha=0.95, zorder=6, label="Takeoff Transition")
+        _plot_masked_chunks(ax, lons, lats, mask_landing, color=LANDING_TRANSITION_COLOR,
+                            linewidth=3.2, alpha=0.95, zorder=6, label="Landing Transition")
     
     if np.any(mask_rf):
         ax.scatter(lons[mask_rf], lats[mask_rf], s=18, c="gold", alpha=0.90, edgecolors="none",
@@ -2018,11 +4914,15 @@ def save_excel_route_map_figure(xlsx_path, out_png_path=None, figure_title=None,
     end_vertiport_point = input_point_map.get(
         "end_vertiport", _vertiport_from_route("end")
     )
+    takeoff_stage1_end_point = input_point_map.get("takeoff_stage1_end")
+    landing_stage1_start_point = input_point_map.get("landing_stage1_start")
     takeoff_end_point = input_point_map.get(
-        "takeoff_point", (float(lons[0]), float(lats[0]))
+        "takeoff_transition_end",
+        input_point_map.get("takeoff_point", (float(lons[0]), float(lats[0]))),
     )
-    offmode_end_point = input_point_map.get(
-        "landing_point", (float(lons[-1]), float(lats[-1]))
+    landing_end_point = input_point_map.get(
+        "landing_transition_start",
+        input_point_map.get("landing_point", (float(lons[-1]), float(lats[-1]))),
     )
 
     if end_vertiport_point is not None:
@@ -2037,14 +4937,26 @@ def save_excel_route_map_figure(xlsx_path, out_png_path=None, figure_title=None,
             s=100, c="red", edgecolors="k", linewidths=0.8, marker="s",
             label="Start Vertiport", zorder=14,
         )
+    if takeoff_stage1_end_point is not None:
+        ax.scatter(
+            takeoff_stage1_end_point[0], takeoff_stage1_end_point[1],
+            s=70, facecolors="none", edgecolors=TAKEOFF_TRANSITION_COLOR,
+            linewidths=1.5, marker="o", label="Takeoff Stage1 End", zorder=15,
+        )
+    if landing_stage1_start_point is not None:
+        ax.scatter(
+            landing_stage1_start_point[0], landing_stage1_start_point[1],
+            s=70, facecolors="none", edgecolors=LANDING_TRANSITION_COLOR,
+            linewidths=1.5, marker="o", label="Landing Stage1 Start", zorder=15,
+        )
     ax.scatter(
         takeoff_end_point[0], takeoff_end_point[1],
-        s=90, c="blue", edgecolors="k", linewidths=0.5, marker="^",
+        s=90, c=TAKEOFF_TRANSITION_COLOR, edgecolors="k", linewidths=0.5, marker="^",
         label="Takeoff_End", zorder=15,
     )
     ax.scatter(
-        offmode_end_point[0], offmode_end_point[1],
-        s=90, c="green", edgecolors="k", linewidths=0.5, marker="v",
+        landing_end_point[0], landing_end_point[1],
+        s=90, c=LANDING_TRANSITION_COLOR, edgecolors="k", linewidths=0.5, marker="v",
         label="Landing_End", zorder=15,
     )
 
@@ -2061,6 +4973,7 @@ def save_excel_route_map_figure(xlsx_path, out_png_path=None, figure_title=None,
     legend_handles, legend_labels = ax.get_legend_handles_labels()
     marker_label_order = [
         "Waypoints", "Start Vertiport", "End Vertiport",
+        "Takeoff Stage1 End", "Landing Stage1 Start",
         "Takeoff_End", "Landing_End",
     ]
     non_marker_indices = [
@@ -2098,12 +5011,15 @@ def run_nsga3(
     NoiseRisk, noise_floor_db, w_n,
     ground_speed_mps, bank_angle_deg, num_arc_points,
     look_ahead, look_ahead_threshold_m, look_ahead_min_scale, look_ahead_window,
+    use_boundary_heading,
     W_half, check_corridor_nfz, check_corridor_moc, check_corridor_self_overlap,
     MOCRisk,
     start_vertiport, end_vertiport, landing_entry, takeoff_complete,
     airspace_center_latlon, airspace_radius_m,
     airspace_alt_min_m, airspace_alt_max_m,
     min_corridor_distance_m,
+    transition_corridor_cfg,
+    generation_progress_callback=None,
 ):
     """NSGA-III with RF-turn preprocessing."""
 
@@ -2116,6 +5032,8 @@ def run_nsga3(
         MOCRisk=MOCRisk, check_corridor_moc=check_corridor_moc,
         check_corridor_self_overlap=check_corridor_self_overlap,
         vertiport=None, landing_entry=None, takeoff_complete=None,
+        flight_phases=np.full(dummy.shape[0], FLIGHT_PHASE_CRUISE, dtype=object),
+        transition_corridor_cfg=transition_corridor_cfg,
     )
     num_obj = len(temp_f)
     H = num_obj + 1
@@ -2134,15 +5052,19 @@ def run_nsga3(
             look_ahead_threshold_m,
             look_ahead_min_scale,
             look_ahead_window,
+            use_boundary_heading=use_boundary_heading,
         )
         full_path = rf["path"]
-        if not is_path_inside_airspace(
+        air_ok, _, _ = _is_path_inside_airspace_envelope_v1(
             full_path,
+            rf.get("flight_phases"),
             airspace_center_latlon,
             airspace_radius_m,
             alt_min_m=airspace_alt_min_m,
             alt_max_m=airspace_alt_max_m,
-        ):
+            transition_corridor_cfg=transition_corridor_cfg,
+        )
+        if not air_ok:
             f_pen = np.asarray(temp_f, dtype=float) + 1e6
             return f_pen, False
 
@@ -2160,10 +5082,12 @@ def run_nsga3(
             MOCRisk=MOCRisk, check_corridor_moc=check_corridor_moc,
             check_corridor_self_overlap=check_corridor_self_overlap,
             vertiport=None, landing_entry=None, takeoff_complete=None,
+            flight_phases=rf.get("flight_phases"),
+            transition_corridor_cfg=transition_corridor_cfg,
         )
         if not rf["feasible"]:
             f_val = np.asarray(f_val, dtype=float) + 1e6
-        return f_val, feas
+        return f_val, bool(feas and rf["feasible"])
 
     pop = list(population[:N_pop]) if len(population) > N_pop else list(population)
     pop = [_enforce_mandatory_wp_order(p, mandatory_backbone) for p in pop]
@@ -2203,6 +5127,17 @@ def run_nsga3(
             new_pop = list(last_success_pop)
             carry_over_used = True
             print(f"[Gen {gen}] no parent-selectable solution in current generation; carrying over {len(new_pop)} previous feasible parent(s).")
+
+        if generation_progress_callback is not None:
+            generation_progress_callback(
+                generation=int(gen),
+                total_generations=int(Nmax),
+                constraint_feasible=int(num_feas),
+                rf_feasible=int(rf_feas),
+                parent_selection_feasible=int(sel_feas),
+                population_size=int(Np),
+                carry_over_used=bool(carry_over_used),
+            )
 
         if not new_pop:
             return [], np.empty((0, num_obj)), gen_history
@@ -2250,7 +5185,6 @@ def run_nsga3(
             f"next_pop: {next_count} (unique {next_unique}) | "
             f"carry_over: {int(carry_over_used)}"
         )
-
         pop = [_enforce_mandatory_wp_order(pn, mandatory_backbone) for pn in pop_next]
 
     if not pop:
@@ -2281,6 +5215,2340 @@ def pick_representatives(population, f_vals):
     return reps
 
 
+def _plot_rf_segments_by_phase(
+    ax,
+    rf,
+    cruise_color="black",
+    tf_lw=1.5,
+    rf_lw=2.0,
+    transform=None,
+    zorder=8,
+    transition_labels=False,
+    draw_rf_markers=False,
+    linestyle="-",
+    include_fixed_stage1=True,
+):
+    """Plot TF/RF geometry while keeping transition phases blue/green."""
+    label_used = {"takeoff": False, "landing": False}
+    plot_transform = ccrs.Geodetic() if transform is None else transform
+
+    for seg in rf.get("segments", []):
+        if (
+            not include_fixed_stage1
+            and bool(seg.get("is_fixed_transition_stage1", False))
+        ):
+            continue
+        pts = np.asarray(seg.get("points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        if pts.shape[0] < 2:
+            continue
+        phases = np.asarray(
+            seg.get("point_phases", np.full(pts.shape[0], FLIGHT_PHASE_CRUISE, dtype=object)),
+            dtype=object,
+        ).reshape(-1)
+        if phases.size != pts.shape[0]:
+            phases = np.full(pts.shape[0], FLIGHT_PHASE_CRUISE, dtype=object)
+
+        edge_phases = []
+        for i in range(pts.shape[0] - 1):
+            phase = str(phases[i + 1])
+            if phase == FLIGHT_PHASE_VERTIPORT:
+                phase = str(phases[i])
+            edge_phases.append(phase)
+
+        start = 0
+        while start < len(edge_phases):
+            phase = edge_phases[start]
+            end = start + 1
+            while end < len(edge_phases) and edge_phases[end] == phase:
+                end += 1
+            if phase.startswith("takeoff_"):
+                color = TAKEOFF_TRANSITION_COLOR
+                phase_group = "takeoff"
+                label = "Takeoff Transition" if transition_labels and not label_used[phase_group] else None
+            elif phase.startswith("landing_"):
+                color = LANDING_TRANSITION_COLOR
+                phase_group = "landing"
+                label = "Landing Transition" if transition_labels and not label_used[phase_group] else None
+            else:
+                color = cruise_color
+                phase_group = None
+                label = None
+            ax.plot(
+                pts[start:end + 1, 1],
+                pts[start:end + 1, 0],
+                linestyle,
+                color=color,
+                linewidth=rf_lw if seg.get("type") == "RF" else tf_lw,
+                transform=plot_transform,
+                zorder=zorder + (1 if phase != FLIGHT_PHASE_CRUISE else 0),
+                label=label,
+            )
+            if phase_group is not None:
+                label_used[phase_group] = True
+            start = end
+
+        if draw_rf_markers and seg.get("type") == "RF":
+            ax.scatter(
+                pts[0, 1], pts[0, 0], s=40, c="yellow", marker=">",
+                edgecolors="k", linewidths=0.6, transform=plot_transform, zorder=zorder + 2,
+            )
+            ax.scatter(
+                pts[-1, 1], pts[-1, 0], s=40, c="yellow", marker="s",
+                edgecolors="k", linewidths=0.6, transform=plot_transform, zorder=zorder + 2,
+            )
+            arc_center = np.asarray(seg.get("arc_center", np.empty(0)), dtype=float).reshape(-1)
+            if arc_center.size >= 2:
+                ax.scatter(
+                    arc_center[1], arc_center[0], s=50, c="white", marker="x",
+                    linewidths=1.5, transform=plot_transform, zorder=zorder + 2,
+                )
+
+
+def _plot_transition_phase_markers(
+    ax,
+    rf,
+    transform=None,
+    zorder=12,
+    labels=False,
+    include_stage1=True,
+    direction=None,
+    general_output=False,
+):
+    """Plot stage-1 boundaries and dynamic final transition endpoints."""
+    plot_transform = ccrs.Geodetic() if transform is None else transform
+    meta = rf.get("transition_meta", {}) if isinstance(rf, dict) else {}
+    structure_mode = str(meta.get("transition_structure_mode", "")).strip().lower()
+
+    takeoff_final = meta.get("takeoff_transition_end")
+    landing_final = meta.get("landing_transition_end")
+    if general_output:
+        if structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY:
+            # General fixed-only figures already draw the single static endpoint pair.
+            takeoff_final = None
+            landing_final = None
+        else:
+            if not bool(meta.get("takeoff_optimized_transition_actual", takeoff_final is not None)):
+                takeoff_final = None
+            if not bool(meta.get("landing_optimized_transition_actual", landing_final is not None)):
+                landing_final = None
+
+    takeoff_stage1 = (
+        meta.get("takeoff_stage1_end")
+        if include_stage1 and float(meta.get("takeoff_stage1_straight_distance_m", 0.0)) > 0.5
+        else None
+    )
+    landing_stage1 = (
+        meta.get("landing_stage1_start")
+        if include_stage1 and float(meta.get("landing_stage1_straight_distance_m", 0.0)) > 0.5
+        else None
+    )
+    marker_specs = [
+        (takeoff_stage1, TAKEOFF_TRANSITION_COLOR, "o", True, "Takeoff Stage1 End"),
+        (landing_stage1, LANDING_TRANSITION_COLOR, "o", True, "Landing Stage1 Start"),
+        (takeoff_final, TAKEOFF_TRANSITION_COLOR, "^", False, "Takeoff Transition End"),
+        (landing_final, LANDING_TRANSITION_COLOR, "v", False, "Landing Transition Start"),
+    ]
+    if direction == "takeoff":
+        marker_specs = [marker_specs[0], marker_specs[2]]
+    elif direction == "landing":
+        marker_specs = [marker_specs[1], marker_specs[3]]
+    solid_points = []
+    for point, _, _, hollow, _ in marker_specs:
+        if hollow or point is None:
+            continue
+        p = np.asarray(point, dtype=float).reshape(-1)
+        if p.size >= 2 and np.all(np.isfinite(p[:2])):
+            solid_points.append(p)
+    seen = []
+    for point, color, marker, hollow, label in marker_specs:
+        if point is None:
+            continue
+        p = np.asarray(point, dtype=float).reshape(-1)
+        if p.size < 2 or not np.all(np.isfinite(p[:2])):
+            continue
+        if hollow and any(
+            _seg_dist_m(np.r_[p[:2], 0.0], np.r_[q[:2], 0.0]) <= 0.5
+            for q in solid_points
+        ):
+            continue
+        duplicate = any(_seg_dist_m(np.r_[p[:2], 0.0], np.r_[q[:2], 0.0]) <= 0.5 for q in seen)
+        if duplicate and hollow:
+            continue
+        seen.append(p)
+        kwargs = {
+            "s": 90,
+            "marker": marker,
+            "linewidths": 1.4 if hollow else 0.7,
+            "transform": plot_transform,
+            "zorder": zorder,
+            "label": label if labels else None,
+        }
+        if hollow:
+            kwargs.update(facecolors="none", edgecolors=color)
+        else:
+            kwargs.update(c=color, edgecolors="k")
+        ax.scatter([p[1]], [p[0]], **kwargs)
+
+
+def _edge_phase_for_transition_v1(point_phases, edge_idx):
+    phases = np.asarray(point_phases, dtype=object).reshape(-1)
+    phase = str(phases[int(edge_idx) + 1])
+    if phase == FLIGHT_PHASE_VERTIPORT:
+        phase = str(phases[int(edge_idx)])
+    return phase
+
+
+def _transition_direction_from_phase_v1(phase):
+    return _transition_direction_from_phase_value_v1(phase)
+
+
+def _moc_envelope_for_cells_v1(moc_risk, cells):
+    """Return the discrete first-clear boundary for unique in-grid MOC cells."""
+    moc = np.asarray(moc_risk, dtype=float)
+    if moc.ndim == 2:
+        moc = moc[:, :, np.newaxis]
+    unique_cells = sorted({(int(row), int(col)) for row, col in cells})
+    if not unique_cells:
+        return {
+            "class": "OUT_OF_GRID",
+            "highest_blocked_agl_m": None,
+            "first_clear_agl_m": None,
+            "required_safe_msl_m": None,
+        }
+    blocked_by_layer = np.zeros(moc.shape[2], dtype=bool)
+    for row, col in unique_cells:
+        blocked_by_layer |= np.asarray(moc[row, col, :] >= 0.5, dtype=bool)
+    blocked_indices = np.flatnonzero(blocked_by_layer)
+    if blocked_indices.size == 0:
+        return {
+            "class": "ALL_CLEAR",
+            "highest_blocked_agl_m": None,
+            "first_clear_agl_m": float(MOC_AGL_LEVELS_M[0]),
+            "required_safe_msl_m": None,
+        }
+    highest_idx = int(blocked_indices[-1])
+    highest_agl_m = float(MOC_AGL_LEVELS_M[highest_idx])
+    if highest_idx >= moc.shape[2] - 1:
+        return {
+            "class": "NO_CLEAR_LAYER",
+            "highest_blocked_agl_m": highest_agl_m,
+            "first_clear_agl_m": None,
+            "required_safe_msl_m": None,
+        }
+    first_clear_agl_m = float(MOC_AGL_LEVELS_M[highest_idx + 1])
+    return {
+        "class": "FINITE_CEILING",
+        "highest_blocked_agl_m": highest_agl_m,
+        "first_clear_agl_m": first_clear_agl_m,
+        "required_safe_msl_m": float(MOC_REFERENCE_MSL_M + first_clear_agl_m),
+    }
+
+
+def _collect_transition_moc_samples_v1(
+    rf,
+    half_width_m,
+    moc_risk,
+    lat_lim,
+    lon_lim,
+    along_step_m=80.0,
+    transition_corridor_cfg=None,
+):
+    """Collect auditable MOC footprint samples for transition TF/RF edges."""
+    records = []
+    cumulative_m = 0.0
+
+    for segment_idx, seg in enumerate(rf.get("segments", []), start=1):
+        pts = np.asarray(seg.get("points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        if pts.shape[0] < 2:
+            continue
+        phases = np.asarray(
+            seg.get(
+                "point_phases",
+                np.full(pts.shape[0], FLIGHT_PHASE_CRUISE, dtype=object),
+            ),
+            dtype=object,
+        ).reshape(-1)
+        if phases.size != pts.shape[0]:
+            raise ValueError(
+                "flight_phase_length_mismatch in transition MOC collection: "
+                f"points={pts.shape[0]}, phases={phases.size}."
+            )
+        valid_point_phases = set(TRANSITION_PHASE_NAMES) | {
+            FLIGHT_PHASE_CRUISE,
+            FLIGHT_PHASE_VERTIPORT,
+        }
+        invalid_phases = sorted({
+            str(value) for value in phases
+            if str(value) not in valid_point_phases
+        })
+        if invalid_phases:
+            raise ValueError(
+                "invalid_flight_phase in transition MOC collection: "
+                + ", ".join(invalid_phases)
+            )
+
+        segment_type = str(seg.get("type", "TF"))
+        turn_radius_m = (
+            float(seg.get("turn_radius"))
+            if segment_type == "RF" and seg.get("turn_radius") is not None
+            else float("nan")
+        )
+        turn_angle_deg = (
+            float(np.rad2deg(float(seg.get("turn_angle", 0.0))))
+            if segment_type == "RF" else float("nan")
+        )
+
+        for edge_idx in range(pts.shape[0] - 1):
+            p1 = pts[edge_idx]
+            p2 = pts[edge_idx + 1]
+            edge_length_m = _seg_dist_m(p1, p2)
+            source_point_phase = str(phases[edge_idx])
+            destination_point_phase = str(phases[edge_idx + 1])
+            phase = _edge_phase_for_transition_v1(phases, edge_idx)
+            direction = _transition_direction_from_phase_v1(phase)
+            if direction is not None:
+                along_sample_idx = -1
+                previous_edge_s_m = None
+                for sample in (
+                    _iter_corridor_moc_samples_v1(
+                        p1,
+                        p2,
+                        half_width_m,
+                        moc_risk,
+                        lat_lim,
+                        lon_lim,
+                        along_step_m=along_step_m,
+                        phase=phase,
+                        transition_corridor_cfg=transition_corridor_cfg,
+                    )
+                ):
+                    (
+                        edge_s_m,
+                        cross_track_m,
+                        tau,
+                        sample_lat,
+                        sample_lon,
+                        altitude_msl_m,
+                        center_layer_idx,
+                        effective_clearance_m,
+                        query_altitude_msl_m,
+                        layer_idx,
+                        grid_row,
+                        grid_col,
+                        in_grid,
+                        blocked,
+                    ) = sample
+                    if (
+                        previous_edge_s_m is None
+                        or abs(float(edge_s_m) - float(previous_edge_s_m)) > 1e-9
+                    ):
+                        along_sample_idx += 1
+                        previous_edge_s_m = float(edge_s_m)
+                    center_lat = float(p1[0] + tau * (p2[0] - p1[0]))
+                    center_lon = float(p1[1] + tau * (p2[1] - p1[1]))
+                    moc_agl_m = float(
+                        MOC_AGL_LEVELS_M[
+                            int(np.clip(layer_idx, 0, len(MOC_AGL_LEVELS_M) - 1))
+                        ]
+                    )
+                    center_moc_agl_m = float(
+                        MOC_AGL_LEVELS_M[
+                            int(np.clip(center_layer_idx, 0, len(MOC_AGL_LEVELS_M) - 1))
+                        ]
+                    )
+                    cell_envelope = _moc_envelope_for_cells_v1(
+                        moc_risk,
+                        [(grid_row, grid_col)] if in_grid else [],
+                    )
+                    records.append({
+                        "Direction": direction,
+                        "Flight_Phase": phase,
+                        "Source_Point_Phase": source_point_phase,
+                        "Destination_Point_Phase": destination_point_phase,
+                        "Segment_Type": segment_type,
+                        "Segment_Index": int(segment_idx),
+                        "Edge_Index": int(edge_idx),
+                        "Along_Sample_Index": int(along_sample_idx),
+                        "Along_Track_m": float(cumulative_m + edge_s_m),
+                        "Direction_Along_Track_m": 0.0,
+                        "Edge_Along_Track_m": float(edge_s_m),
+                        "Cross_Track_Offset_m": float(cross_track_m),
+                        "Center_Lat": center_lat,
+                        "Center_Lon": center_lon,
+                        "Lat": float(sample_lat),
+                        "Lon": float(sample_lon),
+                        "Altitude_MSL_m": float(altitude_msl_m),
+                        "Altitude_AGL_m": float(altitude_msl_m - MOC_REFERENCE_MSL_M),
+                        "Center_Altitude_MSL_m": float(altitude_msl_m),
+                        "Center_Altitude_AGL_m": float(
+                            altitude_msl_m - MOC_REFERENCE_MSL_M
+                        ),
+                        "Selected_MOC_Layer_Index": int(layer_idx),
+                        "Selected_MOC_AGL_m": moc_agl_m,
+                        "MOC_Reference_MSL_m": float(MOC_REFERENCE_MSL_M + moc_agl_m),
+                        "Grid_Row": int(grid_row),
+                        "Grid_Col": int(grid_col),
+                        "Grid_Status": "INSIDE" if in_grid else "OUT_OF_GRID",
+                        "Sample_Status": (
+                            "MOC_INTERSECTION"
+                            if blocked else (
+                                "CLEAR" if in_grid else "OUT_OF_GRID/WARN"
+                            )
+                        ),
+                        "Blocked": bool(blocked),
+                        "RF_Turn_Radius_m": turn_radius_m,
+                        "RF_Turn_Angle_deg": turn_angle_deg,
+                        "Fixed_Stage1": bool(seg.get("is_fixed_transition_stage1", False)),
+                        "Transition_Corridor_Half_Width_m": float(half_width_m),
+                        "Configured_Downward_Clearance_m": float(
+                            (transition_corridor_cfg or {}).get("downward_clearance_m", 0.0)
+                        ),
+                        "Effective_Downward_Clearance_m": float(effective_clearance_m),
+                        "Clearance_Taper_Active": bool(
+                            effective_clearance_m + 1e-9
+                            < float((transition_corridor_cfg or {}).get("downward_clearance_m", 0.0))
+                        ),
+                        "Corridor_Lower_Face_MSL_m": float(query_altitude_msl_m),
+                        "Corridor_Lower_Face_AGL_m": float(
+                            query_altitude_msl_m - MOC_REFERENCE_MSL_M
+                        ),
+                        "MOC_Query_MSL_m": float(query_altitude_msl_m),
+                        "MOC_Query_AGL_m": float(
+                            query_altitude_msl_m - MOC_REFERENCE_MSL_M
+                        ),
+                        "Center_MOC_Layer_Index": int(center_layer_idx),
+                        "Center_MOC_AGL_m": center_moc_agl_m,
+                        "Center_MOC_Reference_MSL_m": float(
+                            MOC_REFERENCE_MSL_M + center_moc_agl_m
+                        ),
+                        "Clearance_MOC_Layer_Index": int(layer_idx),
+                        "Clearance_MOC_AGL_m": moc_agl_m,
+                        "Clearance_MOC_Reference_MSL_m": float(
+                            MOC_REFERENCE_MSL_M + moc_agl_m
+                        ),
+                        "Cell_MOC_Envelope_Class": str(cell_envelope["class"]),
+                        "Cell_Highest_Blocked_MOC_AGL_m": cell_envelope[
+                            "highest_blocked_agl_m"
+                        ],
+                        "Cell_First_Clear_MOC_AGL_m": cell_envelope[
+                            "first_clear_agl_m"
+                        ],
+                        "Cell_Required_Safe_MSL_m": cell_envelope[
+                            "required_safe_msl_m"
+                        ],
+                    })
+            cumulative_m += edge_length_m
+
+    columns = [
+        "Direction", "Flight_Phase", "Source_Point_Phase",
+        "Destination_Point_Phase", "Segment_Type", "Segment_Index",
+        "Edge_Index", "Along_Sample_Index", "Along_Track_m",
+        "Direction_Along_Track_m", "Edge_Along_Track_m",
+        "Cross_Track_Offset_m", "Center_Lat", "Center_Lon", "Lat", "Lon",
+        "Altitude_MSL_m", "Altitude_AGL_m", "Selected_MOC_Layer_Index",
+        "Center_Altitude_MSL_m", "Center_Altitude_AGL_m",
+        "Selected_MOC_AGL_m", "MOC_Reference_MSL_m", "Grid_Row", "Grid_Col",
+        "Grid_Status", "Sample_Status", "Blocked", "RF_Turn_Radius_m",
+        "RF_Turn_Angle_deg", "Fixed_Stage1",
+        "Transition_Corridor_Half_Width_m",
+        "Configured_Downward_Clearance_m",
+        "Effective_Downward_Clearance_m", "Clearance_Taper_Active",
+        "Corridor_Lower_Face_MSL_m", "Corridor_Lower_Face_AGL_m",
+        "MOC_Query_MSL_m", "MOC_Query_AGL_m",
+        "Center_MOC_Layer_Index", "Center_MOC_AGL_m",
+        "Center_MOC_Reference_MSL_m", "Clearance_MOC_Layer_Index",
+        "Clearance_MOC_AGL_m", "Clearance_MOC_Reference_MSL_m",
+        "Cell_MOC_Envelope_Class", "Cell_Highest_Blocked_MOC_AGL_m",
+        "Cell_First_Clear_MOC_AGL_m", "Cell_Required_Safe_MSL_m",
+    ]
+    df = pd.DataFrame(records, columns=columns)
+    if not df.empty:
+        # Adjacent TF/RF edges legitimately use different cross-track normals.
+        # Remove only physically identical endpoint samples; keep distinct RF
+        # boundary footprint samples even when they round to the same grid cell.
+        df["_Dedup_Along_m"] = np.round(df["Along_Track_m"].to_numpy(dtype=float), 3)
+        df["_Dedup_Lat"] = np.round(df["Lat"].to_numpy(dtype=float), 10)
+        df["_Dedup_Lon"] = np.round(df["Lon"].to_numpy(dtype=float), 10)
+        df["_Dedup_Alt_m"] = np.round(df["Altitude_MSL_m"].to_numpy(dtype=float), 6)
+        df = df.drop_duplicates(
+            [
+                "Direction",
+                "_Dedup_Along_m",
+                "_Dedup_Lat",
+                "_Dedup_Lon",
+                "_Dedup_Alt_m",
+                "Selected_MOC_Layer_Index",
+                "Grid_Status",
+            ],
+            keep="first",
+        ).drop(
+            columns=["_Dedup_Along_m", "_Dedup_Lat", "_Dedup_Lon", "_Dedup_Alt_m"]
+        ).reset_index(drop=True)
+        for direction in ("takeoff", "landing"):
+            mask = df["Direction"].eq(direction)
+            if bool(mask.any()):
+                start_m = float(df.loc[mask, "Along_Track_m"].min())
+                df.loc[mask, "Direction_Along_Track_m"] = (
+                    df.loc[mask, "Along_Track_m"] - start_m
+                )
+        df["_Station_Key_m"] = np.round(
+            df["Direction_Along_Track_m"].to_numpy(dtype=float), 3
+        )
+        df["Direction_Station_Index"] = -1
+        df["Station_MOC_Envelope_Class"] = "OUT_OF_GRID"
+        df["Station_Highest_Blocked_MOC_AGL_m"] = np.nan
+        df["Station_First_Clear_MOC_AGL_m"] = np.nan
+        df["Station_Required_Safe_MSL_m"] = np.nan
+        df["Station_Vertical_Margin_m"] = np.nan
+        df["Station_3D_Status"] = "OUT_OF_GRID/WARN"
+        for direction in ("takeoff", "landing"):
+            station_no = 0
+            direction_rows = df.loc[df["Direction"].eq(direction)]
+            for station_key, station_rows in direction_rows.groupby(
+                "_Station_Key_m", sort=True
+            ):
+                station_no += 1
+                station_index = station_rows.index
+                cells = [
+                    (row, col)
+                    for row, col, in_grid in zip(
+                        station_rows["Grid_Row"],
+                        station_rows["Grid_Col"],
+                        station_rows["Grid_Status"].eq("INSIDE"),
+                    )
+                    if bool(in_grid)
+                ]
+                envelope = _moc_envelope_for_cells_v1(moc_risk, cells)
+                lower_face_msl = float(
+                    station_rows["Corridor_Lower_Face_MSL_m"].min()
+                )
+                required_safe_msl = envelope["required_safe_msl_m"]
+                margin_m = (
+                    None
+                    if required_safe_msl is None
+                    else float(lower_face_msl - float(required_safe_msl))
+                )
+                any_blocked = bool(station_rows["Blocked"].any())
+                any_out = bool(station_rows["Grid_Status"].ne("INSIDE").any())
+                if envelope["class"] == "NO_CLEAR_LAYER":
+                    station_status = "NO_CLEAR_LAYER/FAIL"
+                elif any_blocked:
+                    station_status = "MOC_INTERSECTION/FAIL"
+                elif any_out:
+                    station_status = "OUT_OF_GRID/WARN"
+                elif margin_m is not None and margin_m < -1e-6:
+                    station_status = "MOC_INTERSECTION/FAIL"
+                elif margin_m is not None and abs(margin_m) <= 1e-6:
+                    station_status = "EXACT_LIMIT/PASS"
+                elif envelope["class"] == "ALL_CLEAR":
+                    station_status = "ALL_CLEAR/PASS"
+                else:
+                    station_status = "CLEAR/PASS"
+                df.loc[station_index, "Direction_Station_Index"] = int(station_no)
+                df.loc[station_index, "Station_MOC_Envelope_Class"] = str(
+                    envelope["class"]
+                )
+                for column_name, value in (
+                    ("Station_Highest_Blocked_MOC_AGL_m", envelope["highest_blocked_agl_m"]),
+                    ("Station_First_Clear_MOC_AGL_m", envelope["first_clear_agl_m"]),
+                    ("Station_Required_Safe_MSL_m", required_safe_msl),
+                    ("Station_Vertical_Margin_m", margin_m),
+                ):
+                    if value is not None:
+                        df.loc[station_index, column_name] = float(value)
+                df.loc[station_index, "Station_3D_Status"] = station_status
+        df = df.drop(columns=["_Station_Key_m"])
+    return df
+
+
+def _transition_moc_checker_hit_v1(
+    rf,
+    half_width_m,
+    moc_risk,
+    lat_lim,
+    lon_lim,
+    along_step_m=80.0,
+    transition_corridor_cfg=None,
+):
+    """Re-run the binary checker on transition edges only for audit matching."""
+    for seg in rf.get("segments", []):
+        pts = np.asarray(seg.get("points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        if pts.shape[0] < 2:
+            continue
+        phases = np.asarray(
+            seg.get(
+                "point_phases",
+                np.full(pts.shape[0], FLIGHT_PHASE_CRUISE, dtype=object),
+            ),
+            dtype=object,
+        ).reshape(-1)
+        if phases.size != pts.shape[0]:
+            raise ValueError(
+                "flight_phase_length_mismatch in transition MOC checker."
+            )
+        for edge_idx in range(pts.shape[0] - 1):
+            phase = _edge_phase_for_transition_v1(phases, edge_idx)
+            if _transition_direction_from_phase_v1(phase) is None:
+                continue
+            if _corridor_hits_moc_v1(
+                pts[edge_idx],
+                pts[edge_idx + 1],
+                half_width_m,
+                moc_risk,
+                lat_lim,
+                lon_lim,
+                along_step_m=along_step_m,
+                phase=phase,
+                transition_corridor_cfg=transition_corridor_cfg,
+            ):
+                return True
+    return False
+
+
+def _full_path_moc_checker_hit_v1(
+    rf,
+    cruise_half_width_m,
+    transition_corridor_cfg,
+    moc_risk,
+    lat_lim,
+    lon_lim,
+    along_step_m=80.0,
+):
+    for seg in rf.get("segments", []):
+        points = np.asarray(seg.get("points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        if points.shape[0] < 2:
+            continue
+        phases = np.asarray(seg.get("point_phases", np.empty((0,), dtype=object)), dtype=object).reshape(-1)
+        if phases.size != points.shape[0]:
+            raise ValueError("flight_phase_length_mismatch in full-path MOC checker.")
+        for edge_idx in range(points.shape[0] - 1):
+            phase = _edge_phase_for_transition_v1(phases, edge_idx)
+            half_width_m = _edge_corridor_half_width_v1(
+                phase,
+                cruise_half_width_m,
+                transition_corridor_cfg,
+            )
+            if _corridor_hits_moc_v1(
+                points[edge_idx],
+                points[edge_idx + 1],
+                half_width_m,
+                moc_risk,
+                lat_lim,
+                lon_lim,
+                along_step_m=along_step_m,
+                phase=phase,
+                transition_corridor_cfg=transition_corridor_cfg,
+            ):
+                return True
+    return False
+
+
+def _moc_diagnostic_status_v1(layer_rows, moc_enforced):
+    hits = int(np.count_nonzero(layer_rows["Blocked"].to_numpy(dtype=bool)))
+    out_of_grid = int(np.count_nonzero(layer_rows["Grid_Status"].ne("INSIDE")))
+    if not bool(moc_enforced):
+        return "NOT ENFORCED", hits, out_of_grid
+    if hits > 0:
+        return "FAIL", hits, out_of_grid
+    if out_of_grid > 0:
+        return "WARN", hits, out_of_grid
+    return "PASS", hits, out_of_grid
+
+
+def _build_transition_3d_validation_v1(
+    rf,
+    cruise_half_width_m,
+    transition_corridor_cfg,
+    moc_risk,
+    moc_enforced,
+    lat_lim,
+    lon_lim,
+    forbidden_zones,
+    check_corridor_nfz,
+    check_corridor_self_overlap,
+    airspace_audit,
+):
+    transition_corridor_cfg = _validate_transition_corridor_cfg_v1(
+        transition_corridor_cfg
+    )
+    if not bool(transition_corridor_cfg.get("enabled", False)):
+        direction_status = {
+            "status": "NOT APPLICABLE",
+            "moc_status": "NOT APPLICABLE",
+            "nfz_status": "NOT APPLICABLE",
+            "airspace_status": "NOT APPLICABLE",
+            "self_overlap_status": "NOT APPLICABLE",
+            "fail_reasons": [],
+        }
+        return {
+            "status": "NOT APPLICABLE",
+            "reason": "transition_disabled",
+            "moc_status": "NOT APPLICABLE",
+            "nfz_status": "NOT APPLICABLE",
+            "airspace_status": "NOT APPLICABLE",
+            "self_overlap_status": "NOT APPLICABLE",
+            "directions": {
+                "takeoff": dict(direction_status),
+                "landing": dict(direction_status),
+            },
+        }
+    half_width_m = float(transition_corridor_cfg["half_width_m"])
+    samples = _collect_transition_moc_samples_v1(
+        rf,
+        half_width_m,
+        moc_risk,
+        lat_lim,
+        lon_lim,
+        transition_corridor_cfg=transition_corridor_cfg,
+    )
+    if samples.empty:
+        return {
+            "status": "FAIL",
+            "reason": "transition_moc_samples_missing",
+            "directions": {},
+        }
+    moc_status, hit_count, out_count = _moc_diagnostic_status_v1(samples, moc_enforced)
+    transition_checker_hit = _transition_moc_checker_hit_v1(
+        rf,
+        half_width_m,
+        moc_risk,
+        lat_lim,
+        lon_lim,
+        transition_corridor_cfg=transition_corridor_cfg,
+    )
+    checker_match = bool(bool(samples["Blocked"].any()) == bool(transition_checker_hit))
+    full_path = np.asarray(rf.get("path", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+    edge_phases = _edge_phase_values_v1(
+        full_path, rf.get("flight_phases"), transition_corridor_cfg
+    )
+    if bool(check_corridor_nfz):
+        nfz_ok, nfz_reason = _phase_specific_nfz_hit_v1(
+            full_path,
+            edge_phases,
+            cruise_half_width_m,
+            transition_corridor_cfg,
+            forbidden_zones,
+        )
+        nfz_status = "PASS" if nfz_ok else "FAIL"
+    else:
+        nfz_status, nfz_reason = "NOT ENFORCED", "not_enforced"
+    if bool(check_corridor_self_overlap):
+        self_hit, self_reason = _phase_specific_self_overlap_v1(
+            full_path,
+            edge_phases,
+            cruise_half_width_m,
+            transition_corridor_cfg,
+        )
+        self_status = "FAIL" if self_hit else "PASS"
+    else:
+        self_status, self_reason = "NOT ENFORCED", "not_enforced"
+    air_status = str((airspace_audit or {}).get("status", "UNKNOWN"))
+
+    if (
+        (bool(moc_enforced) and moc_status == "FAIL")
+        or nfz_status == "FAIL"
+        or self_status == "FAIL" or air_status == "FAIL"
+        or not checker_match
+    ):
+        overall_status = "FAIL"
+    elif not bool(moc_enforced):
+        overall_status = "NOT ENFORCED"
+    elif moc_status == "WARN" or air_status in ("WARN", "UNKNOWN"):
+        overall_status = "WARN"
+    else:
+        overall_status = "PASS"
+
+    directions = {}
+    for direction in ("takeoff", "landing"):
+        direction_rows = samples.loc[samples["Direction"].eq(direction)]
+        station_rows = _transition_station_rows_v1(samples, direction)
+        direction_moc_status, direction_hits, direction_out = _moc_diagnostic_status_v1(
+            direction_rows, moc_enforced
+        )
+        finite_margins = pd.to_numeric(
+            station_rows["Station_Vertical_Margin_m"], errors="coerce"
+        ).dropna()
+        no_clear_rows = station_rows.loc[
+            station_rows["Station_MOC_Envelope_Class"].eq("NO_CLEAR_LAYER")
+        ]
+        minimum_margin_location = None
+        minimum_margin_value = None
+        minimum_margin_status = "UNAVAILABLE"
+        if not no_clear_rows.empty:
+            worst_row = no_clear_rows.iloc[0]
+            minimum_margin_status = "NO_CLEAR_LAYER/FAIL"
+            minimum_margin_location = {
+                "direction_along_track_m": float(
+                    worst_row["Direction_Along_Track_m"]
+                ),
+                "center_lat": float(worst_row["Center_Lat"]),
+                "center_lon": float(worst_row["Center_Lon"]),
+                "center_msl_m": float(worst_row["Center_Altitude_MSL_m"]),
+                "lower_face_msl_m": float(
+                    worst_row["Corridor_Lower_Face_MSL_m"]
+                ),
+                "required_safe_msl_m": None,
+                "envelope_class": "NO_CLEAR_LAYER",
+            }
+        elif not finite_margins.empty:
+            worst_idx = finite_margins.idxmin()
+            worst_row = station_rows.loc[worst_idx]
+            minimum_margin_value = float(finite_margins.loc[worst_idx])
+            minimum_margin_status = str(worst_row["Station_3D_Status"])
+            minimum_margin_location = {
+                "direction_along_track_m": float(
+                    worst_row["Direction_Along_Track_m"]
+                ),
+                "center_lat": float(worst_row["Center_Lat"]),
+                "center_lon": float(worst_row["Center_Lon"]),
+                "center_msl_m": float(worst_row["Center_Altitude_MSL_m"]),
+                "lower_face_msl_m": float(
+                    worst_row["Corridor_Lower_Face_MSL_m"]
+                ),
+                "required_safe_msl_m": float(
+                    worst_row["Station_Required_Safe_MSL_m"]
+                ),
+            }
+        direction_air_audit = (
+            (airspace_audit or {}).get("directions", {}).get(direction, {})
+        )
+        direction_air_status = str(direction_air_audit.get("status", "UNKNOWN"))
+        direction_air_reason = str(direction_air_audit.get("reason", "unknown"))
+        if not bool(check_corridor_nfz):
+            direction_nfz_status, direction_nfz_reason = (
+                "NOT ENFORCED", "not_enforced"
+            )
+        else:
+            direction_nfz_ok, direction_nfz_reason = _phase_specific_nfz_hit_v1(
+                full_path,
+                edge_phases,
+                cruise_half_width_m,
+                transition_corridor_cfg,
+                forbidden_zones,
+                direction_filter=direction,
+            )
+            direction_nfz_status = "PASS" if direction_nfz_ok else "FAIL"
+        if not bool(check_corridor_self_overlap):
+            direction_self_status, direction_self_reason = (
+                "NOT ENFORCED", "not_enforced"
+            )
+        else:
+            direction_self_hit, direction_self_reason = (
+                _phase_specific_self_overlap_v1(
+                    full_path,
+                    edge_phases,
+                    cruise_half_width_m,
+                    transition_corridor_cfg,
+                    direction_filter=direction,
+                )
+            )
+            direction_self_status = "FAIL" if direction_self_hit else "PASS"
+        direction_fail_reasons = []
+        for status_value, reason_value in (
+            (direction_moc_status, f"{direction}_transition_moc_3d_intersection"),
+            (direction_nfz_status, direction_nfz_reason),
+            (direction_air_status, direction_air_reason),
+            (direction_self_status, direction_self_reason),
+        ):
+            if status_value == "FAIL":
+                direction_fail_reasons.append(str(reason_value))
+        if (
+            direction_moc_status == "FAIL"
+            or direction_nfz_status == "FAIL"
+            or direction_air_status == "FAIL"
+            or direction_self_status == "FAIL"
+        ):
+            direction_status = "FAIL"
+        elif direction_moc_status in ("WARN", "NOT ENFORCED") or direction_air_status == "UNKNOWN":
+            direction_status = direction_moc_status
+        else:
+            direction_status = "PASS"
+        effective_clearances = pd.to_numeric(
+            station_rows["Effective_Downward_Clearance_m"], errors="coerce"
+        ).dropna()
+        directions[direction] = {
+            "status": str(direction_status),
+            "moc_status": str(direction_moc_status),
+            "nfz_status": str(direction_nfz_status),
+            "airspace_status": str(direction_air_status),
+            "self_overlap_status": str(direction_self_status),
+            "fail_reasons": direction_fail_reasons,
+            "station_count": int(station_rows.shape[0]),
+            "sample_count": int(direction_rows.shape[0]),
+            "hit_count": int(direction_hits),
+            "out_of_grid_count": int(direction_out),
+            "minimum_vertical_margin_m": minimum_margin_value,
+            "minimum_vertical_margin_status": minimum_margin_status,
+            "minimum_vertical_margin_location": minimum_margin_location,
+            "effective_downward_clearance_min_m": (
+                None if effective_clearances.empty else float(effective_clearances.min())
+            ),
+            "effective_downward_clearance_max_m": (
+                None if effective_clearances.empty else float(effective_clearances.max())
+            ),
+        }
+    return {
+        "status": str(overall_status),
+        "reason": "ok" if overall_status == "PASS" else "see_constraint_status",
+        "transition_corridor_half_width_m": half_width_m,
+        "transition_vertical_clearance_m": float(
+            transition_corridor_cfg["downward_clearance_m"]
+        ),
+        "moc_status": str(moc_status),
+        "moc_hit_count": int(hit_count),
+        "moc_out_of_grid_count": int(out_count),
+        "moc_checker_match": bool(checker_match),
+        "effective_clearance_formula": (
+            "min(configured_clearance, max(0, center_MSL - direction_vertiport_MSL))"
+        ),
+        "lower_face_formula": "center_MSL - effective_clearance",
+        "applied_phases": [str(value) for value in TRANSITION_PHASE_NAMES],
+        "applied_constraints": ["MOC", "NFZ", "airspace", "self_overlap"],
+        "nfz_status": str(nfz_status),
+        "nfz_reason": str(nfz_reason),
+        "airspace_status": str(air_status),
+        "airspace_reason": str((airspace_audit or {}).get("reason", "unknown")),
+        "self_overlap_status": str(self_status),
+        "self_overlap_reason": str(self_reason),
+        "directions": directions,
+    }
+
+
+def _transition_centerline_rows_v1(sample_df, direction=None, layer_idx=None):
+    rows = sample_df
+    if direction is not None:
+        rows = rows.loc[rows["Direction"].eq(str(direction))]
+    if layer_idx is not None:
+        rows = rows.loc[rows["Selected_MOC_Layer_Index"].eq(int(layer_idx))]
+    if rows.empty:
+        return rows.copy()
+    keys = ["Direction", "Segment_Index", "Edge_Index", "Along_Sample_Index"]
+    return (
+        rows.sort_values(["Along_Track_m", "Segment_Index", "Edge_Index", "Along_Sample_Index"])
+        .drop_duplicates(keys, keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def _transition_station_rows_v1(sample_df, direction):
+    rows = sample_df.loc[sample_df["Direction"].eq(str(direction))]
+    if rows.empty:
+        return rows.copy()
+    return (
+        rows.sort_values(
+            ["Direction_Along_Track_m", "Segment_Index", "Edge_Index", "Along_Sample_Index"]
+        )
+        .drop_duplicates(["Direction", "Direction_Station_Index"], keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def _transition_profile_edges_v1(rf, direction):
+    """Return exact transition-edge distance/phase geometry for the side profile."""
+    direction = str(direction)
+    cumulative_m = 0.0
+    records = []
+    for segment_idx, seg in enumerate(rf.get("segments", []), start=1):
+        points = np.asarray(
+            seg.get("points", np.empty((0, 3))), dtype=float
+        ).reshape(-1, 3)
+        if points.shape[0] < 2:
+            continue
+        phases = np.asarray(
+            seg.get("point_phases", np.empty((0,), dtype=object)), dtype=object
+        ).reshape(-1)
+        if phases.size != points.shape[0]:
+            raise ValueError("flight_phase_length_mismatch in transition profile edges")
+        for edge_idx in range(points.shape[0] - 1):
+            edge_length_m = float(_seg_dist_m(points[edge_idx], points[edge_idx + 1]))
+            phase = _edge_phase_for_transition_v1(phases, edge_idx)
+            if _transition_direction_from_phase_v1(phase) == direction:
+                records.append({
+                    "segment_index": int(segment_idx),
+                    "segment_type": str(seg.get("type", "TF")),
+                    "flight_phase": str(phase),
+                    "global_start_m": float(cumulative_m),
+                    "global_end_m": float(cumulative_m + edge_length_m),
+                    "start_msl_m": float(points[edge_idx, 2]),
+                    "end_msl_m": float(points[edge_idx + 1, 2]),
+                })
+            cumulative_m += edge_length_m
+    if not records:
+        return records
+    origin_m = float(min(item["global_start_m"] for item in records))
+    for item in records:
+        item["direction_start_m"] = float(item["global_start_m"] - origin_m)
+        item["direction_end_m"] = float(item["global_end_m"] - origin_m)
+    return records
+
+
+def _transition_moc_extent_v1(sample_df, direction, fallback_extent):
+    rows = sample_df.loc[sample_df["Direction"].eq(str(direction))]
+    if rows.empty:
+        return [float(v) for v in fallback_extent]
+    lat_min = float(rows["Lat"].min())
+    lat_max = float(rows["Lat"].max())
+    lon_min = float(rows["Lon"].min())
+    lon_max = float(rows["Lon"].max())
+    mean_lat = 0.5 * (lat_min + lat_max)
+    span_lat_m = max(1.0, (lat_max - lat_min) * 111000.0)
+    span_lon_m = max(
+        1.0,
+        (lon_max - lon_min) * 111000.0 * np.cos(np.deg2rad(mean_lat)),
+    )
+    pad_m = max(300.0, 0.08 * max(span_lat_m, span_lon_m))
+    pad_lat = pad_m / 111000.0
+    pad_lon = pad_m / max(1.0, 111000.0 * np.cos(np.deg2rad(mean_lat)))
+    return [lon_min - pad_lon, lon_max + pad_lon, lat_min - pad_lat, lat_max + pad_lat]
+
+
+def _plot_moc_transition_layer_axis_v1(
+    ax,
+    request,
+    extent,
+    rf,
+    sample_df,
+    direction,
+    layer_idx,
+    moc_risk,
+    moc_enforced,
+    half_width_m,
+    lat_lim,
+    lon_lim,
+    airspace_center_lla,
+    airspace_radius_m,
+    forbidden_zones,
+    start_vertiport,
+    end_vertiport,
+    compact=False,
+):
+    """Draw one direction/layer MOC footprint panel from checker samples."""
+    direction = str(direction)
+    layer_idx = int(layer_idx)
+    direction_label = "Takeoff" if direction == "takeoff" else "Landing"
+    direction_color = (
+        TAKEOFF_TRANSITION_COLOR
+        if direction == "takeoff" else LANDING_TRANSITION_COLOR
+    )
+    moc = np.asarray(moc_risk, dtype=float)
+    if moc.ndim == 2:
+        moc = moc[:, :, np.newaxis]
+    layer_idx = int(np.clip(layer_idx, 0, moc.shape[2] - 1))
+    moc_agl_m = float(
+        MOC_AGL_LEVELS_M[int(np.clip(layer_idx, 0, len(MOC_AGL_LEVELS_M) - 1))]
+    )
+    layer_rows = sample_df.loc[
+        sample_df["Direction"].eq(direction)
+        & sample_df["Selected_MOC_Layer_Index"].eq(layer_idx)
+    ].copy()
+    center_all = _transition_centerline_rows_v1(sample_df, direction=direction)
+    center_active = _transition_centerline_rows_v1(
+        sample_df, direction=direction, layer_idx=layer_idx
+    )
+    status, hit_count, out_of_grid_count = _moc_diagnostic_status_v1(
+        layer_rows, moc_enforced
+    )
+    tested_count = int(np.count_nonzero(layer_rows["Grid_Status"].eq("INSIDE")))
+
+    ax.set_extent([float(v) for v in extent])
+    ax.add_image(request, 13)
+    draw_vertiport_radius_rings(
+        ax, airspace_center_lla, radii_m=(float(airspace_radius_m),)
+    )
+    plot_forbidden_zones(
+        ax, forbidden_zones, face_alpha=0.10, edge_alpha=0.80
+    )
+    plot_moc_binary_overlay(
+        ax,
+        moc[:, :, layer_idx],
+        lat_lim,
+        lon_lim,
+        label=f"MOC=1 AGL{int(moc_agl_m)}m",
+        fill_color="magenta",
+        fill_alpha=0.24,
+    )
+
+    if not center_all.empty:
+        ax.plot(
+            center_all["Center_Lon"].to_numpy(dtype=float),
+            center_all["Center_Lat"].to_numpy(dtype=float),
+            color="dimgray",
+            linewidth=1.1,
+            alpha=0.55,
+            transform=ccrs.Geodetic(),
+            zorder=5,
+            label=f"Full {direction_label} Transition" if not compact else None,
+        )
+
+    if not center_active.empty:
+        for (_, _, _), edge_rows in center_active.groupby(
+            ["Segment_Index", "Segment_Type", "Flight_Phase"], sort=False
+        ):
+            edge_rows = edge_rows.sort_values("Direction_Along_Track_m")
+            pts = np.column_stack([
+                edge_rows["Center_Lat"].to_numpy(dtype=float),
+                edge_rows["Center_Lon"].to_numpy(dtype=float),
+                edge_rows["Altitude_MSL_m"].to_numpy(dtype=float),
+            ])
+            segment_type = str(edge_rows["Segment_Type"].iloc[0])
+            phase = str(edge_rows["Flight_Phase"].iloc[0])
+            linestyle = "-"
+            linewidth = 3.0 if segment_type == "RF" else 1.9
+            if pts.shape[0] >= 2:
+                plot_corridor_width(
+                    ax,
+                    pts,
+                    float(half_width_m),
+                    color=direction_color,
+                    alpha=0.12,
+                )
+                ax.plot(
+                    pts[:, 1],
+                    pts[:, 0],
+                    linestyle=linestyle,
+                    color=direction_color,
+                    linewidth=linewidth,
+                    transform=ccrs.Geodetic(),
+                    zorder=9,
+                )
+            else:
+                ax.scatter(
+                    pts[:, 1],
+                    pts[:, 0],
+                    s=18,
+                    c=direction_color,
+                    marker="o",
+                    transform=ccrs.Geodetic(),
+                    zorder=9,
+                )
+
+        ax.plot(
+            [], [], "-", color=direction_color, linewidth=1.9,
+            label=f"{direction_label} TF / Stage2" if not compact else None,
+        )
+        ax.plot(
+            [], [], "--", color=direction_color, linewidth=1.9,
+            label=f"{direction_label} Stage1" if not compact else None,
+        )
+        ax.plot(
+            [], [], "-", color=direction_color, linewidth=3.0,
+            label=f"{direction_label} RF" if not compact else None,
+        )
+
+    inside_clear = layer_rows.loc[
+        layer_rows["Grid_Status"].eq("INSIDE") & ~layer_rows["Blocked"]
+    ]
+    if not inside_clear.empty:
+        ax.scatter(
+            inside_clear["Lon"], inside_clear["Lat"],
+            s=5, c="slategray", alpha=0.28, marker=".",
+            transform=ccrs.Geodetic(), zorder=7,
+            label="Checked footprint" if not compact else None,
+        )
+    blocked_rows = layer_rows.loc[layer_rows["Blocked"]]
+    if not blocked_rows.empty:
+        grid_lat_step = (
+            (float(lat_lim[1]) - float(lat_lim[0])) / (moc.shape[0] - 1)
+            if moc.shape[0] > 1 else 0.0
+        )
+        grid_lon_step = (
+            (float(lon_lim[1]) - float(lon_lim[0])) / (moc.shape[1] - 1)
+            if moc.shape[1] > 1 else 0.0
+        )
+        for _, cell in blocked_rows.drop_duplicates(
+            ["Grid_Row", "Grid_Col"]
+        ).iterrows():
+            cell_lat = float(lat_lim[0]) + float(cell["Grid_Row"]) * grid_lat_step
+            cell_lon = float(lon_lim[0]) + float(cell["Grid_Col"]) * grid_lon_step
+            ax.fill(
+                [
+                    cell_lon - 0.5 * grid_lon_step,
+                    cell_lon + 0.5 * grid_lon_step,
+                    cell_lon + 0.5 * grid_lon_step,
+                    cell_lon - 0.5 * grid_lon_step,
+                ],
+                [
+                    cell_lat - 0.5 * grid_lat_step,
+                    cell_lat - 0.5 * grid_lat_step,
+                    cell_lat + 0.5 * grid_lat_step,
+                    cell_lat + 0.5 * grid_lat_step,
+                ],
+                facecolor="red",
+                edgecolor="red",
+                linewidth=0.8,
+                alpha=0.24,
+                transform=ccrs.PlateCarree(),
+                zorder=12,
+            )
+        ax.scatter(
+            blocked_rows["Lon"], blocked_rows["Lat"],
+            s=44, c="red", marker="x", linewidths=1.2,
+            transform=ccrs.Geodetic(), zorder=13,
+            label="MOC hit" if not compact else None,
+        )
+    outside_rows = layer_rows.loc[layer_rows["Grid_Status"].ne("INSIDE")]
+    if not outside_rows.empty:
+        ax.scatter(
+            outside_rows["Lon"], outside_rows["Lat"],
+            s=30, c="darkorange", marker="^", edgecolors="k", linewidths=0.3,
+            transform=ccrs.Geodetic(), zorder=13,
+            label="Out of evaluation grid" if not compact else None,
+        )
+
+    active_rf_indices = sorted({
+        int(v)
+        for v in center_active.loc[
+            center_active["Segment_Type"].eq("RF"), "Segment_Index"
+        ].tolist()
+    })
+    for marker_idx, segment_idx in enumerate(active_rf_indices):
+        if not 1 <= segment_idx <= len(rf.get("segments", [])):
+            continue
+        seg = rf["segments"][segment_idx - 1]
+        pts = np.asarray(seg.get("points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+        if pts.shape[0] == 0:
+            continue
+        center = np.asarray(seg.get("arc_center", np.empty((0,))), dtype=float).reshape(-1)
+        ax.scatter(
+            [pts[0, 1]], [pts[0, 0]], s=38, c="yellow", marker=">",
+            edgecolors="k", linewidths=0.5, transform=ccrs.Geodetic(), zorder=12,
+            label=("RF segment start" if marker_idx == 0 and not compact else None),
+        )
+        ax.scatter(
+            [pts[-1, 1]], [pts[-1, 0]], s=38, c="yellow", marker="s",
+            edgecolors="k", linewidths=0.5, transform=ccrs.Geodetic(), zorder=12,
+            label=("RF segment end" if marker_idx == 0 and not compact else None),
+        )
+        if center.size >= 2:
+            active_seg_rows = center_active.loc[
+                center_active["Segment_Index"].eq(segment_idx)
+            ]
+            anchor = active_seg_rows.iloc[0]
+            ax.plot(
+                [center[1], float(anchor["Center_Lon"])],
+                [center[0], float(anchor["Center_Lat"])],
+                ":", color="goldenrod", linewidth=0.8,
+                transform=ccrs.Geodetic(), zorder=10,
+            )
+            ax.scatter(
+                [center[1]], [center[0]], s=44, c="white", marker="x",
+                linewidths=1.3, transform=ccrs.Geodetic(), zorder=12,
+                label=("RF center" if marker_idx == 0 and not compact else None),
+            )
+            if not compact:
+                ax.text(
+                    center[1], center[0],
+                    f" R={float(seg.get('turn_radius', 0.0)):.0f}m",
+                    fontsize=6, color="black", transform=ccrs.Geodetic(), zorder=13,
+                )
+
+    _plot_transition_phase_markers(
+        ax,
+        rf,
+        transform=ccrs.Geodetic(),
+        zorder=14,
+        labels=not compact,
+        include_stage1=True,
+        direction=direction,
+    )
+    port = start_vertiport if direction == "takeoff" else end_vertiport
+    ax.scatter(
+        [port[1]], [port[0]],
+        s=88 if not compact else 45,
+        c="red" if direction == "takeoff" else "crimson",
+        edgecolors="k",
+        marker="s" if direction == "takeoff" else "D",
+        transform=ccrs.Geodetic(),
+        zorder=14,
+        label=(f"{direction_label} Vertiport" if not compact else None),
+    )
+
+    alt_min = float(layer_rows["Altitude_MSL_m"].min())
+    alt_max = float(layer_rows["Altitude_MSL_m"].max())
+    lower_min = float(layer_rows["Corridor_Lower_Face_MSL_m"].min())
+    lower_max = float(layer_rows["Corridor_Lower_Face_MSL_m"].max())
+    ax.set_title(
+        (
+            f"{direction_label} | MOC AGL{int(moc_agl_m)}m\n"
+            f"Applied path MSL {alt_min:.1f}-{alt_max:.1f}m | "
+            f"lower face MSL {lower_min:.1f}-{lower_max:.1f}m | "
+            f"{status}: hits {hit_count}/{tested_count}, out {out_of_grid_count}"
+        ),
+        fontsize=8 if compact else 10,
+    )
+    if not compact:
+        ax.legend(
+            loc="center left", bbox_to_anchor=(1.01, 0.5),
+            fontsize=7, framealpha=0.9,
+        )
+
+
+def _plot_transition_moc_profile_axis_v1(
+    ax,
+    sample_df,
+    direction,
+    rf,
+    moc_enforced,
+):
+    direction = str(direction)
+    direction_label = "Takeoff" if direction == "takeoff" else "Landing"
+    direction_color = (
+        TAKEOFF_TRANSITION_COLOR
+        if direction == "takeoff" else LANDING_TRANSITION_COLOR
+    )
+    station_rows = _transition_station_rows_v1(sample_df, direction)
+    if station_rows.empty:
+        ax.text(0.5, 0.5, f"No {direction_label.lower()} transition samples", ha="center", va="center")
+        ax.set_axis_off()
+        return
+
+    station_rows = station_rows.sort_values("Direction_Along_Track_m")
+    profile_edges = _transition_profile_edges_v1(rf, direction)
+    x = station_rows["Direction_Along_Track_m"].to_numpy(dtype=float)
+    center_msl = station_rows["Altitude_MSL_m"].to_numpy(dtype=float)
+    lower_msl = station_rows["Corridor_Lower_Face_MSL_m"].to_numpy(dtype=float)
+    required_msl = pd.to_numeric(
+        station_rows["Station_Required_Safe_MSL_m"], errors="coerce"
+    ).to_numpy(dtype=float)
+    statuses = station_rows["Station_3D_Status"].astype(str).to_numpy(dtype=object)
+    envelope_classes = station_rows["Station_MOC_Envelope_Class"].astype(str).to_numpy(dtype=object)
+    x_max = max(1.0, float(np.max(x)))
+    finite_required = np.isfinite(required_msl)
+    values_for_limits = [center_msl, lower_msl]
+    if np.any(finite_required):
+        values_for_limits.append(required_msl[finite_required])
+    if np.any(envelope_classes == "NO_CLEAR_LAYER"):
+        values_for_limits.append(np.asarray([
+            MOC_REFERENCE_MSL_M + float(MOC_AGL_LEVELS_M[-1])
+        ]))
+    y_min = float(min(np.min(values) for values in values_for_limits))
+    y_max = float(max(np.max(values) for values in values_for_limits))
+    pad_y = max(10.0, 0.05 * max(1.0, y_max - y_min))
+    plot_bottom = y_min - pad_y
+    plot_top = y_max + pad_y
+
+    layer_indices = station_rows["Selected_MOC_Layer_Index"].to_numpy(dtype=int)
+    if x.size == 1:
+        station_left = np.asarray([0.0], dtype=float)
+        station_right = np.asarray([x_max], dtype=float)
+    else:
+        station_mid = 0.5 * (x[:-1] + x[1:])
+        station_left = np.r_[0.0, station_mid]
+        station_right = np.r_[station_mid, x_max]
+    band_start = 0
+    band_no = 0
+    while band_start < layer_indices.size:
+        band_end = band_start + 1
+        while (
+            band_end < layer_indices.size
+            and int(layer_indices[band_end]) == int(layer_indices[band_start])
+        ):
+            band_end += 1
+        layer_idx = int(layer_indices[band_start])
+        span_start = float(station_left[band_start])
+        span_end = float(station_right[band_end - 1])
+        ax.axvspan(
+            span_start,
+            max(span_start + 1e-6, span_end),
+            color=("whitesmoke" if band_no % 2 == 0 else "lightsteelblue"),
+            alpha=0.25,
+            zorder=0,
+        )
+        ax.text(
+            0.5 * (span_start + span_end),
+            0.995,
+            f"AGL{int(MOC_AGL_LEVELS_M[layer_idx])}",
+            transform=ax.get_xaxis_transform(),
+            fontsize=6,
+            color="dimgray",
+            ha="center",
+            va="top",
+            zorder=8,
+        )
+        band_no += 1
+        band_start = band_end
+
+    ax.fill_between(
+        x,
+        lower_msl,
+        center_msl,
+        color=direction_color,
+        alpha=0.12,
+        label="Downward transition envelope",
+        zorder=2,
+    )
+    ax.plot(
+        x,
+        lower_msl,
+        "--",
+        color=direction_color,
+        linewidth=1.5,
+        label="Corridor lower face",
+        zorder=4,
+    )
+    ax.plot(
+        x,
+        center_msl,
+        color=direction_color,
+        linewidth=1.2,
+        alpha=0.65,
+        label=f"{direction_label} centerline",
+        zorder=4,
+    )
+    if np.any(finite_required):
+        envelope_plot = np.where(finite_required, required_msl, np.nan)
+        ax.step(
+            x,
+            envelope_plot,
+            where="mid",
+            color="magenta",
+            linewidth=1.8,
+            label="Discrete MOC required-safe envelope (not terrain)",
+            zorder=3,
+        )
+        ax.fill_between(
+            x,
+            plot_bottom,
+            envelope_plot,
+            where=finite_required,
+            step="mid",
+            color="magenta",
+            alpha=0.10,
+            zorder=1,
+        )
+    elif np.all(envelope_classes == "ALL_CLEAR"):
+        ax.text(
+            0.02,
+            0.92,
+            (
+                "MOC envelope: ALL_CLEAR"
+                if moc_enforced else "MOC envelope: ALL_CLEAR (NOT ENFORCED)"
+            ),
+            transform=ax.transAxes,
+            color="magenta",
+            fontsize=8,
+            weight="bold",
+            ha="left",
+            va="top",
+        )
+
+    fail_mask = np.asarray(["FAIL" in value for value in statuses], dtype=bool)
+    exact_mask = np.asarray([value.startswith("EXACT_LIMIT") for value in statuses], dtype=bool)
+    out_mask = np.asarray([value.startswith("OUT_OF_GRID") for value in statuses], dtype=bool)
+    no_clear_mask = envelope_classes == "NO_CLEAR_LAYER"
+    if np.any(fail_mask):
+        ax.scatter(
+            x[fail_mask], lower_msl[fail_mask],
+            c="red", marker="x", s=42, linewidths=1.3,
+            label=(
+                "3D MOC intersection"
+                if moc_enforced else "3D MOC intersection (diagnostic only)"
+            ),
+            zorder=7,
+        )
+        finite_fail = fail_mask & finite_required
+        if np.any(finite_fail):
+            ax.fill_between(
+                x,
+                lower_msl,
+                required_msl,
+                where=finite_fail,
+                color="red",
+                alpha=0.22,
+                zorder=5,
+            )
+    if np.any(exact_mask):
+        ax.scatter(
+            x[exact_mask], lower_msl[exact_mask],
+            facecolors="none", edgecolors="gold", marker="o", s=45,
+            linewidths=1.2,
+            label=(
+                "Exact clearance limit (PASS)"
+                if moc_enforced else "Exact clearance limit (NOT ENFORCED)"
+            ),
+            zorder=7,
+        )
+
+    unique_x = np.unique(x)
+    if unique_x.size > 1:
+        station_half_span_m = max(
+            1.0, 0.5 * float(np.median(np.diff(unique_x)))
+        )
+    else:
+        station_half_span_m = 1.0
+    first_out = True
+    first_no_clear = True
+    for idx in range(x.size):
+        x0 = max(0.0, float(x[idx] - station_half_span_m))
+        x1 = min(x_max, float(x[idx] + station_half_span_m))
+        if fail_mask[idx]:
+            ax.axvspan(x0, x1, color="red", alpha=0.06, zorder=1)
+        if out_mask[idx]:
+            ax.axvspan(
+                x0, x1, color="darkorange", alpha=0.12, zorder=1,
+                label="OUT_OF_GRID / WARN" if first_out else None,
+            )
+            first_out = False
+        if no_clear_mask[idx]:
+            ax.axvspan(
+                x0, x1, facecolor="magenta", edgecolor="red", hatch="///",
+                alpha=0.12, zorder=2,
+                label=(
+                    (
+                        "No clear layer through AGL900"
+                        if moc_enforced
+                        else "No clear layer through AGL900 (diagnostic only)"
+                    )
+                    if first_no_clear else None
+                ),
+            )
+            first_no_clear = False
+
+    first_rf_interval = True
+    rf_segment_indices = sorted({
+        int(item["segment_index"])
+        for item in profile_edges
+        if item["segment_type"] == "RF"
+    })
+    for segment_idx in rf_segment_indices:
+        rf_edges = [
+            item for item in profile_edges
+            if int(item["segment_index"]) == segment_idx
+        ]
+        x0 = float(min(item["direction_start_m"] for item in rf_edges))
+        x1 = float(max(item["direction_end_m"] for item in rf_edges))
+        ax.axvspan(
+            x0,
+            max(x0 + 1e-6, x1),
+            color="gold",
+            alpha=0.12,
+            zorder=1,
+            label="RF interval" if first_rf_interval else None,
+        )
+        first_rf_interval = False
+
+    phase_order = (
+        [FLIGHT_PHASE_TAKEOFF_STAGE1, FLIGHT_PHASE_TAKEOFF_STAGE2]
+        if direction == "takeoff"
+        else [FLIGHT_PHASE_LANDING_STAGE2, FLIGHT_PHASE_LANDING_STAGE1]
+    )
+    for phase in phase_order:
+        phase_edges = [
+            item for item in profile_edges
+            if item["flight_phase"] == phase
+        ]
+        if not phase_edges:
+            continue
+        for edge_no, item in enumerate(phase_edges):
+            ax.plot(
+                [item["direction_start_m"], item["direction_end_m"]],
+                [item["start_msl_m"], item["end_msl_m"]],
+                "-",
+                color=direction_color,
+                linewidth=2.2,
+                label=phase if edge_no == 0 else None,
+                zorder=4,
+            )
+
+    if profile_edges and direction == "takeoff":
+        stage1_edges = [
+            item for item in profile_edges
+            if item["flight_phase"] == FLIGHT_PHASE_TAKEOFF_STAGE1
+        ]
+        if stage1_edges:
+            boundary = max(stage1_edges, key=lambda item: item["direction_end_m"])
+            ax.scatter(
+                [boundary["direction_end_m"]], [boundary["end_msl_m"]],
+                s=55, facecolors="none", edgecolors=direction_color,
+                marker="o", linewidths=1.3, zorder=6,
+            )
+        transition_end = max(
+            profile_edges, key=lambda item: item["direction_end_m"]
+        )
+        ax.scatter(
+            [transition_end["direction_end_m"]], [transition_end["end_msl_m"]],
+            s=60, c=direction_color, edgecolors="k", marker="^", zorder=6,
+        )
+    elif profile_edges:
+        transition_start = min(
+            profile_edges, key=lambda item: item["direction_start_m"]
+        )
+        ax.scatter(
+            [transition_start["direction_start_m"]], [transition_start["start_msl_m"]],
+            s=60, c=direction_color, edgecolors="k", marker="v", zorder=6,
+        )
+        stage1_edges = [
+            item for item in profile_edges
+            if item["flight_phase"] == FLIGHT_PHASE_LANDING_STAGE1
+        ]
+        if stage1_edges:
+            boundary = min(stage1_edges, key=lambda item: item["direction_start_m"])
+            ax.scatter(
+                [boundary["direction_start_m"]], [boundary["start_msl_m"]],
+                s=55, facecolors="none", edgecolors=direction_color,
+                marker="o", linewidths=1.3, zorder=6,
+            )
+
+    taper_values = station_rows["Clearance_Taper_Active"].to_numpy(dtype=bool)
+    taper_changes = np.flatnonzero(taper_values[1:] != taper_values[:-1]) + 1
+    if taper_changes.size > 0:
+        taper_x = float(x[int(taper_changes[0])])
+        configured_clearance_m = float(
+            station_rows["Configured_Downward_Clearance_m"].iloc[0]
+        )
+        ax.axvline(taper_x, color="dimgray", linestyle=":", linewidth=1.0, zorder=3)
+        ax.text(
+            taper_x,
+            plot_top,
+            f"{configured_clearance_m:.0f}m downward clearance boundary",
+            fontsize=7, color="dimgray", rotation=90, va="top", ha="right",
+        )
+
+    ax.set_xlim(0.0, x_max)
+    ax.set_ylim(plot_bottom, plot_top)
+    ax.set_title(
+        f"{direction_label} 3D transition MOC clearance"
+        + ("" if moc_enforced else " | NOT ENFORCED")
+    )
+    ax.set_xlabel("Transition ground-track distance (m)")
+    ax.set_ylabel("Altitude MSL (m)")
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(loc="best", fontsize=7, framealpha=0.9)
+
+
+def _save_moc_transition_snapshots_v1(
+    rf,
+    out_dir,
+    request,
+    map_extent,
+    moc_risk,
+    moc_enforced,
+    half_width_m,
+    cruise_half_width_m,
+    transition_corridor_cfg,
+    lat_lim,
+    lon_lim,
+    airspace_center_lla,
+    airspace_radius_m,
+    forbidden_zones,
+    start_vertiport,
+    end_vertiport,
+    overall_constraint_ok,
+    overall_constraint_reason,
+    airspace_ok,
+    check_corridor_nfz,
+    check_corridor_self_overlap,
+    min_distance_enforced,
+    min_distance_ok,
+    rf_min_allowed_radius_m,
+):
+    """Save final Balanced-path MOC/RF transition audit artifacts."""
+    transition_structure_mode = str(
+        rf.get("transition_meta", {}).get("transition_structure_mode", "unknown")
+    )
+    audit_only_fixed_transition_geometry = bool(
+        transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+    )
+    moc_audit_includes_fixed_transition = bool(any(
+        bool(seg.get("is_fixed_transition_stage1", False))
+        for seg in rf.get("segments", [])
+    ))
+    audit_only_notice = (
+        "audit-only fixed transition geometry; omitted from general corridor outputs"
+    )
+    sample_df = _collect_transition_moc_samples_v1(
+        rf,
+        half_width_m,
+        moc_risk,
+        lat_lim,
+        lon_lim,
+        transition_corridor_cfg=transition_corridor_cfg,
+    )
+    if sample_df.empty:
+        raise RuntimeError(
+            "Transition MOC visualization requested, but no transition samples were collected."
+        )
+    for direction in ("takeoff", "landing"):
+        if not bool(sample_df["Direction"].eq(direction).any()):
+            raise RuntimeError(
+                f"Transition MOC visualization has no {direction} samples."
+            )
+
+    diagnostic_hit = bool(sample_df["Blocked"].any())
+    transition_checker_hit = bool(_transition_moc_checker_hit_v1(
+        rf,
+        half_width_m,
+        moc_risk,
+        lat_lim,
+        lon_lim,
+        transition_corridor_cfg=transition_corridor_cfg,
+    ))
+    checker_match = bool(diagnostic_hit == transition_checker_hit)
+    if not checker_match:
+        raise RuntimeError(
+            "Transition MOC diagnostic samples disagree with the constraint checker."
+        )
+
+    full_path_moc_hit = bool(_full_path_moc_checker_hit_v1(
+        rf,
+        cruise_half_width_m,
+        transition_corridor_cfg,
+        moc_risk,
+        lat_lim,
+        lon_lim,
+    ))
+    full_path = np.asarray(rf.get("path", np.empty((0, 3))), dtype=float).reshape(-1, 3)
+    full_edge_phases = _edge_phase_values_v1(
+        full_path,
+        rf.get("flight_phases"),
+        transition_corridor_cfg,
+    )
+    if bool(check_corridor_nfz):
+        nfz_ok, nfz_reason = _phase_specific_nfz_hit_v1(
+            full_path,
+            full_edge_phases,
+            cruise_half_width_m,
+            transition_corridor_cfg,
+            forbidden_zones,
+        )
+        nfz_status = "PASS" if nfz_ok else "FAIL"
+    else:
+        nfz_ok, nfz_reason, nfz_status = True, "not_enforced", "NOT ENFORCED"
+    if bool(check_corridor_self_overlap):
+        self_overlap_hit, self_overlap_reason = _phase_specific_self_overlap_v1(
+            full_path,
+            full_edge_phases,
+            cruise_half_width_m,
+            transition_corridor_cfg,
+        )
+        self_overlap_status = "FAIL" if self_overlap_hit else "PASS"
+    else:
+        self_overlap_hit = False
+        self_overlap_reason = "not_enforced"
+        self_overlap_status = "NOT ENFORCED"
+    transition_airspace_validation = dict(
+        rf.get("transition_airspace_validation", {})
+    )
+
+    snapshot_dir = Path(out_dir) / "moc_transition_snapshots"
+    working_dir = Path(out_dir) / "_moc_transition_snapshots_incomplete"
+    working_dir.mkdir(parents=True, exist_ok=False)
+    csv_name = "moc_transition_samples.csv"
+    json_name = "moc_transition_summary.json"
+    sample_df.to_csv(working_dir / csv_name, index=False, encoding="utf-8-sig")
+
+    overall_moc_status, total_hits, total_out_of_grid = _moc_diagnostic_status_v1(
+        sample_df, moc_enforced
+    )
+    total_samples = int(sample_df.shape[0])
+    total_tested = int(np.count_nonzero(sample_df["Grid_Status"].eq("INSIDE")))
+
+    direction_summary = {}
+    used_layers_by_direction = {}
+    layer_sample_sum = 0
+    for direction in ("takeoff", "landing"):
+        direction_rows = sample_df.loc[sample_df["Direction"].eq(direction)]
+        direction_stations = _transition_station_rows_v1(sample_df, direction)
+        used_layers = []
+        for value in direction_stations["Selected_MOC_Layer_Index"].tolist():
+            layer_idx_value = int(value)
+            if layer_idx_value not in used_layers:
+                used_layers.append(layer_idx_value)
+        used_layers_by_direction[direction] = used_layers
+        layer_statistics = []
+        for layer_idx in used_layers:
+            layer_rows = direction_rows.loc[
+                direction_rows["Selected_MOC_Layer_Index"].eq(layer_idx)
+            ]
+            layer_status, hit_count, out_count = _moc_diagnostic_status_v1(
+                layer_rows, moc_enforced
+            )
+            sample_count = int(layer_rows.shape[0])
+            tested_count = int(np.count_nonzero(layer_rows["Grid_Status"].eq("INSIDE")))
+            layer_sample_sum += sample_count
+            moc_agl_m = int(MOC_AGL_LEVELS_M[layer_idx])
+            layer_statistics.append({
+                "layer_index": int(layer_idx),
+                "moc_agl_m": moc_agl_m,
+                "moc_reference_msl_m": float(MOC_REFERENCE_MSL_M + moc_agl_m),
+                "applied_path_msl_min_m": float(layer_rows["Altitude_MSL_m"].min()),
+                "applied_path_msl_max_m": float(layer_rows["Altitude_MSL_m"].max()),
+                "applied_lower_face_msl_min_m": float(
+                    layer_rows["Corridor_Lower_Face_MSL_m"].min()
+                ),
+                "applied_lower_face_msl_max_m": float(
+                    layer_rows["Corridor_Lower_Face_MSL_m"].max()
+                ),
+                "sample_count": sample_count,
+                "tested_count": tested_count,
+                "hit_count": int(hit_count),
+                "out_of_grid_count": int(out_count),
+                "status": str(layer_status),
+            })
+        direction_summary[direction] = {
+            "flight_layer_order": (
+                "ascending_agl" if direction == "takeoff" else "descending_agl"
+            ),
+            "used_layers_agl_m": [int(MOC_AGL_LEVELS_M[idx]) for idx in used_layers],
+            "sample_count": int(direction_rows.shape[0]),
+            "station_count": int(direction_stations.shape[0]),
+            "tested_count": int(np.count_nonzero(direction_rows["Grid_Status"].eq("INSIDE"))),
+            "hit_count": int(np.count_nonzero(direction_rows["Blocked"])),
+            "out_of_grid_count": int(np.count_nonzero(
+                direction_rows["Grid_Status"].ne("INSIDE")
+            )),
+            "layer_sample_count_sum": int(sum(
+                item["sample_count"] for item in layer_statistics
+            )),
+            "layer_statistics": layer_statistics,
+        }
+        direction_status, _, _ = _moc_diagnostic_status_v1(
+            direction_rows, moc_enforced
+        )
+        direction_summary[direction]["moc_3d_status"] = str(direction_status)
+        direction_validation = (
+            rf.get("transition_3d_validation", {})
+            .get("directions", {})
+            .get(direction, {})
+        )
+        direction_summary[direction]["nfz_status"] = str(
+            direction_validation.get("nfz_status", nfz_status)
+        )
+        direction_summary[direction]["airspace_status"] = str(
+            direction_validation.get(
+                "airspace_status",
+                transition_airspace_validation.get("directions", {})
+                .get(direction, {})
+                .get("status", "UNKNOWN"),
+            )
+        )
+        direction_summary[direction]["self_overlap_status"] = str(
+            direction_validation.get("self_overlap_status", self_overlap_status)
+        )
+        direction_summary[direction]["constraint_fail_reasons"] = [
+            str(value) for value in direction_validation.get("fail_reasons", [])
+        ]
+        finite_margins = pd.to_numeric(
+            direction_stations["Station_Vertical_Margin_m"], errors="coerce"
+        )
+        finite_mask = finite_margins.notna()
+        no_clear_rows = direction_stations.loc[
+            direction_stations["Station_MOC_Envelope_Class"].eq("NO_CLEAR_LAYER")
+        ]
+        if not no_clear_rows.empty:
+            worst_row = no_clear_rows.iloc[0]
+            direction_summary[direction]["minimum_vertical_margin_m"] = None
+            direction_summary[direction]["minimum_vertical_margin_status"] = (
+                "NO_CLEAR_LAYER/FAIL"
+            )
+            direction_summary[direction]["minimum_vertical_margin_location"] = {
+                "direction_along_track_m": float(worst_row["Direction_Along_Track_m"]),
+                "center_lat": float(worst_row["Center_Lat"]),
+                "center_lon": float(worst_row["Center_Lon"]),
+                "center_msl_m": float(worst_row["Center_Altitude_MSL_m"]),
+                "lower_face_msl_m": float(worst_row["Corridor_Lower_Face_MSL_m"]),
+                "required_safe_msl_m": None,
+                "envelope_class": "NO_CLEAR_LAYER",
+            }
+        elif bool(finite_mask.any()):
+            worst_idx = finite_margins.loc[finite_mask].idxmin()
+            worst_row = direction_stations.loc[worst_idx]
+            direction_summary[direction]["minimum_vertical_margin_m"] = float(
+                finite_margins.loc[worst_idx]
+            )
+            direction_summary[direction]["minimum_vertical_margin_status"] = str(
+                worst_row["Station_3D_Status"]
+            )
+            direction_summary[direction]["minimum_vertical_margin_location"] = {
+                "direction_along_track_m": float(worst_row["Direction_Along_Track_m"]),
+                "center_lat": float(worst_row["Center_Lat"]),
+                "center_lon": float(worst_row["Center_Lon"]),
+                "center_msl_m": float(worst_row["Center_Altitude_MSL_m"]),
+                "lower_face_msl_m": float(worst_row["Corridor_Lower_Face_MSL_m"]),
+                "required_safe_msl_m": float(
+                    worst_row["Station_Required_Safe_MSL_m"]
+                ),
+                "envelope_class": str(worst_row["Station_MOC_Envelope_Class"]),
+            }
+        else:
+            direction_summary[direction]["minimum_vertical_margin_m"] = None
+            direction_summary[direction]["minimum_vertical_margin_status"] = (
+                "UNAVAILABLE"
+            )
+            direction_summary[direction]["minimum_vertical_margin_location"] = None
+        effective_clearances = pd.to_numeric(
+            direction_stations["Effective_Downward_Clearance_m"], errors="coerce"
+        ).dropna()
+        direction_summary[direction]["effective_downward_clearance_min_m"] = (
+            None if effective_clearances.empty else float(effective_clearances.min())
+        )
+        direction_summary[direction]["effective_downward_clearance_max_m"] = (
+            None if effective_clearances.empty else float(effective_clearances.max())
+        )
+        direction_summary[direction]["station_status_counts"] = {
+            str(key): int(value)
+            for key, value in direction_stations["Station_3D_Status"].value_counts().items()
+        }
+
+    all_rf_segments = [
+        seg for seg in rf.get("segments", []) if str(seg.get("type", "TF")) == "RF"
+    ]
+    transition_rf_segment_indices = {
+        int(value)
+        for value in sample_df.loc[
+            sample_df["Segment_Type"].eq("RF"), "Segment_Index"
+        ].tolist()
+    }
+    rf_segments = [
+        seg
+        for segment_idx, seg in enumerate(rf.get("segments", []), start=1)
+        if segment_idx in transition_rf_segment_indices
+        and str(seg.get("type", "TF")) == "RF"
+    ]
+    transition_rf_radii = [
+        float(seg["turn_radius"])
+        for seg in rf_segments
+        if seg.get("turn_radius") is not None and np.isfinite(float(seg["turn_radius"]))
+    ]
+    all_rf_radii = [
+        float(seg["turn_radius"])
+        for seg in all_rf_segments
+        if seg.get("turn_radius") is not None
+        and np.isfinite(float(seg["turn_radius"]))
+    ]
+    min_actual_rf_radius_m = min(all_rf_radii) if all_rf_radii else None
+    transition_min_actual_rf_radius_m = (
+        min(transition_rf_radii) if transition_rf_radii else None
+    )
+    rf_radius_pass = bool(
+        min_actual_rf_radius_m is None
+        or min_actual_rf_radius_m + 1e-6 >= float(rf_min_allowed_radius_m)
+    )
+    transition_rf_radius_pass = (
+        None
+        if transition_min_actual_rf_radius_m is None else bool(
+            transition_min_actual_rf_radius_m + 1e-6
+            >= float(rf_min_allowed_radius_m)
+        )
+    )
+    rf_geometry_feasible = bool(
+        rf.get("rf_geometry_feasible", rf.get("feasible", True))
+    )
+    combined_rf_transition_feasible = bool(rf.get("feasible", True))
+    rf_had_clamp = bool(rf.get("had_clamp", False))
+    if not rf_geometry_feasible or not rf_radius_pass:
+        rf_status = "FAIL"
+    elif not all_rf_segments:
+        rf_status = "NOT APPLICABLE"
+    elif rf_had_clamp:
+        rf_status = "WARN"
+    else:
+        rf_status = "PASS"
+
+    validation_checks = {
+        str(key): bool(value)
+        for key, value in rf.get("transition_meta", {}).get(
+            "validation_checks", {}
+        ).items()
+    }
+    validation_pass_count = int(sum(validation_checks.values()))
+    validation_total_count = int(len(validation_checks))
+
+    file_names = [
+        "00_transition_moc_validation.png",
+        "01_takeoff_moc_layers_overview.png",
+        "02_landing_moc_layers_overview.png",
+    ]
+    for direction in ("takeoff", "landing"):
+        ordered_layers = list(used_layers_by_direction[direction])
+        for sequence_no, layer_idx in enumerate(ordered_layers, start=1):
+            moc_agl_m = int(MOC_AGL_LEVELS_M[layer_idx])
+            file_names.append(
+                f"{direction}_{sequence_no:03d}_agl{moc_agl_m:04d}.png"
+            )
+    file_names.extend([csv_name, json_name])
+
+    if (
+        (bool(moc_enforced) and overall_moc_status == "FAIL")
+        or nfz_status == "FAIL"
+        or self_overlap_status == "FAIL"
+        or not bool(airspace_ok)
+    ):
+        transition_3d_status = "FAIL"
+    elif not bool(moc_enforced):
+        transition_3d_status = "NOT ENFORCED"
+    elif overall_moc_status == "WARN":
+        transition_3d_status = "WARN"
+    else:
+        transition_3d_status = "PASS"
+
+    summary = {
+        "enabled": True,
+        "generated": True,
+        "reason": "generated",
+        "transition_structure_mode": transition_structure_mode,
+        "audit_only_fixed_transition_geometry": audit_only_fixed_transition_geometry,
+        "moc_audit_includes_fixed_transition": moc_audit_includes_fixed_transition,
+        "output_policy_notice": (
+            audit_only_notice if audit_only_fixed_transition_geometry else None
+        ),
+        "folder": "moc_transition_snapshots",
+        "files": [
+            (Path("moc_transition_snapshots") / name).as_posix()
+            for name in file_names
+        ],
+        "moc_enforced": bool(moc_enforced),
+        "status": str(overall_moc_status),
+        "sample_count": total_samples,
+        "tested_count": total_tested,
+        "hit_count": int(total_hits),
+        "out_of_grid_count": int(total_out_of_grid),
+        "layer_sample_count_sum": int(layer_sample_sum),
+        "layer_sample_count_matches_total": bool(layer_sample_sum == total_samples),
+        "diagnostic_hit": bool(diagnostic_hit),
+        "transition_checker_hit": bool(transition_checker_hit),
+        "checker_match": bool(checker_match),
+        "checker_status": (
+            "NOT ENFORCED"
+            if not moc_enforced else ("PASS" if checker_match else "FAIL")
+        ),
+        "full_path_checker_hit": bool(full_path_moc_hit),
+        "corridor_half_width_m": float(half_width_m),
+        "transition_corridor_half_width_m": float(half_width_m),
+        "configured_downward_clearance_m": float(
+            transition_corridor_cfg["downward_clearance_m"]
+        ),
+        "transition_vertical_clearance_m": float(
+            transition_corridor_cfg["downward_clearance_m"]
+        ),
+        "cruise_corridor_half_width_m": float(cruise_half_width_m),
+        "transition_3d_status": str(transition_3d_status),
+        "transition_3d_validation": dict(
+            rf.get("transition_3d_validation", {})
+        ),
+        "transition_3d_corridor_policy": {
+            "effective_clearance_formula": (
+                "min(configured_clearance, max(0, center_MSL - direction_vertiport_MSL))"
+            ),
+            "lower_face_formula": "center_MSL - effective_clearance",
+            "moc_layer_selection": "floor_at_corridor_lower_face",
+            "envelope_semantics": (
+                "Discrete fixed-AGL MOC required-safe envelope; not terrain or obstacle height"
+            ),
+            "vertical_safety_assumption": (
+                "blocked cells at higher MOC layers are subsets of lower-layer blocked cells"
+            ),
+            "all_clear_first_clear_policy": (
+                "AGL100 is recorded as the first clear available layer; required-safe MSL stays null"
+            ),
+            "layer_interpolation": "none",
+            "transition_phases": [str(value) for value in TRANSITION_PHASE_NAMES],
+        },
+        "spatial_constraint_status": {
+            "MOC": str(overall_moc_status),
+            "NFZ": str(nfz_status),
+            "NFZ_reason": str(nfz_reason),
+            "airspace": "PASS" if airspace_ok else "FAIL",
+            "airspace_reason": str(
+                transition_airspace_validation.get("reason", "ok" if airspace_ok else "failed")
+            ),
+            "self_overlap": str(self_overlap_status),
+            "self_overlap_reason": str(self_overlap_reason),
+        },
+        "along_track_sample_spacing_max_m": 80.0,
+        "sample_deduplication_policy": (
+            "physically identical shared-edge endpoint samples are counted once; "
+            "distinct TF/RF cross-track-normal samples are preserved"
+        ),
+        "flight_phase_recording_policy": {
+            "Flight_Phase": (
+                "edge destination phase with vertiport source-phase fallback"
+            ),
+            "point_phase_columns": [
+                "Source_Point_Phase", "Destination_Point_Phase"
+            ],
+            "landing_transition_start_rule": (
+                "boundary point remains cruise; following edge is landing_stage2"
+            ),
+        },
+        "overall_constraint_pass": bool(overall_constraint_ok),
+        "overall_constraint_reason": str(overall_constraint_reason),
+        "airspace_pass": bool(airspace_ok),
+        "min_corridor_distance_enforced": bool(min_distance_enforced),
+        "min_corridor_distance_pass": (
+            bool(min_distance_ok) if min_distance_enforced else None
+        ),
+        "transition_feasible": bool(rf.get("transition_feasible", True)),
+        "transition_fail_reason": str(rf.get("transition_fail_reason", "ok")),
+        "transition_fail_reasons": [
+            str(value) for value in rf.get("transition_fail_reasons", [])
+        ],
+        "transition_validation_checks": validation_checks,
+        "rf_feasible": rf_geometry_feasible,
+        "combined_rf_transition_feasible": combined_rf_transition_feasible,
+        "rf_had_clamp": rf_had_clamp,
+        "rf_status": rf_status,
+        "rf_arc_count": int(len(all_rf_segments)),
+        "transition_rf_arc_count": int(len(rf_segments)),
+        "full_path_rf_arc_count": int(len(all_rf_segments)),
+        "rf_min_allowed_radius_m": float(rf_min_allowed_radius_m),
+        "rf_min_actual_radius_m": (
+            None if min_actual_rf_radius_m is None else float(min_actual_rf_radius_m)
+        ),
+        "rf_radius_pass": (
+            bool(rf_radius_pass) if all_rf_segments else None
+        ),
+        "rf_radius_status": (
+            "NOT APPLICABLE"
+            if not all_rf_segments else ("PASS" if rf_radius_pass else "FAIL")
+        ),
+        "transition_rf_min_actual_radius_m": (
+            None
+            if transition_min_actual_rf_radius_m is None
+            else float(transition_min_actual_rf_radius_m)
+        ),
+        "transition_rf_radius_pass": transition_rf_radius_pass,
+        "transition_rf_radius_status": (
+            "NOT APPLICABLE"
+            if transition_rf_radius_pass is None
+            else ("PASS" if transition_rf_radius_pass else "FAIL")
+        ),
+        "rf_fail_reason_counts": {
+            str(key): int(value)
+            for key, value in rf.get("fail_reason_counts", {}).items()
+        },
+        "directions": direction_summary,
+    }
+    if not summary["layer_sample_count_matches_total"]:
+        raise RuntimeError(
+            "MOC layer sample counts do not sum to the full transition sample count."
+        )
+
+    fig = plt.figure("Transition MOC Validation", figsize=(16, 10))
+    grid = fig.add_gridspec(2, 2, width_ratios=(2.25, 1.0), hspace=0.34, wspace=0.24)
+    ax_takeoff = fig.add_subplot(grid[0, 0])
+    ax_landing = fig.add_subplot(grid[1, 0])
+    ax_status = fig.add_subplot(grid[:, 1])
+    _plot_transition_moc_profile_axis_v1(
+        ax_takeoff, sample_df, "takeoff", rf, moc_enforced
+    )
+    _plot_transition_moc_profile_axis_v1(
+        ax_landing, sample_df, "landing", rf, moc_enforced
+    )
+    ax_status.set_axis_off()
+    min_radius_text = (
+        "n/a" if min_actual_rf_radius_m is None else f"{min_actual_rf_radius_m:.1f} m"
+    )
+    transition_min_radius_text = (
+        "n/a"
+        if transition_min_actual_rf_radius_m is None
+        else f"{transition_min_actual_rf_radius_m:.1f} m"
+    )
+    min_distance_status = (
+        ("PASS" if min_distance_ok else "FAIL")
+        if min_distance_enforced else "NOT ENFORCED"
+    )
+    rf_radius_status = (
+        "NOT APPLICABLE"
+        if not all_rf_segments else ("PASS" if rf_radius_pass else "FAIL")
+    )
+    transition_rf_radius_status = (
+        "NOT APPLICABLE"
+        if transition_rf_radius_pass is None
+        else ("PASS" if transition_rf_radius_pass else "FAIL")
+    )
+    takeoff_sector_status = (
+        "NOT AVAILABLE"
+        if "takeoff_sector_heading" not in validation_checks
+        else ("PASS" if validation_checks["takeoff_sector_heading"] else "FAIL")
+    )
+    landing_sector_status = (
+        "NOT AVAILABLE"
+        if "landing_sector_heading" not in validation_checks
+        else ("PASS" if validation_checks["landing_sector_heading"] else "FAIL")
+    )
+    station_rows_all = pd.concat([
+        _transition_station_rows_v1(sample_df, "takeoff"),
+        _transition_station_rows_v1(sample_df, "landing"),
+    ], ignore_index=True)
+    station_margins = pd.to_numeric(
+        station_rows_all.get("Station_Vertical_Margin_m"), errors="coerce"
+    )
+    has_no_clear_layer = bool(
+        station_rows_all["Station_MOC_Envelope_Class"].eq(
+            "NO_CLEAR_LAYER"
+        ).any()
+    )
+    if has_no_clear_layer:
+        minimum_margin_text = "NO CLEAR LAYER"
+    elif not bool(station_margins.notna().any()):
+        minimum_margin_text = "n/a"
+    else:
+        minimum_margin_text = f"{float(station_margins.min()):.1f} m"
+    status_lines = [
+        "FINAL BALANCED TRANSITION AUDIT",
+        *(
+            [audit_only_notice]
+            if audit_only_fixed_transition_geometry else []
+        ),
+        "",
+        f"MOC enforcement       : {'ON' if moc_enforced else 'OFF'}",
+        f"MOC transition status : {overall_moc_status}",
+        f"MOC samples           : {total_samples}",
+        f"Inside / hits / out   : {total_tested} / {total_hits} / {total_out_of_grid}",
+        (
+            "Checker agreement     : NOT ENFORCED"
+            if not moc_enforced
+            else f"Checker agreement     : {'PASS' if checker_match else 'FAIL'}"
+        ),
+        f"Full-path MOC hit     : {'YES' if full_path_moc_hit else 'NO'}",
+        f"Transition half-width : +/-{float(half_width_m):.1f} m",
+        f"Downward clearance    : {float(transition_corridor_cfg['downward_clearance_m']):.1f} m max",
+        f"Minimum MOC margin    : {minimum_margin_text}",
+        (
+            "Clearance taper       : 0m at port -> configured at center AGL"
+            f"{float(transition_corridor_cfg['downward_clearance_m']):.0f}"
+        ),
+        "",
+        f"Overall constraints   : {'PASS' if overall_constraint_ok else 'FAIL'}",
+        f"Constraint reason     : {overall_constraint_reason}",
+        f"Airspace              : {'PASS' if airspace_ok else 'FAIL'}",
+        f"NFZ envelope          : {nfz_status}",
+        f"Self-overlap envelope : {self_overlap_status}",
+        f"Transition 3D status  : {transition_3d_status}",
+        f"Minimum distance      : {min_distance_status}",
+        f"Transition validation : {validation_pass_count}/{validation_total_count} PASS",
+        f"Transition feasible   : {'PASS' if rf.get('transition_feasible', True) else 'FAIL'}",
+        f"Takeoff sector heading: {takeoff_sector_status}",
+        f"Landing sector heading: {landing_sector_status}",
+        "",
+        f"RF geometry (all path): {rf_status}",
+        f"RF feasible / clamp   : {rf_geometry_feasible} / {rf_had_clamp}",
+        f"RF arcs (all path)    : {len(all_rf_segments)}",
+        f"RF min actual         : {min_radius_text}",
+        f"RF min allowed        : {float(rf_min_allowed_radius_m):.1f} m",
+        f"RF radius check       : {rf_radius_status}",
+        f"Transition RF arcs    : {len(rf_segments)}",
+        f"Transition RF min     : {transition_min_radius_text}",
+        f"Transition RF radius  : {transition_rf_radius_status}",
+        "",
+        "Discrete fixed-AGL MOC envelope; not terrain.",
+        "Below AGL200 query altitude, AGL100 is the enforced proxy layer.",
+        "OUT_OF_GRID samples are WARN, never safe samples.",
+    ]
+    ax_status.text(
+        0.02, 0.98, "\n".join(status_lines),
+        transform=ax_status.transAxes, ha="left", va="top",
+        fontsize=9, family="monospace",
+        bbox=dict(boxstyle="round", facecolor="whitesmoke", edgecolor="gray", alpha=0.92),
+    )
+    fig.suptitle(
+        (
+            "Final Balanced Path: 3D transition MOC clearance and RF validation"
+            + (
+                f"\n{audit_only_notice}"
+                if audit_only_fixed_transition_geometry else ""
+            )
+        ),
+        fontsize=14,
+    )
+    fig.savefig(
+        working_dir / "00_transition_moc_validation.png",
+        dpi=170,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    for direction, overview_name in (
+        ("takeoff", "01_takeoff_moc_layers_overview.png"),
+        ("landing", "02_landing_moc_layers_overview.png"),
+    ):
+        ordered_layers = list(used_layers_by_direction[direction])
+        panel_count = len(ordered_layers)
+        column_count = min(3, max(1, panel_count))
+        row_count = int(np.ceil(panel_count / column_count))
+        overview_fig = plt.figure(
+            f"{direction.title()} MOC Layers Overview",
+            figsize=(5.2 * column_count, 4.7 * row_count),
+        )
+        extent = _transition_moc_extent_v1(sample_df, direction, map_extent)
+        for panel_no, layer_idx in enumerate(ordered_layers, start=1):
+            panel_ax = overview_fig.add_subplot(
+                row_count, column_count, panel_no, projection=request.crs
+            )
+            _plot_moc_transition_layer_axis_v1(
+                panel_ax,
+                request,
+                extent,
+                rf,
+                sample_df,
+                direction,
+                layer_idx,
+                moc_risk,
+                moc_enforced,
+                half_width_m,
+                lat_lim,
+                lon_lim,
+                airspace_center_lla,
+                airspace_radius_m,
+                forbidden_zones,
+                start_vertiport,
+                end_vertiport,
+                compact=True,
+            )
+        overview_fig.suptitle(
+            (
+                f"{direction.title()} transition MOC layers in flight order"
+                + (
+                    f"\n{audit_only_notice}"
+                    if audit_only_fixed_transition_geometry else ""
+                )
+            ),
+            fontsize=13,
+        )
+        overview_fig.tight_layout(rect=[0, 0, 1, 0.96])
+        overview_fig.savefig(working_dir / overview_name, dpi=165, bbox_inches="tight")
+        plt.close(overview_fig)
+
+        for sequence_no, layer_idx in enumerate(ordered_layers, start=1):
+            moc_agl_m = int(MOC_AGL_LEVELS_M[layer_idx])
+            frame_name = f"{direction}_{sequence_no:03d}_agl{moc_agl_m:04d}.png"
+            frame_fig = plt.figure(
+                f"{direction.title()} MOC AGL{moc_agl_m}", figsize=(14, 10)
+            )
+            frame_fig.subplots_adjust(left=0.05, right=0.76)
+            frame_ax = frame_fig.add_subplot(1, 1, 1, projection=request.crs)
+            _plot_moc_transition_layer_axis_v1(
+                frame_ax,
+                request,
+                extent,
+                rf,
+                sample_df,
+                direction,
+                layer_idx,
+                moc_risk,
+                moc_enforced,
+                half_width_m,
+                lat_lim,
+                lon_lim,
+                airspace_center_lla,
+                airspace_radius_m,
+                forbidden_zones,
+                start_vertiport,
+                end_vertiport,
+                compact=False,
+            )
+            if audit_only_fixed_transition_geometry:
+                frame_fig.suptitle(audit_only_notice, fontsize=12)
+            frame_fig.savefig(working_dir / frame_name, dpi=175, bbox_inches="tight")
+            plt.close(frame_fig)
+
+    with open(working_dir / json_name, "w", encoding="utf-8") as summary_file:
+        json.dump(summary, summary_file, indent=2, ensure_ascii=False)
+    working_dir.rename(snapshot_dir)
+    return summary
+
+
 def _save_generation_snapshots(
     gen_history,
     out_dir,
@@ -2295,10 +7563,17 @@ def _save_generation_snapshots(
     end_vertiport,
     takeoff_complete,
     landing_entry,
+    use_takeoff_landing_transition,
+    use_two_stage_transition,
+    transition_structure_mode,
+    takeoff_optimized_transition_actual,
+    landing_optimized_transition_actual,
     objective_names,
     altitude_levels,
     apply_rf_corridor_fn,
+    output_rf_view_fn,
     W_half,
+    transition_corridor_cfg,
     moc_plot_2d,
     lat_lim,
     lon_lim,
@@ -2342,30 +7617,64 @@ def _save_generation_snapshots(
                     marker="s", transform=ccrs.Geodetic(), label="Start Vertiport", zorder=7)
         gxg.scatter([end_vertiport[1]], [end_vertiport[0]], s=120, c="crimson", edgecolors="k",
                     marker="D", transform=ccrs.Geodetic(), label="End Vertiport", zorder=7)
-        gxg.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, c="blue",
-                    marker="^", transform=ccrs.Geodetic(), label="Takeoff_End", zorder=7)
-        gxg.scatter([landing_entry[1]], [landing_entry[0]], s=90, c="green",
-                    marker="v", transform=ccrs.Geodetic(), label="Landing_End", zorder=7)
+        if not use_takeoff_landing_transition:
+            gxg.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, c=TAKEOFF_TRANSITION_COLOR,
+                        marker="^", transform=ccrs.Geodetic(), label="Takeoff_End", zorder=7)
+            gxg.scatter([landing_entry[1]], [landing_entry[0]], s=90, c=LANDING_TRANSITION_COLOR,
+                        marker="v", transform=ccrs.Geodetic(), label="Landing_End", zorder=7)
+        elif transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY:
+            gxg.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                        c=TAKEOFF_TRANSITION_COLOR, marker="^", transform=ccrs.Geodetic(),
+                        label="Takeoff Transition End", zorder=7)
+            gxg.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                        c=LANDING_TRANSITION_COLOR, marker="v", transform=ccrs.Geodetic(),
+                        label="Landing Transition Start", zorder=7)
+        elif use_two_stage_transition and _seg_dist_m(start_vertiport, takeoff_complete) > 0.5:
+            if bool(takeoff_optimized_transition_actual):
+                gxg.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, facecolors="none",
+                            edgecolors=TAKEOFF_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                            transform=ccrs.Geodetic(), label="Takeoff Stage1 End", zorder=7)
+            else:
+                gxg.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                            c=TAKEOFF_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="^",
+                            transform=ccrs.Geodetic(), label="Takeoff Transition End", zorder=7)
+        if use_takeoff_landing_transition and use_two_stage_transition and _seg_dist_m(end_vertiport, landing_entry) > 0.5:
+            if bool(landing_optimized_transition_actual):
+                gxg.scatter([landing_entry[1]], [landing_entry[0]], s=90, facecolors="none",
+                            edgecolors=LANDING_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                            transform=ccrs.Geodetic(), label="Landing Stage1 Start", zorder=7)
+            else:
+                gxg.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                            c=LANDING_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="v",
+                            transform=ccrs.Geodetic(), label="Landing Transition Start", zorder=7)
 
         rep_labels = objective_names + ["Balanced"]
         rep_colors = [plt.cm.tab10(i % 10) for i in range(len(objective_names))] + ["black"]
         for ri, rep in enumerate(greps):
-            rf = apply_rf_corridor_fn(rep)
+            rf = output_rf_view_fn(apply_rf_corridor_fn(rep))
             rp = rf["path"]
             segs = rf["segments"]
             col = rep_colors[ri] if ri < len(rep_colors) else rep_colors[-1]
             lab = rep_labels[ri] if ri < len(rep_labels) else f"Rep{ri}"
 
-            plot_corridor_width(gxg, rp, W_half, color=col, alpha=0.08)
+            _plot_corridor_width_by_phase_v1(
+                gxg,
+                rf,
+                W_half,
+                transition_corridor_cfg,
+                color=col,
+                alpha=0.08,
+            )
 
-            for seg in segs:
-                pts = seg["points"]
-                if seg["type"] == "TF":
-                    gxg.plot(pts[:, 1], pts[:, 0], "-", color=col, linewidth=1.5,
-                             transform=ccrs.Geodetic(), zorder=8)
-                elif seg["type"] == "RF":
-                    gxg.plot(pts[:, 1], pts[:, 0], "-", color=col, linewidth=2.0,
-                             transform=ccrs.Geodetic(), zorder=8)
+            _plot_rf_segments_by_phase(
+                gxg, rf, cruise_color=col, tf_lw=1.5, rf_lw=2.0,
+                transform=ccrs.Geodetic(), zorder=8,
+                transition_labels=(ri == 0), draw_rf_markers=False,
+            )
+            _plot_transition_phase_markers(
+                gxg, rf, transform=ccrs.Geodetic(), zorder=11, labels=(ri == 0),
+                include_stage1=False, general_output=True,
+            )
 
             gxg.plot([], [], "-", color=col, linewidth=1.5, label=f"{lab} (TF)")
             gxg.plot([], [], "-", color=col, linewidth=2.5, label=f"{lab} (RF arc)")
@@ -2386,6 +7695,7 @@ def _compute_final_feasibility(
     airspace_alt_min_m,
     airspace_alt_max_m,
     min_corridor_distance_m,
+    transition_corridor_cfg,
 ):
     """Evaluate final feasibility mask and RF no-clamp count for a population."""
     rf_no_clamp_count = 0
@@ -2395,18 +7705,21 @@ def _compute_final_feasibility(
         if not bool(rf.get("had_clamp", False)):
             rf_no_clamp_count += 1
         full_path = rf["path"]
-        _, feas = eval_corridor_objectives_fn(full_path)
-        air_ok = is_path_inside_airspace(
+        flight_phases = rf.get("flight_phases")
+        _, feas = eval_corridor_objectives_fn(full_path, flight_phases)
+        air_ok, _, _ = _is_path_inside_airspace_envelope_v1(
             full_path,
+            flight_phases,
             airspace_center_lla[:2],
             airspace_radius_m,
             alt_min_m=airspace_alt_min_m,
             alt_max_m=airspace_alt_max_m,
+            transition_corridor_cfg=transition_corridor_cfg,
         )
         dist_ok = True
         if min_corridor_distance_m > 0.0:
             dist_ok = _path_total_3d_distance_m(full_path) + 1e-6 >= min_corridor_distance_m
-        feas = bool(feas and air_ok and dist_ok)
+        feas = bool(feas and bool(rf.get("feasible", False)) and air_ok and dist_ok)
         feas_mask.append(bool(feas))
 
     feasible_count = sum(feas_mask)
@@ -2444,9 +7757,13 @@ def _apply_rf_corridor_path(
     )
 
 
-def _evaluate_corridor_objectives_path(path_points, eval_cfg):
+def _evaluate_corridor_objectives_path(path_points, flight_phases, eval_cfg):
     """Evaluate objectives/constraints for a corridor path using prebuilt config."""
-    return evaluate_objectives_with_constraints_gp(path_points, **eval_cfg)
+    return evaluate_objectives_with_constraints_gp(
+        path_points,
+        flight_phases=flight_phases,
+        **eval_cfg,
+    )
 
 
 def _make_initial_population(
@@ -2537,16 +7854,27 @@ def _evaluate_initial_candidates(
     airspace_alt_min_m,
     airspace_alt_max_m,
     min_corridor_distance_m,
+    transition_corridor_cfg,
 ):
     """Evaluate RF + constraints for initial candidates and return summary stats."""
     rf_ok_list = []
     for c in candidate_pop:
         c_eval = _enforce_mandatory_wp_order(c, backbone) if enforce_mandatory_wp_order else c
         rf = apply_rf_fn(c_eval)
-        rf_ok_list.append((rf["feasible"], bool(rf.get("had_clamp", False)), rf["path"], c_eval))
+        rf_ok_list.append((
+            rf["feasible"],
+            bool(rf.get("had_clamp", False)),
+            rf,
+            c_eval,
+            (
+                str(rf.get("transition_fail_reason", "transition_infeasible"))
+                if not bool(rf.get("transition_feasible", True))
+                else "rf_geometry_infeasible"
+            ),
+        ))
 
-    rf_cnt = sum(1 for ok, _, _, _ in rf_ok_list if ok)
-    rf_no_clamp_cnt = sum(1 for ok, had_clamp, _, _ in rf_ok_list if ok and (not had_clamp))
+    rf_cnt = sum(1 for ok, _, _, _, _ in rf_ok_list if ok)
+    rf_no_clamp_cnt = sum(1 for ok, had_clamp, _, _, _ in rf_ok_list if ok and (not had_clamp))
 
     both_cnt = 0
     cst_cnt = 0
@@ -2554,19 +7882,27 @@ def _evaluate_initial_candidates(
     dist_cnt = 0
     reason_counts = {}
     feasible_init = []
+    for rf_ok, _had_clamp, _rf, _c_eval, rf_reason in rf_ok_list:
+        if not rf_ok:
+            reason_counts[rf_reason] = int(reason_counts.get(rf_reason, 0) + 1)
 
     if rf_cnt > 0:
-        for rf_ok, _had_clamp, rf_path, c_eval in rf_ok_list:
+        for rf_ok, _had_clamp, rf, c_eval, rf_reason in rf_ok_list:
             if not rf_ok:
                 continue
-            full_path = rf_path
-            _, cst_ok, reason = eval_constraints_with_reason_fn(full_path)
-            air_ok = is_path_inside_airspace(
+            full_path = rf["path"]
+            flight_phases = rf.get("flight_phases")
+            _, cst_ok, reason = eval_constraints_with_reason_fn(
+                full_path, flight_phases=flight_phases
+            )
+            air_ok, air_reason, _ = _is_path_inside_airspace_envelope_v1(
                 full_path,
+                flight_phases,
                 airspace_center_lla[:2],
                 airspace_radius_m,
                 alt_min_m=airspace_alt_min_m,
                 alt_max_m=airspace_alt_max_m,
+                transition_corridor_cfg=transition_corridor_cfg,
             )
             dist_ok = True
             if min_corridor_distance_m > 0.0:
@@ -2578,6 +7914,8 @@ def _evaluate_initial_candidates(
                 reason_counts[reason] = int(reason_counts.get(reason, 0) + 1)
             if air_ok:
                 air_cnt += 1
+            else:
+                reason_counts[air_reason] = int(reason_counts.get(air_reason, 0) + 1)
             if dist_ok:
                 dist_cnt += 1
 
@@ -2600,9 +7938,11 @@ def _evaluate_initial_candidates(
 def _export_route_outputs(
     rows,
     rf_best,
+    rf_output,
     Norm_RT,
     AirRisk,
     altitude_levels,
+    risk_altitude_levels,
     use_heading_map,
     air_thr_global,
     lat_lim,
@@ -2633,9 +7973,116 @@ def _export_route_outputs(
     waypoint_alt_fixed_m,
 ):
     """Build route DataFrames and export Excel/map artifacts for balanced corridor."""
+    evaluation_flight_phases = np.asarray(
+        rf_best.get("flight_phases", np.full(len(rf_best.get("path", [])), FLIGHT_PHASE_CRUISE)),
+        dtype=object,
+    ).reshape(-1)
+    output_flight_phases = np.asarray(
+        rf_output.get(
+            "flight_phases",
+            np.full(len(rf_output.get("path", [])), FLIGHT_PHASE_CRUISE),
+        ),
+        dtype=object,
+    ).reshape(-1)
+    balanced_phase_counts = {
+        phase: int(np.count_nonzero(output_flight_phases == phase))
+        for phase in (
+            FLIGHT_PHASE_VERTIPORT,
+            FLIGHT_PHASE_TAKEOFF_STAGE1,
+            FLIGHT_PHASE_TAKEOFF_STAGE2,
+            FLIGHT_PHASE_CRUISE,
+            FLIGHT_PHASE_LANDING_STAGE2,
+            FLIGHT_PHASE_LANDING_STAGE1,
+        )
+    }
+
+    def _as_optional_point(value):
+        if value is None:
+            return None
+        point = np.asarray(value, dtype=float).reshape(-1)
+        if point.size < 3 or not np.all(np.isfinite(point[:3])):
+            return None
+        return point[:3].astype(float)
+
+    def _point_json(point):
+        if point is None:
+            return None
+        return {
+            "lat": float(point[0]),
+            "lon": float(point[1]),
+            "alt_m": float(point[2]),
+        }
+
+    fixed_output_suppressed = bool(
+        params_dict.get("fixed_transition_general_output_suppressed", False)
+    )
+    takeoff_optimized_transition_actual = bool(
+        params_dict.get("takeoff_optimized_transition_actual", False)
+    )
+    landing_optimized_transition_actual = bool(
+        params_dict.get("landing_optimized_transition_actual", False)
+    )
+    has_takeoff_stage1 = bool(
+        not fixed_output_suppressed
+        and takeoff_optimized_transition_actual
+        and np.count_nonzero(
+            evaluation_flight_phases == FLIGHT_PHASE_TAKEOFF_STAGE1
+        ) > 0
+    )
+    has_landing_stage1 = bool(
+        not fixed_output_suppressed
+        and landing_optimized_transition_actual
+        and np.count_nonzero(
+            evaluation_flight_phases == FLIGHT_PHASE_LANDING_STAGE1
+        ) > 0
+    )
+    takeoff_stage1_end = (
+        _as_optional_point(rf_best.get("takeoff_stage1_end"))
+        if has_takeoff_stage1 else None
+    )
+    landing_stage1_start = (
+        _as_optional_point(rf_best.get("landing_stage1_start"))
+        if has_landing_stage1 else None
+    )
+    takeoff_transition_end = (
+        _as_optional_point(rf_best.get("takeoff_transition_end"))
+        if bool(use_takeoff_landing_transition) else None
+    )
+    landing_transition_start = (
+        _as_optional_point(rf_best.get("landing_transition_start"))
+        if bool(use_takeoff_landing_transition) else None
+    )
+    takeoff_output_point = (
+        takeoff_transition_end
+        if takeoff_transition_end is not None
+        else np.asarray(takeoff_complete, dtype=float).reshape(3)
+    )
+    landing_output_point = (
+        landing_transition_start
+        if landing_transition_start is not None
+        else np.asarray(landing_entry, dtype=float).reshape(3)
+    )
+    transition_meta = rf_best.get("transition_meta", {})
+    takeoff_cfg = params_dict.get("takeoff_transition_meta", {})
+    landing_cfg = params_dict.get("landing_transition_meta", {})
+
     df = pd.DataFrame(rows)
     if not df.empty:
         df["Point_No"] = np.arange(len(df), dtype=int)
+    route_flight_phases = np.asarray(
+        df.get("Flight_Phase", pd.Series(dtype=object)), dtype=object
+    ).reshape(-1)
+    phase_counts = {
+        phase: int(np.count_nonzero(route_flight_phases == phase))
+        for phase in (
+            FLIGHT_PHASE_VERTIPORT,
+            FLIGHT_PHASE_TAKEOFF_STAGE1,
+            FLIGHT_PHASE_TAKEOFF_STAGE2,
+            FLIGHT_PHASE_CRUISE,
+            FLIGHT_PHASE_LANDING_STAGE2,
+            FLIGHT_PHASE_LANDING_STAGE1,
+        )
+    }
 
     dist_prev_2d = [0.0]
     dist_prev_3d = [0.0]
@@ -2661,6 +8108,7 @@ def _export_route_outputs(
     df["Cumulative_Dist_3D_km"] = np.asarray(cum_3d, dtype=float) / 1000.0
 
     full_path = np.asarray(rf_best["path"], dtype=float)
+    output_path = np.asarray(rf_output["path"], dtype=float).reshape(-1, 3)
     p2d_cum = [0.0]
     pcum = [0.0]
     for i in range(1, full_path.shape[0]):
@@ -2671,11 +8119,11 @@ def _export_route_outputs(
 
     route_points = df[["Lat", "Lon", "Altitude_MSL_m"]].to_numpy(dtype=float)
     pt_ground, pt_air, _ = _sample_point_risks(
-        route_points, Norm_RT, AirRisk, altitude_levels,
+        route_points, Norm_RT, AirRisk, risk_altitude_levels,
         use_heading_map, air_thr_global, lat_lim, lon_lim
     )
-    pt_noise_norm = _sample_point_noise(route_points, NoiseRisk, altitude_levels, lat_lim, lon_lim)
-    pt_noise_db = _sample_point_noise(route_points, NoiseRiskDb, altitude_levels, lat_lim, lon_lim)
+    pt_noise_norm = _sample_point_noise(route_points, NoiseRisk, risk_altitude_levels, lat_lim, lon_lim)
+    pt_noise_db = _sample_point_noise(route_points, NoiseRiskDb, risk_altitude_levels, lat_lim, lon_lim)
     df["Combined_Risk"] = pt_ground + pt_air + pt_noise_norm
     df["Ground_Risk"] = pt_ground
     df["Air_Risk"] = pt_air
@@ -2685,42 +8133,211 @@ def _export_route_outputs(
     df["Ground_Speed_kmh"] = pd.to_numeric(df["Ground_Speed_mps"], errors="coerce") * 3.6
 
     total_ground_risk, total_air_risk, _ = _aggregate_path_risks(
-        full_path, Norm_RT, AirRisk, altitude_levels,
+        full_path, Norm_RT, AirRisk, risk_altitude_levels,
         use_heading_map, cell_size, refine_scales,
         air_thr_global, lat_lim, lon_lim
     )
     total_noise_risk_norm = _aggregate_path_noise(
-        full_path, NoiseRisk, altitude_levels, cell_size, refine_scales, lat_lim, lon_lim
+        full_path, NoiseRisk, risk_altitude_levels, cell_size, refine_scales, lat_lim, lon_lim
     )
     total_noise_db_after_floor = _aggregate_path_noise(
-        full_path, NoiseRiskDb, altitude_levels, cell_size, refine_scales, lat_lim, lon_lim
+        full_path, NoiseRiskDb, risk_altitude_levels, cell_size, refine_scales, lat_lim, lon_lim
     )
     total_combined_all_risk = float(total_ground_risk + total_air_risk + total_noise_risk_norm)
     total_corridor_dist_2d_km = (float(p2d_cum[-1]) if len(p2d_cum) > 0 else 0.0) / 1000.0
     total_corridor_dist_3d_m = float(pcum[-1]) if len(pcum) > 0 else 0.0
     total_corridor_dist_3d_km = total_corridor_dist_3d_m / 1000.0
+    output_corridor_dist_2d_m = _polyline_cumulative_horizontal_m(output_path)
+    output_corridor_dist_2d_km = (
+        float(output_corridor_dist_2d_m[-1]) / 1000.0
+        if output_corridor_dist_2d_m.size else 0.0
+    )
+    output_corridor_dist_3d_m = _path_total_3d_distance_m(output_path)
+    output_corridor_dist_3d_km = output_corridor_dist_3d_m / 1000.0
     _ = (min_corridor_distance_m <= 0.0) or (total_corridor_dist_3d_m + 1e-6 >= min_corridor_distance_m)
 
-    f_best, _ = evaluate_objectives_with_constraints_gp(full_path, **evaluate_objectives_kwargs)
+    f_best, _ = evaluate_objectives_with_constraints_gp(
+        full_path,
+        flight_phases=evaluation_flight_phases,
+        **evaluate_objectives_kwargs,
+    )
 
+    transition_3d_validation = dict(
+        rf_best.get(
+            "transition_3d_validation",
+            params_dict.get("transition_3d_validation", {}),
+        )
+    )
+    sector_selection = dict(params_dict.get("sector_selection_analysis", {}))
+    sector_selected_pair = dict(sector_selection.get("selected_pair", {}))
     df_summary = pd.DataFrame([
         {"Metric": "Selected_Corridor", "Value": "Balanced_Optimal"},
         {"Metric": "Total_Corridor_Distance_2D_km", "Value": total_corridor_dist_2d_km},
         {"Metric": "Total_Corridor_Distance_3D_km", "Value": total_corridor_dist_3d_km},
+        {"Metric": "Evaluation_Full_Path_Distance_2D_km", "Value": total_corridor_dist_2d_km},
+        {"Metric": "Evaluation_Full_Path_Distance_3D_km", "Value": total_corridor_dist_3d_km},
+        {"Metric": "Public_Corridor_Distance_2D_km", "Value": output_corridor_dist_2d_km},
+        {"Metric": "Public_Corridor_Distance_3D_km", "Value": output_corridor_dist_3d_km},
+        {"Metric": "Evaluation_Full_Path_Point_Count", "Value": int(full_path.shape[0])},
+        {"Metric": "Public_Corridor_Point_Count", "Value": int(output_path.shape[0])},
         {"Metric": "Total_Ground_Risk", "Value": total_ground_risk},
         {"Metric": "Total_Air_Risk", "Value": total_air_risk},
         {"Metric": "Total_Noise_Risk", "Value": total_noise_risk_norm},
         {"Metric": "Total_Combined_Risk", "Value": total_combined_all_risk},
+        {"Metric": "Transition_Enabled", "Value": bool(use_takeoff_landing_transition)},
+        {"Metric": "Sector_Mode_Enabled", "Value": bool(params_dict.get("sector_mode_enabled", False))},
+        {"Metric": "Sector_Selection_Mode", "Value": str(sector_selection.get("mode", "unknown"))},
+        {"Metric": "Sector_Selection_Status", "Value": str(sector_selection.get("status", "unknown"))},
+        {"Metric": "Sector_Selection_Priority", "Value": str(sector_selection.get("selection_priority", "unknown"))},
+        {"Metric": "Sector_Wind_Period", "Value": str(sector_selection.get("season", params_dict.get("sector_season", "unknown")))},
+        {"Metric": "Sector_Wind_Months", "Value": ",".join(str(v) for v in sector_selection.get("wind_months", []))},
+        {"Metric": "Sector_MOC_Safe_Pair_Count", "Value": sector_selection.get("moc_safe_pair_count")},
+        {"Metric": "Takeoff_Sector_User", "Value": int(params_dict.get("takeoff_sector_user", 0))},
+        {"Metric": "Landing_Sector_User", "Value": int(params_dict.get("landing_sector_user", 0))},
+        {"Metric": "Takeoff_Sector_Selected", "Value": sector_selected_pair.get("takeoff_sector", params_dict.get("takeoff_sector_selected"))},
+        {"Metric": "Landing_Sector_Selected", "Value": sector_selected_pair.get("landing_sector", params_dict.get("landing_sector_selected"))},
+        {"Metric": "Sector_Selected_Combined_Risk", "Value": sector_selected_pair.get("combined_risk_score")},
+        {"Metric": "Sector_Selected_Wind_Risk", "Value": sector_selected_pair.get("wind_risk_score")},
+        {"Metric": "Sector_Selected_Ground_Risk", "Value": sector_selected_pair.get("ground_risk_score")},
+        {"Metric": "Sector_Selected_Air_Risk", "Value": sector_selected_pair.get("air_risk_score")},
+        {"Metric": "Sector_Selected_MOC_Issue_Ratio", "Value": sector_selected_pair.get("moc_issue_ratio")},
+        {"Metric": "Sector_Takeoff_MOC_Blocked_Cells", "Value": sector_selected_pair.get("takeoff_moc_blocked_cell_count")},
+        {"Metric": "Sector_Takeoff_MOC_Tested_Cells", "Value": sector_selected_pair.get("takeoff_moc_tested_cell_count")},
+        {"Metric": "Sector_Takeoff_MOC_OUT_OF_GRID", "Value": sector_selected_pair.get("takeoff_moc_out_of_grid_sample_count")},
+        {"Metric": "Sector_Landing_MOC_Blocked_Cells", "Value": sector_selected_pair.get("landing_moc_blocked_cell_count")},
+        {"Metric": "Sector_Landing_MOC_Tested_Cells", "Value": sector_selected_pair.get("landing_moc_tested_cell_count")},
+        {"Metric": "Sector_Landing_MOC_OUT_OF_GRID", "Value": sector_selected_pair.get("landing_moc_out_of_grid_sample_count")},
+        {"Metric": "Sector_Diagnostic_Figure", "Value": sector_selection.get("diagnostic_figure")},
+        {"Metric": "Transition_Structure_Mode", "Value": str(params_dict.get("transition_structure_mode", "unknown"))},
+        {"Metric": "Transition_Structure_Mode_Effective", "Value": str(params_dict.get("transition_structure_mode_effective", "off"))},
+        {"Metric": "Transition_Geometry_Mode", "Value": str(params_dict.get("transition_mode", "unknown"))},
+        {"Metric": "Two_Stage_Transition_Configured", "Value": bool(params_dict.get("use_two_stage_transition", False))},
+        {"Metric": "Two_Stage_Transition_Enabled", "Value": bool(
+            use_takeoff_landing_transition and params_dict.get("use_two_stage_transition", False)
+        )},
+        {"Metric": "Transition_Feasible", "Value": bool(rf_best.get("transition_feasible", True))},
+        {"Metric": "Transition_Fail_Reason", "Value": str(rf_best.get("transition_fail_reason", "ok"))},
+        {"Metric": "Fixed_Transition_General_Output_Suppressed", "Value": fixed_output_suppressed},
+        {"Metric": "Fixed_Transition_Evaluated_But_Not_Exported", "Value": bool(params_dict.get("fixed_transition_evaluated_but_not_exported", False))},
+        {"Metric": "MOC_Audit_Includes_Fixed_Transition", "Value": bool(params_dict.get("moc_audit_includes_fixed_transition", False))},
+        {"Metric": "Takeoff_Optimized_Transition_Actual", "Value": bool(params_dict.get("takeoff_optimized_transition_actual", False))},
+        {"Metric": "Landing_Optimized_Transition_Actual", "Value": bool(params_dict.get("landing_optimized_transition_actual", False))},
+        {"Metric": "Takeoff_Stage2_Collapsed_At_Cruise", "Value": bool(params_dict.get("takeoff_stage2_collapsed_at_cruise", False))},
+        {"Metric": "Landing_Stage2_Collapsed_At_Cruise", "Value": bool(params_dict.get("landing_stage2_collapsed_at_cruise", False))},
+        {"Metric": "Transition_Corridor_Half_Width_m", "Value": float(params_dict.get("transition_corridor_half_width_m", 0.0))},
+        {"Metric": "Transition_Corridor_Total_Width_m", "Value": float(2.0 * params_dict.get("transition_corridor_half_width_m", 0.0))},
+        {"Metric": "Transition_Downward_Clearance_m", "Value": float(params_dict.get("transition_vertical_clearance_m", 0.0))},
+        {"Metric": "Transition_3D_Validation_Status", "Value": str(transition_3d_validation.get("status", "NOT GENERATED"))},
+        {"Metric": "Transition_3D_Validation_Reason", "Value": str(transition_3d_validation.get("reason", "unknown"))},
+        {"Metric": "Takeoff_Transition_3D_Status", "Value": str(transition_3d_validation.get("directions", {}).get("takeoff", {}).get("status", "NOT GENERATED"))},
+        {"Metric": "Landing_Transition_3D_Status", "Value": str(transition_3d_validation.get("directions", {}).get("landing", {}).get("status", "NOT GENERATED"))},
+        {"Metric": "Transition_MOC_3D_Status", "Value": str(transition_3d_validation.get("moc_status", "NOT GENERATED"))},
+        {"Metric": "Transition_NFZ_Envelope_Status", "Value": str(transition_3d_validation.get("nfz_status", "NOT GENERATED"))},
+        {"Metric": "Transition_Airspace_Envelope_Status", "Value": str(transition_3d_validation.get("airspace_status", "NOT GENERATED"))},
+        {"Metric": "Transition_Self_Overlap_Status", "Value": str(transition_3d_validation.get("self_overlap_status", "NOT GENERATED"))},
+        {"Metric": "Takeoff_Stage1_Distance_m", "Value": float(takeoff_cfg.get("stage1_straight_distance_m", 0.0))},
+        {"Metric": "Landing_Stage1_Distance_m", "Value": float(landing_cfg.get("stage1_straight_distance_m", 0.0))},
+        {"Metric": "Takeoff_Fixed_Prefix_Requested_m", "Value": float(takeoff_cfg.get("stage1_requested_straight_distance_m", 0.0))},
+        {"Metric": "Landing_Fixed_Prefix_Requested_m", "Value": float(landing_cfg.get("stage1_requested_straight_distance_m", 0.0))},
+        {"Metric": "Takeoff_Total_Transition_Distance_Configured_m", "Value": params_dict.get("takeoff_total_transition_horizontal_distance_m")},
+        {"Metric": "Landing_Total_Transition_Distance_Configured_m", "Value": params_dict.get("landing_total_transition_horizontal_distance_m")},
+        {"Metric": "Takeoff_Transition_Distance_2D_m", "Value": float(transition_meta.get("takeoff_transition_total_horizontal_distance_m", 0.0))},
+        {"Metric": "Landing_Transition_Distance_2D_m", "Value": float(transition_meta.get("landing_transition_total_horizontal_distance_m", 0.0))},
+        {"Metric": "Takeoff_Climb_Angle_deg", "Value": params_dict.get("takeoff_climb_angle_deg", 0.0)},
+        {"Metric": "Landing_Descent_Angle_deg", "Value": params_dict.get("landing_descent_angle_deg", 0.0)},
+        {"Metric": "Takeoff_Actual_Climb_Angle_deg", "Value": float(params_dict.get("actual_takeoff_angle_deg", 0.0))},
+        {"Metric": "Landing_Actual_Descent_Angle_deg", "Value": float(params_dict.get("actual_landing_angle_deg", 0.0))},
+        {"Metric": "Takeoff_Stage1_End_Altitude_MSL_m", "Value": (None if takeoff_stage1_end is None else float(takeoff_stage1_end[2]))},
+        {"Metric": "Takeoff_Transition_End_Altitude_MSL_m", "Value": (None if takeoff_transition_end is None else float(takeoff_transition_end[2]))},
+        {"Metric": "Landing_Transition_Start_Altitude_MSL_m", "Value": (None if landing_transition_start is None else float(landing_transition_start[2]))},
+        {"Metric": "Landing_Stage1_Start_Altitude_MSL_m", "Value": (None if landing_stage1_start is None else float(landing_stage1_start[2]))},
+        {"Metric": "Phase_Count_Vertiport", "Value": phase_counts[FLIGHT_PHASE_VERTIPORT]},
+        {"Metric": "Phase_Count_Takeoff_Stage1", "Value": phase_counts[FLIGHT_PHASE_TAKEOFF_STAGE1]},
+        {"Metric": "Phase_Count_Takeoff_Stage2", "Value": phase_counts[FLIGHT_PHASE_TAKEOFF_STAGE2]},
+        {"Metric": "Phase_Count_Cruise", "Value": phase_counts[FLIGHT_PHASE_CRUISE]},
+        {"Metric": "Phase_Count_Landing_Stage2", "Value": phase_counts[FLIGHT_PHASE_LANDING_STAGE2]},
+        {"Metric": "Phase_Count_Landing_Stage1", "Value": phase_counts[FLIGHT_PHASE_LANDING_STAGE1]},
     ])
 
     params_dict.update({
+        "evaluation_full_path_distance_2d_m": float(total_corridor_dist_2d_km * 1000.0),
+        "evaluation_full_path_distance_3d_m": float(total_corridor_dist_3d_m),
+        "evaluation_full_path_point_count": int(full_path.shape[0]),
+        "public_corridor_distance_2d_m": float(output_corridor_dist_2d_km * 1000.0),
+        "public_corridor_distance_3d_m": float(output_corridor_dist_3d_m),
+        "public_corridor_point_count": int(output_path.shape[0]),
         "noise_result_summary": {
             "total_noise_risk_normalized": float(total_noise_risk_norm),
             "total_noise_lden_db_after_floor": float(total_noise_db_after_floor),
             "objective_noise_risk_weighted": (float(f_best[3]) if len(f_best) > 3 else None),
             "w_noise": float(w_noise),
             "noise_floor_db": float(noise_floor_db),
-        }
+        },
+        # Preserve the legacy aliases, but keep their historical meaning as the
+        # completed takeoff transition and the start of the landing transition.
+        "takeoff_complete": _point_json(takeoff_output_point),
+        "landing_entry": _point_json(landing_output_point),
+        "balanced_transition_result": {
+            "enabled": bool(use_takeoff_landing_transition),
+            "transition_structure_mode": str(
+                params_dict.get("transition_structure_mode", "unknown")
+            ),
+            "two_stage_enabled": bool(
+                use_takeoff_landing_transition
+                and params_dict.get("use_two_stage_transition", False)
+            ),
+            "feasible": bool(rf_best.get("transition_feasible", True)),
+            "fail_reason": str(rf_best.get("transition_fail_reason", "ok")),
+            "fail_reasons": [str(v) for v in rf_best.get("transition_fail_reasons", [])],
+            "validation_checks": {
+                str(k): bool(v)
+                for k, v in transition_meta.get("validation_checks", {}).items()
+            },
+            "takeoff_stage1_end": _point_json(takeoff_stage1_end),
+            "takeoff_transition_end": _point_json(takeoff_transition_end),
+            "landing_transition_start": _point_json(landing_transition_start),
+            "landing_stage1_start": _point_json(landing_stage1_start),
+            "takeoff_stage1_distance_m": float(takeoff_cfg.get("stage1_straight_distance_m", 0.0)),
+            "landing_stage1_distance_m": float(landing_cfg.get("stage1_straight_distance_m", 0.0)),
+            "takeoff_fixed_prefix_requested_distance_m": float(
+                takeoff_cfg.get("stage1_requested_straight_distance_m", 0.0)
+            ),
+            "landing_fixed_prefix_requested_distance_m": float(
+                landing_cfg.get("stage1_requested_straight_distance_m", 0.0)
+            ),
+            "takeoff_transition_distance_2d_m": float(transition_meta.get("takeoff_transition_total_horizontal_distance_m", 0.0)),
+            "landing_transition_distance_2d_m": float(transition_meta.get("landing_transition_total_horizontal_distance_m", 0.0)),
+            "takeoff_optimized_transition_actual": bool(
+                transition_meta.get("takeoff_optimized_transition_actual", False)
+            ),
+            "landing_optimized_transition_actual": bool(
+                transition_meta.get("landing_optimized_transition_actual", False)
+            ),
+            "fixed_transition_general_output_suppressed": fixed_output_suppressed,
+            "evaluation_full_path_distance_2d_m": float(total_corridor_dist_2d_km * 1000.0),
+            "evaluation_full_path_distance_3d_m": float(total_corridor_dist_3d_m),
+            "evaluation_full_path_point_count": int(full_path.shape[0]),
+            "public_corridor_distance_2d_m": float(output_corridor_dist_2d_km * 1000.0),
+            "public_corridor_distance_3d_m": float(output_corridor_dist_3d_m),
+            "public_corridor_point_count": int(output_path.shape[0]),
+            "takeoff_climb_angle_deg": params_dict.get("takeoff_climb_angle_deg", 0.0),
+            "landing_descent_angle_deg": params_dict.get("landing_descent_angle_deg", 0.0),
+            "takeoff_actual_climb_angle_deg": float(
+                params_dict.get("actual_takeoff_angle_deg", 0.0)
+            ),
+            "landing_actual_descent_angle_deg": float(
+                params_dict.get("actual_landing_angle_deg", 0.0)
+            ),
+            "takeoff_stage2_collapsed_at_cruise": bool(
+                transition_meta.get("takeoff_stage2_collapsed_at_cruise", False)
+            ),
+            "landing_stage2_collapsed_at_cruise": bool(
+                transition_meta.get("landing_stage2_collapsed_at_cruise", False)
+            ),
+            "flight_phase_counts": phase_counts,
+            "balanced_path_flight_phase_counts": balanced_phase_counts,
+            "transition_3d_validation": transition_3d_validation,
+        },
     })
     with open(out_dir / "params.json", "w", encoding="utf-8") as _pf:
         json.dump(params_dict, _pf, indent=2, ensure_ascii=False)
@@ -2786,7 +8403,7 @@ def _export_route_outputs(
                 df_excel.loc[idx + 1, "RF_Start"] = ""
 
     route_col_order = [
-        "Point_No", "Type", "Segment", "Lat", "Lon", "Altitude_MSL_m", "Altitude_AGL_m",
+        "Point_No", "Type", "Segment", "Flight_Phase", "Lat", "Lon", "Altitude_MSL_m", "Altitude_AGL_m",
         "Combined_Risk", "Ground_Risk", "Air_Risk", "Noise_Risk_Norm_0to1", "Noise_Lden_dB_Above_Floor",
         "Dist_From_Prev_2D_km", "Dist_From_Prev_3D_km", "Cumulative_Dist_2D_km", "Cumulative_Dist_3D_km",
         "Turn_Radius_m", "Turn_Angle_deg", "LookAhead_Radius_Scale",
@@ -2803,7 +8420,31 @@ def _export_route_outputs(
     for c in flag_cols:
         if c in df_excel.columns:
             cr_mask = cr_mask | (df_excel[c].astype(str).str.strip().str.upper().eq("O").to_numpy(dtype=bool))
-    cr_mask = cr_mask & non_vertiport_mask
+    if "Flight_Phase" in df_excel.columns:
+        stage1_mask = df_excel["Flight_Phase"].astype(str).isin([
+            FLIGHT_PHASE_TAKEOFF_STAGE1,
+            FLIGHT_PHASE_LANDING_STAGE1,
+        ]).to_numpy(dtype=bool)
+    else:
+        stage1_mask = np.zeros(len(df_excel), dtype=bool)
+    transition_boundary_mask = np.zeros(len(df_excel), dtype=bool)
+    for boundary in (
+        takeoff_stage1_end,
+        landing_stage1_start,
+        takeoff_transition_end,
+        landing_transition_start,
+    ):
+        if boundary is None:
+            continue
+        for row_idx in range(len(df_excel)):
+            row_point = np.array([
+                float(df_excel.loc[row_idx, "Lat"]),
+                float(df_excel.loc[row_idx, "Lon"]),
+                float(df_excel.loc[row_idx, "Altitude_MSL_m"]),
+            ], dtype=float)
+            if _seg_dist_3d_m(row_point, boundary) <= 0.5:
+                transition_boundary_mask[row_idx] = True
+    cr_mask = cr_mask & non_vertiport_mask & ~stage1_mask & ~transition_boundary_mask
     cr_indices = np.flatnonzero(cr_mask)
     for k, ridx in enumerate(cr_indices, start=1):
         df_excel.loc[ridx, "CR_Name"] = f"CR{k:03d}"
@@ -2839,42 +8480,66 @@ def _export_route_outputs(
         for i, p in enumerate(rf_centers)
     ])
 
+    takeoff_transition_boundary_phase = (
+        FLIGHT_PHASE_TAKEOFF_STAGE2
+        if bool(transition_meta.get("takeoff_optimized_transition_actual", False))
+        else FLIGHT_PHASE_CRUISE
+    )
     input_rows = [
         {
             "Point_Name": "Start_Vertiport",
+            "Flight_Phase": FLIGHT_PHASE_VERTIPORT,
             "Lat": float(start_vertiport[0]),
             "Lon": float(start_vertiport[1]),
             "Alt_m": float(start_vertiport[2]),
         },
         {
             "Point_Name": "End_Vertiport",
+            "Flight_Phase": FLIGHT_PHASE_VERTIPORT,
             "Lat": float(end_vertiport[0]),
             "Lon": float(end_vertiport[1]),
             "Alt_m": float(end_vertiport[2]),
         },
         {
             "Point_Name": "Takeoff_Point",
-            "Lat": float(takeoff_complete[0]),
-            "Lon": float(takeoff_complete[1]),
-            "Alt_m": float(takeoff_complete[2]),
+            "Flight_Phase": takeoff_transition_boundary_phase,
+            "Lat": float(takeoff_output_point[0]),
+            "Lon": float(takeoff_output_point[1]),
+            "Alt_m": float(takeoff_output_point[2]),
         },
         {
             "Point_Name": "Landing_Point",
-            "Lat": float(landing_entry[0]),
-            "Lon": float(landing_entry[1]),
-            "Alt_m": float(landing_entry[2]),
+            "Flight_Phase": FLIGHT_PHASE_CRUISE,
+            "Lat": float(landing_output_point[0]),
+            "Lon": float(landing_output_point[1]),
+            "Alt_m": float(landing_output_point[2]),
         },
     ]
+    for point_name, point, phase in (
+        ("Takeoff_Stage1_End", takeoff_stage1_end, FLIGHT_PHASE_TAKEOFF_STAGE1),
+        ("Landing_Stage1_Start", landing_stage1_start, FLIGHT_PHASE_LANDING_STAGE2),
+        ("Takeoff_Transition_End", takeoff_transition_end, takeoff_transition_boundary_phase),
+        ("Landing_Transition_Start", landing_transition_start, FLIGHT_PHASE_CRUISE),
+    ):
+        if point is not None:
+            input_rows.append({
+                "Point_Name": point_name,
+                "Flight_Phase": phase,
+                "Lat": float(point[0]),
+                "Lon": float(point[1]),
+                "Alt_m": float(point[2]),
+            })
     n_wp_default = min(int(np.size(corridor_lat_default)), int(np.size(corridor_lon_default)))
     for i_wp in range(n_wp_default):
         input_rows.append({
             "Point_Name": f"WP_Default_{i_wp+1:03d}",
+            "Flight_Phase": FLIGHT_PHASE_CRUISE,
             "Lat": float(corridor_lat_default[i_wp]),
             "Lon": float(corridor_lon_default[i_wp]),
             "Alt_m": float(waypoint_alt_fixed_m),
         })
     df_input_points = pd.DataFrame(input_rows, columns=[
-        "Point_Name", "Lat", "Lon", "Alt_m"
+        "Point_Name", "Flight_Phase", "Lat", "Lon", "Alt_m"
     ])
 
     xlsx_name = out_dir / "route_data.xlsx"
@@ -2886,7 +8551,7 @@ def _export_route_outputs(
         df_summary.to_excel(writer, index=False, sheet_name="Summary")
         df_airspace.to_excel(writer, index=False, sheet_name="Airspace_Info")
         df_nfz.to_excel(writer, index=False, sheet_name="NFZ_Info")
-    print(f"Saved {xlsx_name} (Optimized Corridor: {len(df_excel)} points, Transitions excluded)")
+    print(f"Saved {xlsx_name} (Full optimized corridor: {len(df_excel)} points)")
 
     excel_fig_name = out_dir / "fig_route_from_excel_map.png"
     excel_fig_title = _title_with_altitude(
@@ -2908,11 +8573,13 @@ def _export_route_outputs(
 def _plot_representative_corridor_figures(
     reps,
     apply_rf_corridor_fn,
+    output_rf_view_fn,
     eval_corridor_objectives_fn,
     objective_names,
     altitude_levels,
     start_vertiport,
     W_half,
+    transition_corridor_cfg,
     out_dir,
     request,
     map_extent,
@@ -2929,9 +8596,8 @@ def _plot_representative_corridor_figures(
     landing_entry,
     init_rep_objectives,
     f_initial_backbone,
-    takeoff_transition_profile,
-    landing_transition_profile_desc,
     use_takeoff_landing_transition,
+    transition_structure_mode,
     setup_corridor_axes_fn,
     plot_standard_key_markers_fn,
 ):
@@ -2941,8 +8607,8 @@ def _plot_representative_corridor_figures(
         ax.plot([], [], "-", color=color, linewidth=tf_lw, label=f"{name} (TF)")
         ax.plot([], [], "-", color=color, linewidth=rf_lw, label=f"{name} (RF arc)")
         if include_transition:
-            ax.plot([], [], "-", color="dodgerblue", linewidth=transition_lw, label="Takeoff Transition")
-            ax.plot([], [], "-", color="seagreen", linewidth=transition_lw, label="Landing Transition")
+            ax.plot([], [], "-", color=TAKEOFF_TRANSITION_COLOR, linewidth=transition_lw, label="Takeoff Transition")
+            ax.plot([], [], "-", color=LANDING_TRANSITION_COLOR, linewidth=transition_lw, label="Landing Transition")
 
     def _add_arc_marker_legend_handles(ax):
         ax.scatter([], [], s=40, c="yellow", marker=">", edgecolors="k", label="Arc Start")
@@ -2953,7 +8619,17 @@ def _plot_representative_corridor_figures(
         ax.scatter([], [], s=36, facecolors="none", edgecolors="red", linewidths=1.1, label="CR Point")
         ax.scatter([], [], s=50, c="white", marker="x", linewidths=1.5, label="RFC (Arc Center)")
 
-    def _collect_cr_points_from_segments(segments, tol_m=0.5):
+    def _collect_cr_points_from_segments(segments, excluded_points=None, tol_m=0.5):
+        segments = [
+            seg for seg in segments
+            if not bool(seg.get("is_fixed_transition_stage1", False))
+        ]
+        excluded_source = [] if excluded_points is None else excluded_points
+        excluded = [
+            np.asarray(p, dtype=float).reshape(3)
+            for p in excluded_source
+            if p is not None
+        ]
         cr_pts = []
         for si, seg in enumerate(segments):
             pts = np.asarray(seg["points"], dtype=float)
@@ -2967,6 +8643,8 @@ def _plot_representative_corridor_figures(
         unique_pts = []
         labels = []
         for p in cr_pts:
+            if any(_seg_dist_3d_m(p, ep) <= float(tol_m) for ep in excluded):
+                continue
             is_dup = False
             for up in unique_pts:
                 if _seg_dist_3d_m(p, up) <= float(tol_m):
@@ -3004,33 +8682,25 @@ def _plot_representative_corridor_figures(
     rep_labels = objective_names + ["Balanced"]
     rep_colors = [plt.cm.tab10(i % 10) for i in range(len(objective_names))] + ["black"]
     for ri, rep in enumerate(reps):
-        rf = apply_rf_corridor_fn(rep)
+        rf = output_rf_view_fn(apply_rf_corridor_fn(rep))
         rp = rf["path"]
         segs = rf["segments"]
         col = rep_colors[ri] if ri < len(rep_colors) else rep_colors[-1]
         lab = rep_labels[ri] if ri < len(rep_labels) else f"Rep{ri}"
 
-        plot_corridor_width(gx4, rp, W_half, color=col, alpha=0.08)
+        _plot_corridor_width_by_phase_v1(
+            gx4, rf, W_half, transition_corridor_cfg, color=col, alpha=0.08
+        )
 
-        for seg in segs:
-            pts = seg["points"]
-            if seg["type"] == "TF":
-                gx4.plot(pts[:, 1], pts[:, 0], "-", color=col, linewidth=1.5,
-                         transform=ccrs.Geodetic(), zorder=8)
-                gx4.scatter(pts[0, 1], pts[0, 0], s=25, color=col, marker="o",
-                            edgecolors="k", linewidths=0.4, transform=ccrs.Geodetic(), zorder=9)
-                gx4.scatter(pts[-1, 1], pts[-1, 0], s=25, color=col, marker="o",
-                            edgecolors="k", linewidths=0.4, transform=ccrs.Geodetic(), zorder=9)
-            elif seg["type"] == "RF":
-                gx4.plot(pts[:, 1], pts[:, 0], "-", color=col, linewidth=2.0,
-                         transform=ccrs.Geodetic(), zorder=8)
-                gx4.scatter(pts[0, 1], pts[0, 0], s=40, c="yellow", marker=">",
-                            edgecolors="k", linewidths=0.6, transform=ccrs.Geodetic(), zorder=10)
-                gx4.scatter(pts[-1, 1], pts[-1, 0], s=40, c="yellow", marker="s",
-                            edgecolors="k", linewidths=0.6, transform=ccrs.Geodetic(), zorder=10)
-                ac = seg["arc_center"]
-                gx4.scatter(ac[1], ac[0], s=50, c="white", marker="x",
-                            linewidths=1.5, transform=ccrs.Geodetic(), zorder=10)
+        _plot_rf_segments_by_phase(
+            gx4, rf, cruise_color=col, tf_lw=1.5, rf_lw=2.0,
+            transform=ccrs.Geodetic(), zorder=8,
+            transition_labels=(ri == 0), draw_rf_markers=True,
+        )
+        _plot_transition_phase_markers(
+            gx4, rf, transform=ccrs.Geodetic(), zorder=12, labels=(ri == 0),
+            include_stage1=False, general_output=True,
+        )
 
         _add_rf_legend_handles(gx4, col, lab, tf_lw=1.5, rf_lw=2.5, include_transition=False)
 
@@ -3044,7 +8714,7 @@ def _plot_representative_corridor_figures(
     if len(reps) > 3:
         risk_configs = [
             {"idx": 1, "name": "Ground Risk", "filename": "fig4_ground_risk_corridor.png", "color": "orange"},
-            {"idx": 2, "name": "Air Risk", "filename": "fig4_air_risk_corridor.png", "color": "blue"},
+            {"idx": 2, "name": "Air Risk", "filename": "fig4_air_risk_corridor.png", "color": "cyan"},
             {"idx": 3, "name": "Noise Risk", "filename": "fig4_noise_risk_corridor.png", "color": "purple"},
         ]
         for config in risk_configs:
@@ -3053,15 +8723,20 @@ def _plot_representative_corridor_figures(
                 continue
 
             risk_rep = reps[risk_idx]
-            rf_risk = apply_rf_corridor_fn(risk_rep)
-            risk_full_path = rf_risk["path"]
+            rf_risk_full = apply_rf_corridor_fn(risk_rep)
+            risk_full_path = rf_risk_full["path"]
+            rf_risk = output_rf_view_fn(rf_risk_full)
+            risk_transition_meta = rf_risk_full.get("transition_meta", {})
 
             fig_risk = plt.figure(f"Figure 4: {config['name']} Corridor", figsize=(14, 10))
             fig_risk.subplots_adjust(left=0.05, right=0.72)
             gx_risk = fig_risk.add_subplot(1, 1, 1, projection=request.crs)
             gx_risk.set_extent(map_extent)
             gx_risk.add_image(request, 13)
-            f_risk_opt, _ = eval_corridor_objectives_fn(risk_full_path)
+            f_risk_opt, _ = eval_corridor_objectives_fn(
+                risk_full_path,
+                rf_risk_full.get("flight_phases"),
+            )
             if init_rep_objectives is not None and risk_idx < len(init_rep_objectives):
                 risk_init_val = float(init_rep_objectives[risk_idx][risk_idx])
             else:
@@ -3090,45 +8765,65 @@ def _plot_representative_corridor_figures(
                             marker="s", transform=ccrs.Geodetic(), label="Start Vertiport", zorder=7)
             gx_risk.scatter([end_vertiport[1]], [end_vertiport[0]], s=120, c="crimson", edgecolors="k",
                             marker="D", transform=ccrs.Geodetic(), label="End Vertiport", zorder=7)
-            gx_risk.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, c="blue",
-                            marker="^", transform=ccrs.Geodetic(), label="Takeoff_End", zorder=7)
-            gx_risk.scatter([landing_entry[1]], [landing_entry[0]], s=90, c="green",
-                            marker="v", transform=ccrs.Geodetic(), label="Landing_End", zorder=7)
+            if not use_takeoff_landing_transition:
+                gx_risk.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                                c=TAKEOFF_TRANSITION_COLOR, marker="^", transform=ccrs.Geodetic(),
+                                label="Takeoff_End", zorder=7)
+                gx_risk.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                                c=LANDING_TRANSITION_COLOR, marker="v", transform=ccrs.Geodetic(),
+                                label="Landing_End", zorder=7)
+            elif transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY:
+                gx_risk.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                                c=TAKEOFF_TRANSITION_COLOR, marker="^", transform=ccrs.Geodetic(),
+                                label="Takeoff Transition End", zorder=7)
+                gx_risk.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                                c=LANDING_TRANSITION_COLOR, marker="v", transform=ccrs.Geodetic(),
+                                label="Landing Transition Start", zorder=7)
+            elif _seg_dist_m(start_vertiport, takeoff_complete) > 0.5:
+                if bool(risk_transition_meta.get("takeoff_optimized_transition_actual", True)):
+                    gx_risk.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, facecolors="none",
+                                    edgecolors=TAKEOFF_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                                    transform=ccrs.Geodetic(), label="Takeoff Stage1 End", zorder=7)
+                else:
+                    gx_risk.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                                    c=TAKEOFF_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="^",
+                                    transform=ccrs.Geodetic(), label="Takeoff Transition End", zorder=7)
+            if (
+                use_takeoff_landing_transition
+                and transition_structure_mode != TRANSITION_STRUCTURE_FIXED_ONLY
+                and _seg_dist_m(end_vertiport, landing_entry) > 0.5
+            ):
+                if bool(risk_transition_meta.get("landing_optimized_transition_actual", True)):
+                    gx_risk.scatter([landing_entry[1]], [landing_entry[0]], s=90, facecolors="none",
+                                    edgecolors=LANDING_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                                    transform=ccrs.Geodetic(), label="Landing Stage1 Start", zorder=7)
+                else:
+                    gx_risk.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                                    c=LANDING_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="v",
+                                    transform=ccrs.Geodetic(), label="Landing Transition Start", zorder=7)
 
-            plot_corridor_width(gx_risk, risk_full_path, W_half, color=config["color"], alpha=0.08)
+            _plot_corridor_width_by_phase_v1(
+                gx_risk,
+                rf_risk,
+                W_half,
+                transition_corridor_cfg,
+                color=config["color"],
+                alpha=0.08,
+            )
 
-            if takeoff_transition_profile is not None and np.size(takeoff_transition_profile) > 0:
-                tp = np.asarray(takeoff_transition_profile, dtype=float)
-                gx_risk.plot(tp[:, 1], tp[:, 0], "-", color="dodgerblue", linewidth=1.2,
-                             transform=ccrs.Geodetic(), zorder=7)
-            if landing_transition_profile_desc is not None and np.size(landing_transition_profile_desc) > 0:
-                lp = np.asarray(landing_transition_profile_desc, dtype=float)
-                gx_risk.plot(lp[:, 1], lp[:, 0], "-", color="seagreen", linewidth=1.2,
-                             transform=ccrs.Geodetic(), zorder=7)
-
-            for seg in rf_risk["segments"]:
-                pts = seg["points"]
-                if seg["type"] == "TF":
-                    gx_risk.plot(pts[:, 1], pts[:, 0], "-", color=config["color"], linewidth=1.5,
-                                 transform=ccrs.Geodetic(), zorder=8)
-                    gx_risk.scatter(pts[0, 1], pts[0, 0], s=25, color=config["color"], marker="o",
-                                    edgecolors="k", linewidths=0.4, transform=ccrs.Geodetic(), zorder=9)
-                    gx_risk.scatter(pts[-1, 1], pts[-1, 0], s=25, color=config["color"], marker="o",
-                                    edgecolors="k", linewidths=0.4, transform=ccrs.Geodetic(), zorder=9)
-                elif seg["type"] == "RF":
-                    gx_risk.plot(pts[:, 1], pts[:, 0], "-", color=config["color"], linewidth=2.0,
-                                 transform=ccrs.Geodetic(), zorder=8)
-                    gx_risk.scatter(pts[0, 1], pts[0, 0], s=40, c="yellow", marker=">",
-                                    edgecolors="k", linewidths=0.6, transform=ccrs.Geodetic(), zorder=10)
-                    gx_risk.scatter(pts[-1, 1], pts[-1, 0], s=40, c="yellow", marker="s",
-                                    edgecolors="k", linewidths=0.6, transform=ccrs.Geodetic(), zorder=10)
-                    ac = seg["arc_center"]
-                    gx_risk.scatter(ac[1], ac[0], s=50, c="white", marker="x",
-                                    linewidths=1.5, transform=ccrs.Geodetic(), zorder=10)
+            _plot_rf_segments_by_phase(
+                gx_risk, rf_risk, cruise_color=config["color"], tf_lw=1.5, rf_lw=2.0,
+                transform=ccrs.Geodetic(), zorder=8,
+                transition_labels=True, draw_rf_markers=True,
+            )
+            _plot_transition_phase_markers(
+                gx_risk, rf_risk, transform=ccrs.Geodetic(), zorder=12, labels=True,
+                include_stage1=False, general_output=True,
+            )
 
             _add_rf_legend_handles(
                 gx_risk, config["color"], config["name"], tf_lw=1.5, rf_lw=2.5,
-                include_transition=True, transition_lw=1.2
+                include_transition=False, transition_lw=1.2
             )
             _add_arc_marker_legend_handles(gx_risk)
 
@@ -3139,8 +8834,9 @@ def _plot_representative_corridor_figures(
 
     if reps:
         balanced_rep = reps[-1]
-        rf_bal = apply_rf_corridor_fn(balanced_rep)
-        bal_full_path = rf_bal["path"]
+        rf_bal_full = apply_rf_corridor_fn(balanced_rep)
+        bal_full_path = rf_bal_full["path"]
+        rf_bal = output_rf_view_fn(rf_bal_full)
 
         fig5 = plt.figure("Figure 5: Balanced Corridor Only", figsize=(14, 10))
         gx5 = setup_corridor_axes_fn(fig5, "Balanced Corridor Only (RF Turn)", with_moc=True)
@@ -3150,34 +8846,22 @@ def _plot_representative_corridor_figures(
             backbone_lw=1.2, zorder=7
         )
 
-        plot_corridor_width(gx5, bal_full_path, W_half, color="black", alpha=0.14)
-        if takeoff_transition_profile is not None and np.size(takeoff_transition_profile) > 0:
-            tp = np.asarray(takeoff_transition_profile, dtype=float)
-            gx5.plot(tp[:, 1], tp[:, 0], "-", color="dodgerblue", linewidth=1.5,
-                     transform=ccrs.Geodetic(), zorder=7)
-        if landing_transition_profile_desc is not None and np.size(landing_transition_profile_desc) > 0:
-            lp = np.asarray(landing_transition_profile_desc, dtype=float)
-            gx5.plot(lp[:, 1], lp[:, 0], "-", color="seagreen", linewidth=1.5,
-                     transform=ccrs.Geodetic(), zorder=7)
-        for seg in rf_bal["segments"]:
-            pts = seg["points"]
-            if seg["type"] == "TF":
-                gx5.plot(pts[:, 1], pts[:, 0], "-", color="black", linewidth=1.8,
-                         transform=ccrs.Geodetic(), zorder=8)
-            else:
-                gx5.plot(pts[:, 1], pts[:, 0], "-", color="black", linewidth=2.8,
-                         transform=ccrs.Geodetic(), zorder=9)
-                gx5.scatter(pts[0, 1], pts[0, 0], s=40, c="yellow", marker=">",
-                            edgecolors="k", linewidths=0.6, transform=ccrs.Geodetic(), zorder=10)
-                gx5.scatter(pts[-1, 1], pts[-1, 0], s=40, c="yellow", marker="s",
-                            edgecolors="k", linewidths=0.6, transform=ccrs.Geodetic(), zorder=10)
-                ac = seg["arc_center"]
-                gx5.scatter(ac[1], ac[0], s=50, c="white", marker="x",
-                            linewidths=1.5, transform=ccrs.Geodetic(), zorder=10)
+        _plot_corridor_width_by_phase_v1(
+            gx5, rf_bal, W_half, transition_corridor_cfg, color="black", alpha=0.14
+        )
+        _plot_rf_segments_by_phase(
+            gx5, rf_bal, cruise_color="black", tf_lw=1.8, rf_lw=2.8,
+            transform=ccrs.Geodetic(), zorder=8,
+            transition_labels=True, draw_rf_markers=True,
+        )
+        _plot_transition_phase_markers(
+            gx5, rf_bal, transform=ccrs.Geodetic(), zorder=12, labels=True,
+            include_stage1=False, general_output=True,
+        )
 
         _add_rf_legend_handles(
             gx5, "black", "Balanced", tf_lw=1.8, rf_lw=2.8,
-            include_transition=True, transition_lw=1.5
+            include_transition=False, transition_lw=1.5
         )
         _add_arc_marker_legend_handles(gx5)
         gx5.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=7, framealpha=0.9)
@@ -3193,34 +8877,22 @@ def _plot_representative_corridor_figures(
             backbone_lw=1.2, zorder=10
         )
 
-        plot_corridor_width(gx5b, bal_full_path, W_half, color="black", alpha=0.14)
-        if takeoff_transition_profile is not None and np.size(takeoff_transition_profile) > 0:
-            tp = np.asarray(takeoff_transition_profile, dtype=float)
-            gx5b.plot(tp[:, 1], tp[:, 0], "-", color="dodgerblue", linewidth=1.5,
-                      transform=ccrs.Geodetic(), zorder=7)
-        if landing_transition_profile_desc is not None and np.size(landing_transition_profile_desc) > 0:
-            lp = np.asarray(landing_transition_profile_desc, dtype=float)
-            gx5b.plot(lp[:, 1], lp[:, 0], "-", color="seagreen", linewidth=1.5,
-                      transform=ccrs.Geodetic(), zorder=7)
-        for seg in rf_bal["segments"]:
-            pts = seg["points"]
-            if seg["type"] == "TF":
-                gx5b.plot(pts[:, 1], pts[:, 0], "-", color="black", linewidth=1.8,
-                          transform=ccrs.Geodetic(), zorder=8)
-            else:
-                gx5b.plot(pts[:, 1], pts[:, 0], "-", color="black", linewidth=2.8,
-                          transform=ccrs.Geodetic(), zorder=9)
-                gx5b.scatter(pts[0, 1], pts[0, 0], s=40, c="yellow", marker=">",
-                             edgecolors="k", linewidths=0.6, transform=ccrs.Geodetic(), zorder=10)
-                gx5b.scatter(pts[-1, 1], pts[-1, 0], s=40, c="yellow", marker="s",
-                             edgecolors="k", linewidths=0.6, transform=ccrs.Geodetic(), zorder=10)
-                ac = seg["arc_center"]
-                gx5b.scatter(ac[1], ac[0], s=50, c="white", marker="x",
-                             linewidths=1.5, transform=ccrs.Geodetic(), zorder=10)
+        _plot_corridor_width_by_phase_v1(
+            gx5b, rf_bal, W_half, transition_corridor_cfg, color="black", alpha=0.14
+        )
+        _plot_rf_segments_by_phase(
+            gx5b, rf_bal, cruise_color="black", tf_lw=1.8, rf_lw=2.8,
+            transform=ccrs.Geodetic(), zorder=8,
+            transition_labels=True, draw_rf_markers=True,
+        )
+        _plot_transition_phase_markers(
+            gx5b, rf_bal, transform=ccrs.Geodetic(), zorder=12, labels=True,
+            include_stage1=False, general_output=True,
+        )
 
         _add_rf_legend_handles(
             gx5b, "black", "Balanced", tf_lw=1.8, rf_lw=2.8,
-            include_transition=True, transition_lw=1.5
+            include_transition=False, transition_lw=1.5
         )
         _add_arc_marker_legend_handles(gx5b)
 
@@ -3237,19 +8909,29 @@ def _plot_representative_corridor_figures(
             landing_label="Landing_End",
             backbone_lw=1.2, zorder=10
         )
-        plot_corridor_width(gx5c, bal_full_path, W_half, color="black", alpha=0.14)
-        for seg in rf_bal["segments"]:
-            pts = np.asarray(seg["points"], dtype=float)
-            if pts.size == 0:
-                continue
-            if seg["type"] == "TF":
-                gx5c.plot(pts[:, 1], pts[:, 0], "-", color="black", linewidth=1.8,
-                          transform=ccrs.Geodetic(), zorder=8)
-            else:
-                gx5c.plot(pts[:, 1], pts[:, 0], "-", color="black", linewidth=2.8,
-                          transform=ccrs.Geodetic(), zorder=9)
+        _plot_corridor_width_by_phase_v1(
+            gx5c, rf_bal, W_half, transition_corridor_cfg, color="black", alpha=0.14
+        )
+        _plot_rf_segments_by_phase(
+            gx5c, rf_bal, cruise_color="black", tf_lw=1.8, rf_lw=2.8,
+            transform=ccrs.Geodetic(), zorder=8,
+            transition_labels=True, draw_rf_markers=False,
+        )
+        _plot_transition_phase_markers(
+            gx5c, rf_bal, transform=ccrs.Geodetic(), zorder=12, labels=True,
+            include_stage1=False, general_output=True,
+        )
 
-        cr_pts, cr_labels = _collect_cr_points_from_segments(rf_bal["segments"])
+        transition_meta_bal = rf_bal.get("transition_meta", {})
+        cr_pts, cr_labels = _collect_cr_points_from_segments(
+            rf_bal["segments"],
+            excluded_points=[
+                transition_meta_bal.get("takeoff_stage1_end"),
+                transition_meta_bal.get("landing_stage1_start"),
+                transition_meta_bal.get("takeoff_transition_end"),
+                transition_meta_bal.get("landing_transition_end"),
+            ],
+        )
         for p, name in zip(cr_pts, cr_labels):
             gx5c.scatter(p[1], p[0], s=36, facecolors="none", edgecolors="red", linewidths=1.1,
                          transform=ccrs.Geodetic(), zorder=12)
@@ -3274,9 +8956,114 @@ def _plot_representative_corridor_figures(
 # MAIN ENTRY: one complete optimization attempt
 # ======================================================================
 # Main optimization pipeline: one end-to-end run attempt
-def attempt_run_once():
+def attempt_run_once(
+    *,
+    start_vertiport_override=None,
+    end_vertiport_override=None,
+    airspace_info_override=None,
+    forbidden_zones_override=None,
+    corridor_points_override=None,
+    cruise_altitude_m_override=None,
+    takeoff_climb_angle_deg_override=None,
+    landing_descent_angle_deg_override=None,
+    project_root=None,
+    use_clicked_waypoints_override=None,
+    progress_callback=None,
+    return_run_dir=False,
+):
+    """Run one optimization attempt, optionally with API-owned input overrides.
+
+    No override is used by the standalone script.  The API adapter supplies only
+    request-owned geometry and keeps every optimization parameter authoritative
+    in this file.
+    """
+    runtime_root = None if project_root is None else Path(project_root).resolve()
+
+    def _runtime_path(*parts):
+        relative = Path(*parts)
+        return relative if runtime_root is None else runtime_root / relative
+
+    def _progress(progress, message, stage, **details):
+        if progress_callback is None:
+            return
+        event = {
+            "progress": int(max(0, min(100, progress))),
+            "message": str(message),
+            "stage": str(stage),
+        }
+        if details:
+            event["details"] = details
+        progress_callback(event)
+
+    def _warning(code, message, **details):
+        if progress_callback is None:
+            return
+        event = {
+            "event": "warning",
+            "percent": int(_last_progress_percent[0]),
+            "stage": str(_last_progress_stage[0]),
+            "code": str(code),
+            "message": str(message),
+        }
+        if details:
+            event["details"] = details
+        progress_callback(event)
+
+    def _initial_population_diagnostic(
+        *, current, state, candidate_count, rf_count, feasible_count,
+        reason_counts=None,
+    ):
+        if progress_callback is None:
+            return
+        blockers = []
+        for reason, failed in sorted(
+            dict(reason_counts or {}).items(), key=lambda item: (-item[1], item[0])
+        )[:5]:
+            blockers.append({
+                "code": str(reason),
+                "failed": int(failed),
+                "evaluated": int(candidate_count),
+            })
+        progress_callback({
+            "event": "diagnostic",
+            "percent": int(min(42, 30 + 12 * float(current) / max(1, max_init_retries))),
+            "stage": "initial_population",
+            "state": str(state),
+            "current": int(current),
+            "total": int(max_init_retries),
+            "candidate_count": int(candidate_count),
+            "checks": {
+                "rf_feasible": {
+                    "passed": int(rf_count),
+                    "evaluated": int(candidate_count),
+                },
+                "overall_feasible": {
+                    "passed": int(feasible_count),
+                    "evaluated": int(candidate_count),
+                    "target": int(min_feasible_init_solutions),
+                },
+            },
+            "blockers": blockers,
+            "message": (
+                "Initial feasible population found."
+                if state == "completed"
+                else "Initial population feasibility diagnostic."
+            ),
+        })
+
+    _last_progress_percent = [0]
+    _last_progress_stage = ["accepted"]
+
+    def _tracked_progress(progress, message, stage, **details):
+        _last_progress_percent[0] = int(max(0, min(100, progress)))
+        _last_progress_stage[0] = str(stage)
+        _progress(progress, message, stage, **details)
+
+    _tracked_progress(2, "Optimization request accepted.", "initializing")
+    _tracked_progress(4, "Validating optimizer and transition configuration.", "configuration_validation")
     # ==================== Core Parameters ====================
-    W_half = 296.0                   # TSE=148 (m), W_half = TSE*2 (m)
+    W_half = 296.0                   # 순항 회랑의 중심선 기준 좌·우 반폭(m); 총폭은 2*W_half
+    transition_corridor_half_width_m = 100.0  # 전이구간 전용 좌·우 반폭(m)이자 최대 하방 MOC 이격거리(m)
     # RF turn radius model:
     #   V: m/s, g: m/s^2, theta: rad, R: m
     #   R = V^2 / (g * tan(theta))
@@ -3328,11 +9115,13 @@ def attempt_run_once():
     wp_perturb_radius_m = 100.0     # WP 교란 반경 (m)
     wp_perturb_steps = 10           # WP 교란 반복 횟수 (1이면 단일 교란)
     min_extra_nodes_per_seg = 0     # 세그먼트별 최소 extra node 수 (int 또는 list)
-    max_extra_nodes_per_seg = 1     # 세그먼트별 최대 extra node 수 (int 또는 list)
+    max_extra_nodes_per_seg = 2     # 세그먼트별 최대 extra node 수 (int 또는 list)
     use_wp_skip_generator = False   # True: WP-skip 초기해 생성기 혼용
     init_pop_skip_mix_ratio = 0.5   # skip 생성기 혼용 비율(0~1)
     wp_skip_prob = 0.00             # 중간 WP skip 확률 (0~1)
-    airspace_radius_km = 5.0        # 공역 반경 제한 (km)
+    airspace_radius_km = float(
+        (airspace_info_override or {}).get("radius_km", 5.0)
+    )  # 공역 반경 제한(km); API 공역 설정이 있으면 그 값 사용
     min_corridor_distance_km = 0.0  # 전체 회랑 최소 거리 제한 (km), 0이면 비활성
     emergency_strip_m = 500.0       # emergency 포함 완화 strip 폭
     min_seg_for_extra_nodes_m = 1500.0  # 짧은 세그먼트 extra node 생성 억제 길이
@@ -3352,7 +9141,7 @@ def attempt_run_once():
     #       scale=1.0 -> V_scaled = V_base = 83.33 m/s (300 km/h)
     look_ahead_min_scale = 0.11   # lower bound for RF radius scaling (0~1)
     look_ahead_window = 3          # number of neighbor segments per side for look-ahead
-    rf_use_boundary_heading = False  # False: do not force transition boundary headings into RF first/last corners
+    rf_use_boundary_heading = False  # True: pass candidate first/last tangents into RF boundary corners
     rf_debug_level = "off"         # "off" | "summary" | "detail", RF-debug print control
     rf_allow_tangent_clamp = True  # allow geometric tangent clamping to fit short segments
     rf_corner_fit_margin = 0.95    # maximum usable fraction of adjacent segment lengths
@@ -3360,6 +9149,7 @@ def attempt_run_once():
     rf_min_turn_angle_deg = 0.5    # angles below this are treated as straight
     max_init_retries = 300         # max retries for feasible initial-population search
     global RF_ALLOW_TANGENT_CLAMP, RF_CORNER_FIT_MARGIN, RF_CORNER_MIN_TANGENT_M, RF_MIN_TURN_ANGLE_DEG
+    global MOC_REFERENCE_MSL_M
     RF_ALLOW_TANGENT_CLAMP = bool(rf_allow_tangent_clamp)
     RF_CORNER_FIT_MARGIN = float(rf_corner_fit_margin)
     RF_CORNER_MIN_TANGENT_M = float(rf_corner_min_tangent_m)
@@ -3370,63 +9160,189 @@ def attempt_run_once():
     look_ahead_min_turn_radius_m = rf_base_turn_radius_m * look_ahead_min_scale
 
     w_dist, w_ground, w_air, w_noise = 0.1, 1.0, 2.0, 0.1
-    altitude_levels = np.array([750.0], dtype=float)  # 순항 고도(MSL, m)
+    altitude_levels = np.array([
+        600.0 if cruise_altitude_m_override is None else float(cruise_altitude_m_override)
+    ], dtype=float)  # 순항 고도(MSL, m); API 요청값이 있으면 그 값만 덮어쓴다.
+    risk_altitude_levels = np.arange(0.0, 1000.0, 100.0, dtype=float)  # 위험자료 MSL 층
     use_heading_map = True
 
-    sector_mode_enabled = False  # True: season 마스크로 사용자 섹터 허용 여부 검사, False: 검사 없이 사용자 섹터 그대로 사용
-    sector_season = "annual"    # 시즌 키 (annual, spring, summer, autumn, winter). True일 때 허용 섹터 판정에 사용
-    takeoff_sector_user = 7     # 이륙 섹터 번호 (1~12, 1=북쪽 시작, 시계방향)
-    landing_sector_user = 5     # 착륙 섹터 번호 (1~12, 1=북쪽 시작, 시계방향)
-    sector_half_width_deg = 15.0    # 플롯 wedge 반폭(deg): 섹터 중심 기준 ±각도
+    sector_mode_enabled = True  # True: MOC·계절바람·지상·공중위험 자동선정, False: 아래 사용자 섹터를 그대로 사용
+    sector_season = "winter"     # 자동선정에 사용할 바람자료 월 범위: annual/spring/summer/autumn/winter
+    takeoff_sector_user = 7      # 수동모드에서 사용할 이륙 섹터(1~12); 자동모드에서도 입력값 자체는 기록용으로 보존
+    landing_sector_user = 5      # 수동모드에서 사용할 착륙 섹터(1~12); 자동모드에서도 입력값 자체는 기록용으로 보존
+    sector_half_width_deg = 15.0 # 고정 직선이 없을 때 최적화 경로 heading에 허용할 섹터 중심 ±각도(deg)
+    sector_analysis_sample_spacing_m = 80.0  # 자동선정 명목 전이회랑의 종방향 MOC·위험 검사 최대 간격(m)
+    sector_wind_tail_weight = 0.5   # 자동선정 바람위험 안에서 순풍 위험이 차지하는 비율
+    sector_wind_cross_weight = 0.5  # 자동선정 바람위험 안에서 절대 측풍 위험이 차지하는 비율
+    sector_wind_risk_weight = 1.0 / 3.0    # 자동선정 최종점수의 바람위험 비율
+    sector_ground_risk_weight = 1.0 / 3.0  # 자동선정 최종점수의 지상위험 비율
+    sector_air_risk_weight = 1.0 / 3.0     # 자동선정 최종점수의 공중위험 비율
+    sector_wind_data_dir = _runtime_path("wind_data")  # 월별 AirRisk_Data_1~12.mat 바람자료 폴더
 
-    takeoff_heading_deg = float(np.rad2deg(_sector_angle(int(takeoff_sector_user))))
-    landing_heading_deg = float(np.rad2deg(_sector_angle(int(landing_sector_user))))
-    use_takeoff_landing_transition = True   # 이착륙 전환 경로 사용 여부,  False이면 사용자가 지정한 takeoff_end_lla를 그대로 사용, 
+    takeoff_sector_user = _validate_sector_1based_v1(
+        takeoff_sector_user, label="takeoff_sector_user"
+    )
+    landing_sector_user = _validate_sector_1based_v1(
+        landing_sector_user, label="landing_sector_user"
+    )
+    takeoff_sector_selected = int(takeoff_sector_user)
+    landing_sector_selected = int(landing_sector_user)
+    takeoff_heading_deg = float(np.rad2deg(_sector_angle(takeoff_sector_selected)))
+    landing_heading_deg = float(np.rad2deg(_sector_angle(landing_sector_selected)))
+    use_takeoff_landing_transition = True  # 전체 전이 기능 스위치; False면 아래 구조·기하 설정을 무시하고 수동 endpoint 사용
+    transition_structure_mode = "fixed_straight_only"  # 전이 경로 구조를 아래 3개 값 중 하나로 선택
+    # "fixed_straight_only": 순항고도까지 고정 직선, 최적화 전이 없음
+    # "fixed_straight_plus_optimized": 고정 직선 prefix + 남은 최적화 전이
+    # "optimized_only": 버티포트부터 최적화 전이만 사용
+    transition_structure_mode = str(transition_structure_mode).strip().lower()
+    if (
+        bool(use_takeoff_landing_transition)
+        and transition_structure_mode not in TRANSITION_STRUCTURE_MODES
+    ):
+        raise ValueError(
+            "transition_structure_mode must be one of "
+            f"{TRANSITION_STRUCTURE_MODES}, got {transition_structure_mode!r}."
+        )
+    # 호환용 파생 alias이며 사용자가 직접 설정하는 파라미터가 아니다.
+    # 세 구조를 모두 표현할 수 없으므로 실제 설정은 transition_structure_mode만 변경한다.
+    use_two_stage_transition = bool(
+        transition_structure_mode
+        == TRANSITION_STRUCTURE_FIXED_PLUS_OPTIMIZED
+    )
 
-    if bool(sector_mode_enabled):
-        sector_season = normalize_season(sector_season)
-        takeoff_sector_user = validate_sector_1based(takeoff_sector_user, label="takeoff_sector_user")
-        landing_sector_user = validate_sector_1based(landing_sector_user, label="landing_sector_user")
-        season_takeoff_mask, season_landing_mask = get_season_masks(sector_season)
+    if bool(use_takeoff_landing_transition) and (
+        not np.isfinite(transition_corridor_half_width_m)
+        or float(transition_corridor_half_width_m) <= 0.0
+    ):
+        raise ValueError(
+            "transition_corridor_half_width_m must be finite and > 0."
+        )
 
-        if not sector_allowed(season_takeoff_mask, takeoff_sector_user):
-            raise ValueError(
-                f"Takeoff sector {takeoff_sector_user} is not allowed for season '{sector_season}'. "
-                f"Allowed takeoff sectors={np.where(season_takeoff_mask)[0] + 1}"
-            )
-        if not sector_allowed(season_landing_mask, landing_sector_user):
-            raise ValueError(
-                f"Landing sector {landing_sector_user} is not allowed for season '{sector_season}'. "
-                f"Allowed landing sectors={np.where(season_landing_mask)[0] + 1}"
-            )
+    sector_season = str(sector_season).strip().lower()
+    _sector_wind_months_v1(sector_season)
 
-        takeoff_heading_deg = float(np.rad2deg(_sector_angle(takeoff_sector_user)))
-        landing_heading_deg = float(np.rad2deg(_sector_angle(landing_sector_user)))
-    else:
-        sector_season = normalize_season(sector_season)
-        season_takeoff_mask, season_landing_mask = get_season_masks(sector_season)
+    takeoff_sector_heading_deg_compass = float((90.0 - takeoff_heading_deg) % 360.0)
+    landing_sector_heading_deg_compass = float((90.0 - landing_heading_deg) % 360.0)
 
+    # 고정 직선이 있는 구조에서 전체 버티포트→순항고도 기울기를 정한다.
     # "distance": 밑변을 직접 입력하고 실제 경사각을 자동 계산한다.
     # "angle": 경사각을 직접 입력하고 밑변을 자동 계산한다.
-    transition_mode = "distance"
-
-    # distance 모드에서 사용하는 이륙/착륙 삼각형의 밑변(m).
-    takeoff_distance_m = 1000.0
-    landing_distance_m = 1000.0
-
-    # angle 모드에서 사용하는 이륙/착륙 경사각(deg).
-    takeoff_angle_deg = 8.0
-    landing_angle_deg = 8.0
+    transition_mode = "angle"  # 고정 직선 포함 구조의 전체 기울기 입력 방식: "angle" 또는 "distance"; optimized_only에서는 무시
+    takeoff_total_transition_horizontal_distance_m = None  # distance 모드의 이륙 전체 밑변(m); angle/optimized_only에서는 무시
+    landing_total_transition_horizontal_distance_m = None  # distance 모드의 착륙 전체 밑변(m); angle/optimized_only에서는 무시
+    takeoff_stage1_straight_distance_m = 300.0  # 혼합 구조에서 최적화 전 이륙 고정 직선 prefix 거리(m); 다른 구조에서는 무시
+    landing_stage1_straight_distance_m = 300.0  # 혼합 구조에서 최적화 후 착륙 고정 직선 prefix 거리(m); 다른 구조에서는 무시
+    takeoff_climb_angle_deg = (
+        6.0 if takeoff_climb_angle_deg_override is None
+        else float(takeoff_climb_angle_deg_override)
+    )  # angle 모드의 이륙 권위 각도; API에서 선택 입력 가능
+    landing_descent_angle_deg = (
+        6.0 if landing_descent_angle_deg_override is None
+        else float(landing_descent_angle_deg_override)
+    )  # angle 모드의 착륙 권위 각도; API에서 선택 입력 가능
+    transition_mode = str(transition_mode).strip().lower()
+    fixed_transition_geometry_active = bool(
+        use_takeoff_landing_transition
+        and transition_structure_mode in (
+            TRANSITION_STRUCTURE_FIXED_ONLY,
+            TRANSITION_STRUCTURE_FIXED_PLUS_OPTIMIZED,
+        )
+    )
+    fixed_prefix_input_active = bool(
+        use_takeoff_landing_transition
+        and transition_structure_mode
+        == TRANSITION_STRUCTURE_FIXED_PLUS_OPTIMIZED
+    )
+    angle_input_active = bool(
+        use_takeoff_landing_transition
+        and (
+            transition_structure_mode == TRANSITION_STRUCTURE_OPTIMIZED_ONLY
+            or (
+                fixed_transition_geometry_active
+                and transition_mode == "angle"
+            )
+        )
+    )
+    total_distance_input_active = bool(
+        fixed_transition_geometry_active and transition_mode == "distance"
+    )
+    if fixed_transition_geometry_active and transition_mode not in (
+        "angle", "distance"
+    ):
+        raise ValueError(
+            "transition_mode must be 'angle' or 'distance' when the transition "
+            "structure contains a fixed straight segment."
+        )
+    if angle_input_active:
+        _validate_transition_angle(
+            takeoff_climb_angle_deg, "takeoff_climb_angle_deg"
+        )
+        _validate_transition_angle(
+            landing_descent_angle_deg, "landing_descent_angle_deg"
+        )
+    if total_distance_input_active:
+        for value, label in (
+            (
+                takeoff_total_transition_horizontal_distance_m,
+                "takeoff_total_transition_horizontal_distance_m",
+            ),
+            (
+                landing_total_transition_horizontal_distance_m,
+                "landing_total_transition_horizontal_distance_m",
+            ),
+        ):
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{label} must be finite and > 0 in distance mode."
+                ) from exc
+            if not np.isfinite(numeric_value) or numeric_value <= 0.0:
+                raise ValueError(f"{label} must be finite and > 0 in distance mode.")
+    if fixed_prefix_input_active:
+        for value, label in (
+            (
+                takeoff_stage1_straight_distance_m,
+                "takeoff_stage1_straight_distance_m",
+            ),
+            (
+                landing_stage1_straight_distance_m,
+                "landing_stage1_straight_distance_m",
+            ),
+        ):
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{label} must be finite and >= 0.") from exc
+            if not np.isfinite(numeric_value) or numeric_value < 0.0:
+                raise ValueError(f"{label} must be finite and >= 0.")
+    configured_fixed_transition_for_moc_audit = bool(
+        use_takeoff_landing_transition
+        and (
+            transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+            or (
+                transition_structure_mode
+                == TRANSITION_STRUCTURE_FIXED_PLUS_OPTIMIZED
+                and (
+                    float(takeoff_stage1_straight_distance_m) > 0.0
+                    or float(landing_stage1_straight_distance_m) > 0.0
+                )
+            )
+        )
+    )
 
     # 경로 형상 계산과 무관하며 엑셀의 이착륙 속도 기록에만 사용한다.
-    transition_speed_takeoff_mps = 50.0
-    transition_speed_landing_mps = 50.0
+    transition_speed_takeoff_mps = 50.0  # Excel 전이행에 기록할 이륙 속도(m/s); 기하·최적화에는 미사용
+    transition_speed_landing_mps = 50.0  # Excel 전이행에 기록할 착륙 속도(m/s); 기하·최적화에는 미사용
 
     # 전이 경로에 점을 생성하는 수평 간격(m).
     # 예: 밑변 2000 m, 간격 100 m이면 양 끝점을 포함하여 약 21개 점이 생성된다.
-    transition_sample_spacing_m = 100.0
+    transition_sample_spacing_m = 100.0  # 고정 직선 Stage1 표본 간격(m); MOC의 80m 검사 간격과는 별도
 
-    use_clicked_waypoints = False     # 클릭 기반 WP 입력 ON/OFF
+    use_clicked_waypoints = (
+        True if use_clicked_waypoints_override is None
+        else bool(use_clicked_waypoints_override)
+    )  # API는 False를 주입하여 클릭 입력을 항상 끈다.
     enforce_mandatory_wp_order = True  # True: takeoff -> 입력 WP 순서 -> landing 강제
     
     min_clicked_waypoints = 0   # 클릭 입력 WP 최소 개수 (takeoff/landing 제외)
@@ -3449,40 +9365,199 @@ def attempt_run_once():
     flight_dist_limit = 100000.0 
     objective_names = ["Distance", "Ground Risk", "Air Risk", "Noise Risk"]
     airspace_radius_m = float(airspace_radius_km) * 1000.0
-    airspace_alt_min_m = 100.0  # 공역 최소 고도(MSL, m)
-    airspace_alt_max_m = 1000.0  # 공역 최대 고도(MSL, m)
+    airspace_alt_min_m = float(
+        (airspace_info_override or {}).get("alt_min_m", 100.0)
+    )  # 공역 최소 고도(MSL, m)
+    airspace_alt_max_m = float(
+        (airspace_info_override or {}).get("alt_max_m", 1000.0)
+    )  # 공역 최대 고도(MSL, m)
     min_corridor_distance_m = float(min_corridor_distance_km) * 1000.0
 
-    noise_npy_path = Path("noise_data") / "noise_lden_grid.npy"
+    noise_npy_path = _runtime_path("noise_data", "noise_lden_grid.npy")
     noise_floor_db = 0.0
 
     #
 
-    ground_risk_path = Path("ground_risk_data") / "Modified_high_res_affected_population_GRC.npy"
+    ground_risk_path = _runtime_path("ground_risk_data", "Modified_high_res_affected_population_GRC.npy")
 
-    bird_airrisk_path = Path("air_risk_data") / "bird_riskmap_springfall_3d.npy"
-    moc_airrisk_dir = Path("260608_MOC")
+    bird_airrisk_path = _runtime_path("air_risk_data", "bird_riskmap_springfall_3d.npy")
+    moc_airrisk_dir = _runtime_path("260608_MOC")
     lat_lim = [35.535, 35.652]
     lon_lim = [129.020, 129.150]
 
     import datetime as _dt
     _run_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path("runs") / _run_ts
+    out_dir = _runtime_path("runs") / _run_ts
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # start_vertiport_default = np.array([35.6033361, 129.0776917, 150.0], dtype=float) # 26년 5월 28일 변경전 버티포트 좌표
     # end_vertiport_default = np.array([35.6033361, 129.0776917, 150.0], dtype=float)   # 26년 5월 28일 변경전 버티포트 좌표
-    start_vertiport_default = np.array([35.603386, 129.078025, 150.0], dtype=float) # 변경후 버티포트 좌표
-    end_vertiport_default = np.array([35.6316511, 129.0535480, 150.0], dtype=float)   # 변경후 버티포트 좌표
+    start_vertiport_default = np.array(
+        [35.603386, 129.078025, 150.0]
+        if start_vertiport_override is None else start_vertiport_override,
+        dtype=float,
+    ).reshape(-1)  # API 생략 시 최신 메인의 기본 버티포트
+    end_vertiport_default = np.array(
+        [35.603386, 129.078025, 150.0]
+        if end_vertiport_override is None else end_vertiport_override,
+        dtype=float,
+    ).reshape(-1)  # API 생략 시 최신 메인의 기본 버티포트
+    if start_vertiport_default.size != 3 or end_vertiport_default.size != 3:
+        raise ValueError("Both start/end vertiport overrides must be [lat, lon, alt].")
     takeoff_end_lla = np.array([35.59468397, 129.07515721, float(altitude_levels[0])], dtype=float) # 이륙 끝 지점, 고도를 순항 고도와 일치하도록 설정
     landing_end_lla = np.array([35.59701567, 129.08585995, float(altitude_levels[0])], dtype=float) #  착륙 끝 지점, 고도를 순항 고도와 일치하도록 설정
     start_ref_alt_m = float(start_vertiport_default[2])
+    MOC_REFERENCE_MSL_M = float(start_ref_alt_m)
+    transition_corridor_cfg = {
+        "enabled": bool(use_takeoff_landing_transition),
+        "half_width_m": float(transition_corridor_half_width_m),
+        "downward_clearance_m": float(transition_corridor_half_width_m),
+        "start_vertiport_msl_m": float(start_vertiport_default[2]),
+        "end_vertiport_msl_m": float(end_vertiport_default[2]),
+    }
+    _validate_transition_corridor_cfg_v1(transition_corridor_cfg)
+    transition_3d_corridor_policy = {
+        "enabled": bool(use_takeoff_landing_transition),
+        "horizontal_half_width_m": float(transition_corridor_half_width_m),
+        "horizontal_total_width_m": float(2.0 * transition_corridor_half_width_m),
+        "configured_downward_clearance_m": float(transition_corridor_half_width_m),
+        "downward_clearance_source": "transition_corridor_half_width_m",
+        "effective_clearance_formula": (
+            "min(configured_clearance, max(0, center_MSL - direction_vertiport_MSL))"
+        ),
+        "lower_face_formula": "center_MSL - effective_clearance",
+        "transition_phases": [str(value) for value in TRANSITION_PHASE_NAMES],
+        "cruise_half_width_m": float(W_half),
+        "applies_to": ["MOC", "NFZ", "airspace", "self_overlap"],
+        "airspace_vertical_extent": "lower_face_to_centerline",
+        "self_overlap_vertical_policy": "legacy_conservative_2d",
+        "moc_vertical_safety_assumption": (
+            "blocked cells at higher MOC layers are subsets of lower-layer blocked cells"
+        ),
+        "moc_all_clear_first_clear_policy": (
+            "AGL100 is recorded as the first clear available layer; required-safe MSL stays null"
+        ),
+    }
+    transition_3d_validation = {
+        "status": (
+            "NOT GENERATED" if use_takeoff_landing_transition else "NOT APPLICABLE"
+        ),
+        "reason": (
+            "balanced_path_unavailable"
+            if use_takeoff_landing_transition else "transition_disabled"
+        ),
+        "directions": {},
+    }
+    if not bool(use_takeoff_landing_transition):
+        off_direction_status = {
+            "status": "NOT APPLICABLE",
+            "moc_status": "NOT APPLICABLE",
+            "nfz_status": "NOT APPLICABLE",
+            "airspace_status": "NOT APPLICABLE",
+            "self_overlap_status": "NOT APPLICABLE",
+            "fail_reasons": [],
+        }
+        transition_3d_validation.update({
+            "moc_status": "NOT APPLICABLE",
+            "nfz_status": "NOT APPLICABLE",
+            "airspace_status": "NOT APPLICABLE",
+            "self_overlap_status": "NOT APPLICABLE",
+            "directions": {
+                "takeoff": dict(off_direction_status),
+                "landing": dict(off_direction_status),
+            },
+        })
 
+    moc_transition_visualization = {
+        "enabled": bool(use_takeoff_landing_transition),
+        "generated": False,
+        "transition_structure_mode": str(transition_structure_mode),
+        "audit_only_fixed_transition_geometry": bool(
+            use_takeoff_landing_transition
+            and transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+        ),
+        "moc_audit_includes_fixed_transition": bool(
+            configured_fixed_transition_for_moc_audit
+        ),
+        "output_policy_notice": (
+            "audit-only fixed transition geometry; omitted from general corridor outputs"
+            if use_takeoff_landing_transition
+            and transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+            else None
+        ),
+        "reason": (
+            "balanced_path_unavailable"
+            if use_takeoff_landing_transition else "transition_disabled"
+        ),
+        "folder": None,
+        "files": [],
+        "moc_enforced": bool(check_corridor_moc),
+        "status": (
+            "NOT GENERATED" if use_takeoff_landing_transition else "NOT APPLICABLE"
+        ),
+        "sample_count": 0,
+        "tested_count": 0,
+        "hit_count": 0,
+        "out_of_grid_count": 0,
+        "corridor_half_width_m": float(transition_corridor_half_width_m),
+        "transition_corridor_half_width_m": float(
+            transition_corridor_half_width_m
+        ),
+        "configured_downward_clearance_m": float(transition_corridor_half_width_m),
+        "transition_vertical_clearance_m": float(
+            transition_corridor_half_width_m
+        ),
+        "cruise_corridor_half_width_m": float(W_half),
+        "transition_3d_status": str(transition_3d_validation["status"]),
+        "transition_3d_corridor_policy": transition_3d_corridor_policy,
+        "transition_3d_validation": transition_3d_validation,
+        "directions": {},
+    }
+    sector_auto_selection_active = bool(
+        sector_mode_enabled and use_takeoff_landing_transition
+    )
+    sector_selection_analysis = {
+        "enabled": bool(sector_auto_selection_active),
+        "mode": (
+            "automatic" if sector_auto_selection_active else (
+                "manual" if use_takeoff_landing_transition else "not_applicable"
+            )
+        ),
+        "status": (
+            "PENDING" if sector_auto_selection_active else (
+                "MANUAL" if use_takeoff_landing_transition else "NOT_APPLICABLE"
+            )
+        ),
+        "reason": (
+            None if use_takeoff_landing_transition else "transition_disabled"
+        ),
+        "season": str(sector_season),
+        "wind_months": (
+            [int(value) for value in _sector_wind_months_v1(sector_season)]
+            if sector_auto_selection_active else []
+        ),
+        "configured_user_takeoff_sector": int(takeoff_sector_user),
+        "configured_user_landing_sector": int(landing_sector_user),
+        "selected_pair": {
+            "takeoff_sector": int(takeoff_sector_selected),
+            "landing_sector": int(landing_sector_selected),
+            "selection_status": (
+                "PENDING" if sector_auto_selection_active else (
+                    "MANUAL" if use_takeoff_landing_transition else "NOT_APPLICABLE"
+                )
+            ),
+        },
+        "diagnostic_figure": None,
+    }
     params_dict = {
         "run_timestamp": _run_ts,
         "WP_CLICK_MODE_ENV": _CLICK_MODE_ENV,
         "USE_INTERACTIVE_BACKEND": bool(USE_INTERACTIVE_BACKEND),
         "W_half": W_half,
+        "transition_corridor_half_width_m": float(transition_corridor_half_width_m),
+        "transition_vertical_clearance_m": float(transition_corridor_half_width_m),
+        "transition_3d_corridor_policy": transition_3d_corridor_policy,
+        "transition_3d_validation": transition_3d_validation,
         "ground_speed_mps": ground_speed_mps,
         "ground_speed_kmh": speed_max_kmh,
         "bank_angle_deg": bank_angle_deg,
@@ -3520,6 +9595,7 @@ def attempt_run_once():
         "look_ahead_min_equiv_speed_kmh": look_ahead_min_equiv_speed_kmh,
         "look_ahead_window": look_ahead_window,
         "rf_use_boundary_heading": bool(rf_use_boundary_heading),
+        "rf_boundary_heading_policy": "preserve_candidate_tangency_and_validate_actual_sector_legs",
         "rf_debug_level": str(rf_debug_level),
         "rf_allow_tangent_clamp": bool(rf_allow_tangent_clamp),
         "rf_corner_fit_margin": float(rf_corner_fit_margin),
@@ -3531,25 +9607,121 @@ def attempt_run_once():
         "w_air": w_air,
         "w_noise": w_noise,
         "sector_mode_enabled": bool(sector_mode_enabled),
+        "sector_auto_selection_active": bool(sector_auto_selection_active),
         "sector_season": str(sector_season),
         "takeoff_sector_user": int(takeoff_sector_user),
         "landing_sector_user": int(landing_sector_user),
+        "takeoff_sector_selected": int(takeoff_sector_selected),
+        "landing_sector_selected": int(landing_sector_selected),
         "sector_half_width_deg": float(sector_half_width_deg),
-        "season_takeoff_mask_12": [int(v) for v in season_takeoff_mask.astype(int).tolist()],
-        "season_landing_mask_12": [int(v) for v in season_landing_mask.astype(int).tolist()],
+        "sector_analysis_sample_spacing_m": float(sector_analysis_sample_spacing_m),
+        "sector_wind_tail_weight": float(sector_wind_tail_weight),
+        "sector_wind_cross_weight": float(sector_wind_cross_weight),
+        "sector_wind_risk_weight": float(sector_wind_risk_weight),
+        "sector_ground_risk_weight": float(sector_ground_risk_weight),
+        "sector_air_risk_weight": float(sector_air_risk_weight),
+        "sector_wind_data_dir": str(sector_wind_data_dir),
         "takeoff_heading_deg": float(takeoff_heading_deg),
         "landing_heading_deg": float(landing_heading_deg),
+        "takeoff_compass_heading_deg": takeoff_sector_heading_deg_compass,
+        "landing_compass_heading_deg": landing_sector_heading_deg_compass,
+        "takeoff_sector_heading_deg_compass": takeoff_sector_heading_deg_compass,
+        "landing_sector_heading_deg_compass": landing_sector_heading_deg_compass,
+        "sector_selection_analysis": sector_selection_analysis,
         "use_takeoff_landing_transition": bool(use_takeoff_landing_transition),
+        "transition_structure_mode": str(transition_structure_mode),
+        "transition_structure_mode_effective": (
+            str(transition_structure_mode)
+            if use_takeoff_landing_transition else "off"
+        ),
+        "use_two_stage_transition": bool(use_two_stage_transition),
+        "use_two_stage_transition_deprecated_alias_is_lossy": True,
+        "effective_two_stage_transition": bool(
+            use_takeoff_landing_transition and use_two_stage_transition
+        ),
+        "fixed_transition_general_output_suppressed": bool(
+            use_takeoff_landing_transition
+            and transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+        ),
+        "fixed_transition_evaluated_but_not_exported": bool(
+            use_takeoff_landing_transition
+            and transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+        ),
+        "moc_audit_includes_fixed_transition": bool(
+            configured_fixed_transition_for_moc_audit
+        ),
         "takeoff_end_lla": [float(v) for v in takeoff_end_lla.tolist()],
         "landing_end_lla": [float(v) for v in landing_end_lla.tolist()],
         "transition_mode": str(transition_mode),
-        "takeoff_distance_m": float(takeoff_distance_m),
-        "landing_distance_m": float(landing_distance_m),
-        "takeoff_angle_deg": float(takeoff_angle_deg),
-        "landing_angle_deg": float(landing_angle_deg),
+        "transition_mode_effective": (
+            (
+                "ignored"
+                if transition_structure_mode == TRANSITION_STRUCTURE_OPTIMIZED_ONLY
+                else str(transition_mode)
+            )
+            if use_takeoff_landing_transition else "off"
+        ),
+        "takeoff_total_transition_horizontal_distance_m": (
+            None
+            if takeoff_total_transition_horizontal_distance_m is None
+            else (
+                float(takeoff_total_transition_horizontal_distance_m)
+                if total_distance_input_active
+                else takeoff_total_transition_horizontal_distance_m
+            )
+        ),
+        "landing_total_transition_horizontal_distance_m": (
+            None
+            if landing_total_transition_horizontal_distance_m is None
+            else (
+                float(landing_total_transition_horizontal_distance_m)
+                if total_distance_input_active
+                else landing_total_transition_horizontal_distance_m
+            )
+        ),
+        "takeoff_stage1_straight_distance_m": (
+            float(takeoff_stage1_straight_distance_m)
+            if fixed_prefix_input_active else takeoff_stage1_straight_distance_m
+        ),
+        "landing_stage1_straight_distance_m": (
+            float(landing_stage1_straight_distance_m)
+            if fixed_prefix_input_active else landing_stage1_straight_distance_m
+        ),
+        "takeoff_climb_angle_deg": (
+            float(takeoff_climb_angle_deg)
+            if angle_input_active else takeoff_climb_angle_deg
+        ),
+        "landing_descent_angle_deg": (
+            float(landing_descent_angle_deg)
+            if angle_input_active else landing_descent_angle_deg
+        ),
+        # Backward-compatible aliases; v1 semantics are documented by the keys above.
+        "takeoff_distance_m": (
+            float(takeoff_stage1_straight_distance_m)
+            if fixed_prefix_input_active else takeoff_stage1_straight_distance_m
+        ),
+        "landing_distance_m": (
+            float(landing_stage1_straight_distance_m)
+            if fixed_prefix_input_active else landing_stage1_straight_distance_m
+        ),
+        "takeoff_angle_deg": (
+            float(takeoff_climb_angle_deg)
+            if angle_input_active else takeoff_climb_angle_deg
+        ),
+        "landing_angle_deg": (
+            float(landing_descent_angle_deg)
+            if angle_input_active else landing_descent_angle_deg
+        ),
+        "transition_altitude_rule": "cumulative_horizontal_ground_track",
         "transition_speed_takeoff_mps": float(transition_speed_takeoff_mps),
         "transition_speed_landing_mps": float(transition_speed_landing_mps),
         "transition_sample_spacing_m": float(transition_sample_spacing_m),
+        "risk_altitude_levels_msl_m": [float(v) for v in risk_altitude_levels.tolist()],
+        "moc_altitude_policy": {
+            "reference_msl_m": float(start_ref_alt_m),
+            "available_agl_m": [int(v) for v in MOC_AGL_LEVELS_M.tolist()],
+            "selection": "floor_to_available_agl_with_agl100_below_minimum",
+        },
         "use_heading_map": bool(use_heading_map),
         "altitude_reference": {
             "cruise_altitude_msl_m": float(altitude_levels[0]),
@@ -3586,16 +9758,18 @@ def attempt_run_once():
         "noise_floor_db": noise_floor_db,
         "ground_risk_path": str(ground_risk_path),
         "bird_airrisk_path": str(bird_airrisk_path),
+        "moc_transition_visualization": moc_transition_visualization,
     }
     with open(out_dir / "params.json", "w", encoding="utf-8") as _pf:
         json.dump(params_dict, _pf, indent=2, ensure_ascii=False)
     print(f"Output folder : {out_dir}")
 
+    _tracked_progress(8, "Loading ground, air, MOC, noise, and wind inputs.", "loading_risk_data")
     pop_risk_raw = np.load(str(ground_risk_path), allow_pickle=True)
     selected = pop_risk_raw[:, :, 0, 3:]
     Ny, Nx, H_time = selected.shape
 
-    A = len(altitude_levels)
+    A = len(risk_altitude_levels)
     RT = np.zeros((A, H_time, Ny, Nx), dtype=float)
     for ai in range(A):
         for hi in range(H_time):
@@ -3619,20 +9793,25 @@ def attempt_run_once():
     ).ravel()
     bird_3d = _align_to_ny_nx_z(np.asarray(bird_raw["Risk_3d"], dtype=float), "BirdRisk")
 
-    AirRisk = np.zeros((Ny, Nx, len(altitude_levels)), dtype=float)
-    for i, alt in enumerate(altitude_levels):  # alt: MSL
+    AirRisk = np.zeros((Ny, Nx, len(risk_altitude_levels)), dtype=float)
+    for i, alt in enumerate(risk_altitude_levels):  # alt: MSL
         src_idx = int(np.argmin(np.abs(bird_z_vec - float(alt))))  # bird_z_vec: MSL
         AirRisk[:, :, i] = bird_3d[:, :, src_idx]
 
-    MOCRisk, moc_plot_2d, moc_meta = load_fixed_agl_moc_maps(
+    moc_altitude_levels_msl = float(start_ref_alt_m) + MOC_AGL_LEVELS_M
+    MOCRisk, _moc_plot_all_levels, moc_meta = load_fixed_agl_moc_maps(
         moc_dir=moc_airrisk_dir,
-        altitude_levels=altitude_levels,
+        altitude_levels=moc_altitude_levels_msl,
         vertiport_elevation_msl_m=start_ref_alt_m,
         Ny=Ny,
         Nx=Nx,
         lat_lim=lat_lim,
         lon_lim=lon_lim,
     )
+    cruise_moc_idx = _moc_floor_layer_index_v1(float(altitude_levels[0]), MOCRisk.shape[2])
+    moc_plot_2d = np.asarray(MOCRisk[:, :, cruise_moc_idx], dtype=float)
+    moc_meta["plot_layer_agl_m"] = int(MOC_AGL_LEVELS_M[cruise_moc_idx])
+    moc_meta["low_altitude_policy"] = "AGL100 is used below 100m AGL"
 
     print(
         f"Loaded bird air risk map: shape={bird_3d.shape}, "
@@ -3657,7 +9836,7 @@ def attempt_run_once():
         npy_path=noise_npy_path,
         Ny=Ny,
         Nx=Nx,
-        altitude_levels=altitude_levels,
+        altitude_levels=risk_altitude_levels,
         noise_floor_db=noise_floor_db,
     )
     NoiseRisk = np.asarray(noise_3d_norm, dtype=float)
@@ -3683,7 +9862,17 @@ def attempt_run_once():
                 f"npy_lat_lim={_lat_lim_meta}, npy_lon_lim={_lon_lim_meta}, "
                 "v18_lat_lim=[35.535, 35.652], v18_lon_lim=[129.020, 129.150]"
             )
+            _warning(
+                "noise_extent_mismatch",
+                "Noise-map extent differs from the optimizer evaluation extent; "
+                "the optimizer extent remains authoritative.",
+                npy_lat_lim=list(_lat_lim_meta),
+                npy_lon_lim=list(_lon_lim_meta),
+                evaluation_lat_lim=[35.535, 35.652],
+                evaluation_lon_lim=[129.020, 129.150],
+            )
 
+    _tracked_progress(14, "Validating vertiports and airspace constraints.", "airspace_validation")
     # start_vertiport = np.array([35.6033361, 129.0776917, 150.0], dtype=float)
     # end_vertiport = np.array([35.6249109, 129.0586710, 150.0], dtype=float)
     # start_vertiport = np.array([35.6033361, 129.0776917, 150.0], dtype=float)
@@ -3696,7 +9885,12 @@ def attempt_run_once():
     params_dict["altitude_reference"]["cruise_altitude_agl_m"] = float(altitude_levels[0] - start_vertiport[2])
 
     # airspace_center_lla = None
-    airspace_center_lla = np.array([35.6033361, 129.0776917, 150.0], dtype=float)
+    _airspace_center_override = (airspace_info_override or {}).get("center")
+    airspace_center_lla = (
+        np.array([35.6033361, 129.0776917, 150.0], dtype=float)
+        if _airspace_center_override is None
+        else np.asarray(_airspace_center_override, dtype=float).reshape(-1)
+    )
 
     if airspace_center_lla is None:
         airspace_center_lla = np.array([
@@ -3733,8 +9927,88 @@ def attempt_run_once():
     # lon_lim = [129.0514, 129.1436]
     request = cimgt.OSM()
 
-    corridor_lat_default = np.array([], dtype=float)
-    corridor_lon_default = np.array([], dtype=float)
+    if sector_auto_selection_active:
+        _tracked_progress(18, "Evaluating automatic takeoff and landing sectors.", "sector_selection")
+        sector_diagnostic_path = out_dir / "sector_selection_diagnostics.png"
+        sector_selection_analysis = _automatic_sector_selection_v1(
+            start_vertiport=start_vertiport,
+            end_vertiport=end_vertiport,
+            target_altitude_msl=float(altitude_levels[0]),
+            transition_structure_mode=transition_structure_mode,
+            transition_mode=transition_mode,
+            takeoff_total_distance_m=takeoff_total_transition_horizontal_distance_m,
+            landing_total_distance_m=landing_total_transition_horizontal_distance_m,
+            takeoff_angle_deg=takeoff_climb_angle_deg,
+            landing_angle_deg=landing_descent_angle_deg,
+            corridor_half_width_m=transition_corridor_half_width_m,
+            sector_half_width_deg=sector_half_width_deg,
+            along_track_step_m=sector_analysis_sample_spacing_m,
+            sector_season=sector_season,
+            wind_tail_weight=sector_wind_tail_weight,
+            wind_cross_weight=sector_wind_cross_weight,
+            wind_risk_weight=sector_wind_risk_weight,
+            ground_risk_weight=sector_ground_risk_weight,
+            air_risk_weight=sector_air_risk_weight,
+            wind_data_dir=sector_wind_data_dir,
+            Norm_RT=Norm_RT,
+            AirRisk=AirRisk,
+            risk_altitude_levels=risk_altitude_levels,
+            MOCRisk=MOCRisk,
+            lat_lim=lat_lim,
+            lon_lim=lon_lim,
+            use_heading_map=use_heading_map,
+            transition_corridor_cfg=transition_corridor_cfg,
+            output_png_path=sector_diagnostic_path,
+            request=request,
+            warning_callback=_warning,
+        )
+        sector_selection_analysis.update({
+            "configured_user_takeoff_sector": int(takeoff_sector_user),
+            "configured_user_landing_sector": int(landing_sector_user),
+        })
+        takeoff_sector_selected = int(
+            sector_selection_analysis["selected_pair"]["takeoff_sector"]
+        )
+        landing_sector_selected = int(
+            sector_selection_analysis["selected_pair"]["landing_sector"]
+        )
+        print(
+            "Automatic sector selection: "
+            f"takeoff=S{takeoff_sector_selected}, landing=S{landing_sector_selected}, "
+            f"status={sector_selection_analysis['status']}"
+        )
+    else:
+        _tracked_progress(18, "Using the configured manual takeoff and landing sectors.", "sector_selection")
+
+    takeoff_heading_deg = float(np.rad2deg(_sector_angle(takeoff_sector_selected)))
+    landing_heading_deg = float(np.rad2deg(_sector_angle(landing_sector_selected)))
+    takeoff_sector_heading_deg_compass = float((90.0 - takeoff_heading_deg) % 360.0)
+    landing_sector_heading_deg_compass = float((90.0 - landing_heading_deg) % 360.0)
+    params_dict.update({
+        "takeoff_sector_selected": int(takeoff_sector_selected),
+        "landing_sector_selected": int(landing_sector_selected),
+        "takeoff_heading_deg": float(takeoff_heading_deg),
+        "landing_heading_deg": float(landing_heading_deg),
+        "takeoff_compass_heading_deg": float(takeoff_sector_heading_deg_compass),
+        "landing_compass_heading_deg": float(landing_sector_heading_deg_compass),
+        "takeoff_sector_heading_deg_compass": float(takeoff_sector_heading_deg_compass),
+        "landing_sector_heading_deg_compass": float(landing_sector_heading_deg_compass),
+        "sector_selection_analysis": sector_selection_analysis,
+    })
+    with open(out_dir / "params.json", "w", encoding="utf-8") as _pf:
+        json.dump(params_dict, _pf, indent=2, ensure_ascii=False)
+
+    _tracked_progress(22, "Validating client corridor waypoints.", "waypoint_validation")
+    _corridor_points_api = [] if corridor_points_override is None else list(corridor_points_override)
+    if _corridor_points_api:
+        _corridor_points_array = np.asarray(_corridor_points_api, dtype=float)
+        if _corridor_points_array.ndim != 2 or _corridor_points_array.shape[1] not in (2, 3):
+            raise ValueError("corridor_points_override must contain [lat, lon] or [lat, lon, alt] rows.")
+        corridor_lat_default = _corridor_points_array[:, 0].astype(float)
+        corridor_lon_default = _corridor_points_array[:, 1].astype(float)
+    else:
+        corridor_lat_default = np.array([], dtype=float)
+        corridor_lon_default = np.array([], dtype=float)
 
 
     # WP set (alt=750m), msl 750일때, agl = 600 일때 위경도값, 이거 사용시 altitude_levels를 750으로 고정해야 함
@@ -3788,24 +10062,33 @@ def attempt_run_once():
     corridor_lat = corridor_lat_default.copy()
     corridor_lon = corridor_lon_default.copy()
 
+    _tracked_progress(24, "Building takeoff and landing transition geometry.", "transition_geometry")
     if use_takeoff_landing_transition:
-        preview_takeoff, _, takeoff_transition_profile, takeoff_transition_meta = build_transition_profile_by_mode(
+        preview_takeoff, takeoff_transition_profile, takeoff_transition_meta = build_stage1_transition_profile(
             start_vertiport,
             target_alt_m=waypoint_alt_fixed_m,
             heading_deg=takeoff_heading_deg,
+            transition_structure_mode=transition_structure_mode,
             transition_mode=transition_mode,
-            distance_m=takeoff_distance_m,
-            angle_deg=takeoff_angle_deg,
+            straight_distance_m=takeoff_stage1_straight_distance_m,
+            total_transition_horizontal_distance_m=(
+                takeoff_total_transition_horizontal_distance_m
+            ),
+            angle_deg=takeoff_climb_angle_deg,
             sample_spacing_m=transition_sample_spacing_m,
             mode_label="takeoff",
         )
-        preview_landing, _, landing_transition_profile, landing_transition_meta = build_transition_profile_by_mode(
+        preview_landing, landing_transition_profile, landing_transition_meta = build_stage1_transition_profile(
             end_vertiport,
             target_alt_m=waypoint_alt_fixed_m,
             heading_deg=landing_heading_deg,
+            transition_structure_mode=transition_structure_mode,
             transition_mode=transition_mode,
-            distance_m=landing_distance_m,
-            angle_deg=landing_angle_deg,
+            straight_distance_m=landing_stage1_straight_distance_m,
+            total_transition_horizontal_distance_m=(
+                landing_total_transition_horizontal_distance_m
+            ),
+            angle_deg=landing_descent_angle_deg,
             sample_spacing_m=transition_sample_spacing_m,
             mode_label="landing",
         )
@@ -3826,6 +10109,15 @@ def attempt_run_once():
             "angle_deg": 0.0,
             "heading_deg": float("nan"),
             "sample_spacing_m": float(transition_sample_spacing_m),
+            "transition_structure_mode": "off",
+            "transition_mode": "off",
+            "total_horizontal_distance_m": 0.0,
+            "stage1_requested_straight_distance_m": 0.0,
+            "stage1_straight_distance_m": 0.0,
+            "stage2_horizontal_distance_m": 0.0,
+            "optimized_transition_actual": False,
+            "stage2_collapsed_at_cruise": False,
+            "stage1_clamped_to_cruise": False,
         }
         landing_transition_meta = {
             "mode": "off",
@@ -3834,20 +10126,67 @@ def attempt_run_once():
             "angle_deg": 0.0,
             "heading_deg": float("nan"),
             "sample_spacing_m": float(transition_sample_spacing_m),
+            "transition_structure_mode": "off",
+            "transition_mode": "off",
+            "total_horizontal_distance_m": 0.0,
+            "stage1_requested_straight_distance_m": 0.0,
+            "stage1_straight_distance_m": 0.0,
+            "stage2_horizontal_distance_m": 0.0,
+            "optimized_transition_actual": False,
+            "stage2_collapsed_at_cruise": False,
+            "stage1_clamped_to_cruise": False,
         }
 
     print(
-        f"Applied takeoff endpoint: lat={preview_takeoff[0]:.8f}, "
+        f"Takeoff optimization boundary: lat={preview_takeoff[0]:.8f}, "
         f"lon={preview_takeoff[1]:.8f}, alt={preview_takeoff[2]:.1f}m"
     )
     print(
-        f"Applied landing endpoint: lat={preview_landing[0]:.8f}, "
+        f"Landing optimization boundary: lat={preview_landing[0]:.8f}, "
         f"lon={preview_landing[1]:.8f}, alt={preview_landing[2]:.1f}m"
     )
 
-    global TAKEOFF_TRANSITION_PROFILE, LANDING_TRANSITION_PROFILE_DESC
+    global TAKEOFF_TRANSITION_PROFILE, LANDING_TRANSITION_PROFILE_DESC, TRANSITION_CONTEXT
     TAKEOFF_TRANSITION_PROFILE = np.asarray(takeoff_transition_profile, dtype=float).copy() if takeoff_transition_profile is not None else np.empty((0, 3), dtype=float)
     LANDING_TRANSITION_PROFILE_DESC = np.asarray(landing_transition_profile_desc, dtype=float).copy() if landing_transition_profile_desc is not None else np.empty((0, 3), dtype=float)
+    if use_takeoff_landing_transition:
+        takeoff_transition_meta["stage1_profile"] = np.asarray(takeoff_transition_profile, dtype=float).copy()
+        landing_transition_meta["stage1_profile_desc"] = np.asarray(landing_transition_profile_desc, dtype=float).copy()
+        TRANSITION_CONTEXT = {
+            "enabled": True,
+            "two_stage_enabled": bool(use_two_stage_transition),
+            "transition_structure_mode": str(transition_structure_mode),
+            "cruise_altitude_m": float(waypoint_alt_fixed_m),
+            "takeoff": takeoff_transition_meta,
+            "landing": landing_transition_meta,
+            "takeoff_heading_deg": takeoff_sector_heading_deg_compass,
+            "landing_heading_deg": landing_sector_heading_deg_compass,
+            "sector_half_width_deg": float(sector_half_width_deg),
+            "require_takeoff_sector_heading": bool(
+                takeoff_transition_meta.get("optimized_transition_actual", False)
+                and takeoff_transition_meta.get(
+                    "stage1_straight_distance_m", 0.0
+                ) <= 0.0
+            ),
+            "require_landing_sector_heading": bool(
+                landing_transition_meta.get("optimized_transition_actual", False)
+                and landing_transition_meta.get(
+                    "stage1_straight_distance_m", 0.0
+                ) <= 0.0
+            ),
+            "start_vertiport_lla": np.asarray(start_vertiport, dtype=float).copy(),
+            "end_vertiport_lla": np.asarray(end_vertiport, dtype=float).copy(),
+        }
+        TRANSITION_CONTEXT["require_sector_heading"] = bool(
+            TRANSITION_CONTEXT["require_takeoff_sector_heading"]
+            and TRANSITION_CONTEXT["require_landing_sector_heading"]
+        )
+    else:
+        TRANSITION_CONTEXT = {
+            "enabled": False,
+            "start_vertiport_lla": np.asarray(start_vertiport, dtype=float).copy(),
+            "end_vertiport_lla": np.asarray(end_vertiport, dtype=float).copy(),
+        }
 
     use_emergency_points = True
     emergency_points_input = np.array([
@@ -3875,9 +10214,11 @@ def attempt_run_once():
     #     [129.12, 129.13, 35.59, 35.60],
     # ], dtype=float)
 
-    forbidden_zones_input = np.array([
-        # [129.12, 129.13, 35.59, 35.60],
-    ], dtype=float)
+    _tracked_progress(26, "Validating NFZ and spatial constraint inputs.", "constraint_input_validation")
+    forbidden_zones_input = np.asarray(
+        [] if forbidden_zones_override is None else forbidden_zones_override,
+        dtype=float,
+    )
 
     if (not use_forbidden_zones) or forbidden_zones_input is None or np.size(forbidden_zones_input) == 0:
         forbidden_zones = np.array([], dtype=float).reshape(0, 4)
@@ -3899,10 +10240,19 @@ def attempt_run_once():
                 end_vertiport=end_vertiport,
                 takeoff_complete=preview_takeoff,
                 landing_entry=preview_landing,
+                use_takeoff_landing_transition=use_takeoff_landing_transition,
+                use_two_stage_transition=use_two_stage_transition,
+                transition_structure_mode=transition_structure_mode,
+                takeoff_optimized_transition_actual=bool(
+                    takeoff_transition_meta.get("optimized_transition_actual", False)
+                ),
+                landing_optimized_transition_actual=bool(
+                    landing_transition_meta.get("optimized_transition_actual", False)
+                ),
                 takeoff_heading_deg=takeoff_heading_deg,
                 landing_heading_deg=landing_heading_deg,
-                takeoff_sector_user=takeoff_sector_user,
-                landing_sector_user=landing_sector_user,
+                takeoff_sector_user=takeoff_sector_selected,
+                landing_sector_user=landing_sector_selected,
                 sector_half_width_deg=sector_half_width_deg,
                 emergency_points=emergency_points_preview,
                 forbidden_zones=forbidden_zones,
@@ -3958,6 +10308,7 @@ def attempt_run_once():
         f"end=({landing_entry[0]:.8f}, {landing_entry[1]:.8f}, {landing_entry[2]:.1f}m)"
     )
 
+    _tracked_progress(28, "Validating the route backbone against the airspace.", "route_validation")
     backbone = np.vstack([takeoff_complete, waypoints, landing_entry])
     if not is_path_inside_airspace(
         backbone,
@@ -4010,9 +10361,67 @@ def attempt_run_once():
             "lon": float(start_vertiport[1]),
             "alt_m": float(start_vertiport[2]),
         },
-        "takeoff_sector": 6,
-        "landing_sector": 11,
+        "takeoff_sector": int(takeoff_sector_selected),
+        "landing_sector": int(landing_sector_selected),
+        "takeoff_sector_selected": int(takeoff_sector_selected),
+        "landing_sector_selected": int(landing_sector_selected),
+        "sector_selection_analysis": sector_selection_analysis,
+        "transition_structure_mode_effective": (
+            str(transition_structure_mode)
+            if bool(use_takeoff_landing_transition) else "off"
+        ),
+        "transition_mode_effective": (
+            str(takeoff_transition_meta.get("transition_mode", "off"))
+            if bool(use_takeoff_landing_transition) else "off"
+        ),
         "actual_takeoff_angle_deg": float(takeoff_transition_meta["angle_deg"]),
+        "actual_landing_angle_deg": float(landing_transition_meta["angle_deg"]),
+        "takeoff_total_transition_horizontal_distance_actual_m": float(
+            takeoff_transition_meta.get("total_horizontal_distance_m", 0.0)
+        ),
+        "landing_total_transition_horizontal_distance_actual_m": float(
+            landing_transition_meta.get("total_horizontal_distance_m", 0.0)
+        ),
+        "takeoff_fixed_prefix_requested_distance_m": float(
+            takeoff_transition_meta.get("stage1_requested_straight_distance_m", 0.0)
+        ),
+        "landing_fixed_prefix_requested_distance_m": float(
+            landing_transition_meta.get("stage1_requested_straight_distance_m", 0.0)
+        ),
+        "takeoff_fixed_prefix_effective_distance_m": float(
+            takeoff_transition_meta.get("stage1_straight_distance_m", 0.0)
+        ),
+        "landing_fixed_prefix_effective_distance_m": float(
+            landing_transition_meta.get("stage1_straight_distance_m", 0.0)
+        ),
+        "takeoff_fixed_straight_actual": bool(
+            takeoff_transition_meta.get("fixed_straight_actual", False)
+        ),
+        "landing_fixed_straight_actual": bool(
+            landing_transition_meta.get("fixed_straight_actual", False)
+        ),
+        "moc_audit_includes_fixed_transition": bool(
+            takeoff_transition_meta.get("fixed_straight_actual", False)
+            or landing_transition_meta.get("fixed_straight_actual", False)
+        ),
+        "takeoff_optimized_transition_actual": bool(
+            takeoff_transition_meta.get("optimized_transition_actual", False)
+        ),
+        "landing_optimized_transition_actual": bool(
+            landing_transition_meta.get("optimized_transition_actual", False)
+        ),
+        "takeoff_stage2_collapsed_at_cruise": bool(
+            takeoff_transition_meta.get("stage2_collapsed_at_cruise", False)
+        ),
+        "landing_stage2_collapsed_at_cruise": bool(
+            landing_transition_meta.get("stage2_collapsed_at_cruise", False)
+        ),
+        "takeoff_fixed_prefix_clamped_to_cruise": bool(
+            takeoff_transition_meta.get("stage1_clamped_to_cruise", False)
+        ),
+        "landing_fixed_prefix_clamped_to_cruise": bool(
+            landing_transition_meta.get("stage1_clamped_to_cruise", False)
+        ),
         "alt_delta_m": float(abs(takeoff_target_alt - start_vertiport[2])),
         "takeoff_complete": {
             "lat": float(takeoff_complete[0]),
@@ -4077,23 +10486,77 @@ def attempt_run_once():
         "map_boundary": {"lat_lim": lat_lim, "lon_lim": lon_lim},
         "takeoff_transition_meta": {
             "mode": str(takeoff_transition_meta["mode"]),
+            "transition_structure_mode": str(
+                takeoff_transition_meta.get("transition_structure_mode", "off")
+            ),
+            "transition_mode": str(
+                takeoff_transition_meta.get("transition_mode", "off")
+            ),
             "height_m": float(takeoff_transition_meta["height_m"]),
             "distance_m": float(takeoff_transition_meta["distance_m"]),
             "angle_deg": float(takeoff_transition_meta["angle_deg"]),
-            "heading_deg": float(takeoff_transition_meta["heading_deg"]),
+            "actual_angle_deg": float(takeoff_transition_meta["angle_deg"]),
+            "heading_deg": (
+                float(takeoff_transition_meta["heading_deg"])
+                if np.isfinite(float(takeoff_transition_meta["heading_deg"]))
+                else None
+            ),
             "sample_spacing_m": float(takeoff_transition_meta["sample_spacing_m"]),
             "sample_count": int(takeoff_transition_profile.shape[0]),
+            "total_horizontal_distance_m": float(takeoff_transition_meta.get("total_horizontal_distance_m", 0.0)),
+            "configured_total_horizontal_distance_m": takeoff_transition_meta.get("configured_total_horizontal_distance_m"),
+            "stage1_requested_straight_distance_m": float(takeoff_transition_meta.get("stage1_requested_straight_distance_m", 0.0)),
+            "stage1_straight_distance_m": float(takeoff_transition_meta.get("stage1_straight_distance_m", 0.0)),
+            "stage1_effective_straight_distance_m": float(takeoff_transition_meta.get("stage1_straight_distance_m", 0.0)),
+            "stage2_horizontal_distance_m": float(takeoff_transition_meta.get("stage2_horizontal_distance_m", 0.0)),
+            "optimized_transition_actual": bool(takeoff_transition_meta.get("optimized_transition_actual", False)),
+            "stage2_collapsed_at_cruise": bool(takeoff_transition_meta.get("stage2_collapsed_at_cruise", False)),
+            "stage1_clamped_to_cruise": bool(takeoff_transition_meta.get("stage1_clamped_to_cruise", False)),
+            "stage1_end_lla": [
+                float(v) for v in np.asarray(
+                    takeoff_transition_meta.get("stage1_end_lla", preview_takeoff), dtype=float
+                ).tolist()
+            ],
         },
         "landing_transition_meta": {
             "mode": str(landing_transition_meta["mode"]),
+            "transition_structure_mode": str(
+                landing_transition_meta.get("transition_structure_mode", "off")
+            ),
+            "transition_mode": str(
+                landing_transition_meta.get("transition_mode", "off")
+            ),
             "height_m": float(landing_transition_meta["height_m"]),
             "distance_m": float(landing_transition_meta["distance_m"]),
             "angle_deg": float(landing_transition_meta["angle_deg"]),
-            "heading_deg": float(landing_transition_meta["heading_deg"]),
+            "actual_angle_deg": float(landing_transition_meta["angle_deg"]),
+            "heading_deg": (
+                float(landing_transition_meta["heading_deg"])
+                if np.isfinite(float(landing_transition_meta["heading_deg"]))
+                else None
+            ),
             "sample_spacing_m": float(landing_transition_meta["sample_spacing_m"]),
             "sample_count": int(landing_transition_profile.shape[0]),
+            "total_horizontal_distance_m": float(landing_transition_meta.get("total_horizontal_distance_m", 0.0)),
+            "configured_total_horizontal_distance_m": landing_transition_meta.get("configured_total_horizontal_distance_m"),
+            "stage1_requested_straight_distance_m": float(landing_transition_meta.get("stage1_requested_straight_distance_m", 0.0)),
+            "stage1_straight_distance_m": float(landing_transition_meta.get("stage1_straight_distance_m", 0.0)),
+            "stage1_effective_straight_distance_m": float(landing_transition_meta.get("stage1_straight_distance_m", 0.0)),
+            "stage2_horizontal_distance_m": float(landing_transition_meta.get("stage2_horizontal_distance_m", 0.0)),
+            "optimized_transition_actual": bool(landing_transition_meta.get("optimized_transition_actual", False)),
+            "stage2_collapsed_at_cruise": bool(landing_transition_meta.get("stage2_collapsed_at_cruise", False)),
+            "stage1_clamped_to_cruise": bool(landing_transition_meta.get("stage1_clamped_to_cruise", False)),
+            "stage1_start_lla": [
+                float(v) for v in np.asarray(
+                    landing_transition_meta.get("stage1_end_lla", preview_landing), dtype=float
+                ).tolist()
+            ],
         },
     })
+    moc_transition_visualization["moc_audit_includes_fixed_transition"] = bool(
+        takeoff_transition_meta.get("fixed_straight_actual", False)
+        or landing_transition_meta.get("fixed_straight_actual", False)
+    )
     with open(out_dir / "params.json", "w", encoding="utf-8") as _pf:
         json.dump(params_dict, _pf, indent=2, ensure_ascii=False)
     print("params.json updated with spatial data.")
@@ -4118,7 +10581,7 @@ def attempt_run_once():
 
         I_n = np.clip(((nodes_seg[:, 1] - lon_lim[0]) / (lon_lim[1] - lon_lim[0]) * (Nx - 1)).astype(int), 0, Nx - 1)
         J_n = np.clip(((nodes_seg[:, 0] - lat_lim[0]) / (lat_lim[1] - lat_lim[0]) * (Ny - 1)).astype(int), 0, Ny - 1)
-        ai = np.argmin(np.abs(nodes_seg[:, 2][:, None] - altitude_levels[None, :]), axis=1)
+        ai = np.argmin(np.abs(nodes_seg[:, 2][:, None] - risk_altitude_levels[None, :]), axis=1)
         risks = AirRisk[J_n, I_n, ai]
 
         safe = nodes_seg
@@ -4156,7 +10619,7 @@ def attempt_run_once():
 
         I_n = np.clip(((nodes_seg[:, 1] - lon_lim[0]) / (lon_lim[1] - lon_lim[0]) * (Nx - 1)).astype(int), 0, Nx - 1)
         J_n = np.clip(((nodes_seg[:, 0] - lat_lim[0]) / (lat_lim[1] - lat_lim[0]) * (Ny - 1)).astype(int), 0, Ny - 1)
-        ai = np.argmin(np.abs(nodes_seg[:, 2][:, None] - altitude_levels[None, :]), axis=1)
+        ai = np.argmin(np.abs(nodes_seg[:, 2][:, None] - risk_altitude_levels[None, :]), axis=1)
         risks = AirRisk[J_n, I_n, ai]
 
         safe = nodes_seg
@@ -4194,7 +10657,7 @@ def attempt_run_once():
         if s.size > 0:
             I_s = np.clip(((s[:, 1] - lon_lim[0]) / (lon_lim[1] - lon_lim[0]) * (Nx - 1)).astype(int), 0, Nx - 1)
             J_s = np.clip(((s[:, 0] - lat_lim[0]) / (lat_lim[1] - lat_lim[0]) * (Ny - 1)).astype(int), 0, Ny - 1)
-            ai_s = np.argmin(np.abs(s[:, 2][:, None] - altitude_levels[None, :]), axis=1)
+            ai_s = np.argmin(np.abs(s[:, 2][:, None] - risk_altitude_levels[None, :]), axis=1)
             safe_airrisk_by_seg.append(AirRisk[J_s, I_s, ai_s].astype(float))
         else:
             safe_airrisk_by_seg.append(np.empty((0,), dtype=float))
@@ -4217,7 +10680,7 @@ def attempt_run_once():
         if s_pct.size > 0:
             I_s = np.clip(((s_pct[:, 1] - lon_lim[0]) / (lon_lim[1] - lon_lim[0]) * (Nx - 1)).astype(int), 0, Nx - 1)
             J_s = np.clip(((s_pct[:, 0] - lat_lim[0]) / (lat_lim[1] - lat_lim[0]) * (Ny - 1)).astype(int), 0, Ny - 1)
-            ai_s = np.argmin(np.abs(s_pct[:, 2][:, None] - altitude_levels[None, :]), axis=1)
+            ai_s = np.argmin(np.abs(s_pct[:, 2][:, None] - risk_altitude_levels[None, :]), axis=1)
             safe_airrisk_by_seg_pct.append(AirRisk[J_s, I_s, ai_s].astype(float))
         else:
             safe_airrisk_by_seg_pct.append(np.empty((0,), dtype=float))
@@ -4255,8 +10718,9 @@ def attempt_run_once():
         f"(max {max_init_retries} retries, N_init={N_init}, "
         f"min_feasible_init_solutions={min_feasible_init_solutions}) ..."
     )
-    rf_corridor_start = np.asarray(takeoff_complete if not use_takeoff_landing_transition else start_vertiport, dtype=float)
-    rf_corridor_end = np.asarray(landing_entry if not use_takeoff_landing_transition else end_vertiport, dtype=float)
+    _tracked_progress(30, "Searching for a constraint-feasible initial population.", "initial_population")
+    rf_corridor_start = np.asarray(takeoff_complete, dtype=float)
+    rf_corridor_end = np.asarray(landing_entry, dtype=float)
     _apply_rf_for_init = partial(
         _apply_rf_corridor_path,
         start_vertiport=rf_corridor_start,
@@ -4268,6 +10732,7 @@ def attempt_run_once():
         look_ahead_threshold_m=look_ahead_threshold_m,
         look_ahead_min_scale=look_ahead_min_scale,
         look_ahead_window=look_ahead_window,
+        use_boundary_heading=rf_use_boundary_heading,
         rf_debug_level=rf_debug_level,
     )
     _eval_with_reason_for_init = partial(
@@ -4278,7 +10743,7 @@ def attempt_run_once():
         flight_dist_limit=flight_dist_limit,
         forbidden_zones=forbidden_zones,
         delta_z_max=delta_z_max,
-        altitude_levels=altitude_levels,
+        altitude_levels=risk_altitude_levels,
         cell_size=cell_size,
         refine_scales=refine_scales,
         air_risk_threshold=air_thr_global,
@@ -4299,9 +10764,14 @@ def attempt_run_once():
         landing_entry=None,
         takeoff_complete=None,
         return_reason=True,
+        transition_corridor_cfg=transition_corridor_cfg,
     )
 
     init_pop = None
+    _last_init_candidate_count = 0
+    _last_init_rf_count = 0
+    _last_init_feasible_count = 0
+    _last_init_reason_counts = {}
     for _retry in range(1, max_init_retries + 1):
         _candidate = _make_initial_population(
             N_init=N_init,
@@ -4330,7 +10800,16 @@ def attempt_run_once():
         if len(_candidate) < N_init:
             print(f"  [Init] Airspace-filtered initial pop: {len(_candidate)}/{N_init}")
         _cand_n = len(_candidate)
+        _last_init_candidate_count = int(_cand_n)
         if not _candidate:
+            _initial_population_diagnostic(
+                current=_retry,
+                state="retry",
+                candidate_count=0,
+                rf_count=0,
+                feasible_count=0,
+                reason_counts={"initial_horizontal_airspace": int(N_init)},
+            )
             if _retry % 50 == 0:
                 print(f"  [Init retry {_retry}/{max_init_retries}] candidate_after_initial_airspace: 0/{N_init}")
             continue
@@ -4346,6 +10825,7 @@ def attempt_run_once():
             airspace_alt_min_m=airspace_alt_min_m,
             airspace_alt_max_m=airspace_alt_max_m,
             min_corridor_distance_m=min_corridor_distance_m,
+            transition_corridor_cfg=transition_corridor_cfg,
         )
         _rf_cnt = int(_init_eval["rf_cnt"])
         _rf_no_clamp_cnt = int(_init_eval["rf_no_clamp_cnt"])
@@ -4355,6 +10835,21 @@ def attempt_run_once():
         _dist_cnt = int(_init_eval["dist_cnt"])
         _reason_counts = dict(_init_eval["reason_counts"])
         _feasible_init = list(_init_eval["feasible_init"])
+        _last_init_rf_count = int(_rf_cnt)
+        _last_init_feasible_count = int(_both_cnt)
+        _last_init_reason_counts = dict(_reason_counts)
+
+        _initial_population_diagnostic(
+            current=_retry,
+            state=(
+                "completed"
+                if _both_cnt >= min_feasible_init_solutions else "retry"
+            ),
+            candidate_count=_cand_n,
+            rf_count=_rf_cnt,
+            feasible_count=_both_cnt,
+            reason_counts=_reason_counts,
+        )
 
         if _retry % 50 == 0 or _rf_cnt > 0:
             _reason_txt = "none"
@@ -4387,6 +10882,17 @@ def attempt_run_once():
             f"  Warning: feasible init pop < target ({min_feasible_init_solutions}) "
             f"after {max_init_retries} retries. Restarting run."
         )
+        _initial_population_diagnostic(
+            current=max_init_retries,
+            state="failed",
+            candidate_count=_last_init_candidate_count,
+            rf_count=_last_init_rf_count,
+            feasible_count=_last_init_feasible_count,
+            reason_counts=_last_init_reason_counts,
+        )
+        _tracked_progress(42, "No feasible initial population was found; retrying.", "retry")
+        if return_run_dir:
+            return False, 0, out_dir
         return False, 0
     print(f"  -> {len(init_pop)} feasible initial solutions ready.")
 
@@ -4414,7 +10920,16 @@ def attempt_run_once():
     map_extent = compute_centered_map_extent(np.array(extent_points, dtype=float), airspace_center_lla,
                                              ring_radii_m=(airspace_radius_m,), pad_ratio=0.10)
 
-    bb_full = np.vstack([start_vertiport, backbone, end_vertiport]) if use_takeoff_landing_transition else np.asarray(backbone, dtype=float)
+    fixed_transition_general_output_suppressed = bool(
+        use_takeoff_landing_transition
+        and transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+    )
+    bb_full = (
+        np.vstack([start_vertiport, backbone, end_vertiport])
+        if use_takeoff_landing_transition
+        and not fixed_transition_general_output_suppressed
+        else np.asarray(backbone, dtype=float)
+    )
     total_safe_count = sum(s.shape[0] for s in safe_nodes_active if s.size > 0)
     total_safe_count_compare = sum(s.shape[0] for s in safe_nodes_compare if s.size > 0)
 
@@ -4476,10 +10991,37 @@ def attempt_run_once():
                    marker="s", transform=ccrs.Geodetic(), label="Start Vertiport", zorder=zorder)
         gx.scatter([end_vertiport[1]], [end_vertiport[0]], s=point_size, c="crimson", edgecolors="k",
                    marker="D", transform=ccrs.Geodetic(), label="End Vertiport", zorder=zorder)
-        gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, c="blue",
-                   marker="^", transform=ccrs.Geodetic(), label=takeoff_label, zorder=zorder)
-        gx.scatter([landing_entry[1]], [landing_entry[0]], s=90, c="green",
-                   marker="v", transform=ccrs.Geodetic(), label=landing_label, zorder=zorder)
+        if not use_takeoff_landing_transition:
+            gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, c=TAKEOFF_TRANSITION_COLOR,
+                       marker="^", transform=ccrs.Geodetic(), label=takeoff_label, zorder=zorder)
+            gx.scatter([landing_entry[1]], [landing_entry[0]], s=90, c=LANDING_TRANSITION_COLOR,
+                       marker="v", transform=ccrs.Geodetic(), label=landing_label, zorder=zorder)
+        elif transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY:
+            gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                       c=TAKEOFF_TRANSITION_COLOR, marker="^", transform=ccrs.Geodetic(),
+                       label="Takeoff Transition End", zorder=zorder)
+            gx.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                       c=LANDING_TRANSITION_COLOR, marker="v", transform=ccrs.Geodetic(),
+                       label="Landing Transition Start", zorder=zorder)
+        elif use_two_stage_transition:
+            if _seg_dist_m(start_vertiport, takeoff_complete) > 0.5:
+                if bool(takeoff_transition_meta.get("optimized_transition_actual", False)):
+                    gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, facecolors="none",
+                               edgecolors=TAKEOFF_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                               transform=ccrs.Geodetic(), label="Takeoff Stage1 End", zorder=zorder)
+                else:
+                    gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                               c=TAKEOFF_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="^",
+                               transform=ccrs.Geodetic(), label="Takeoff Transition End", zorder=zorder)
+            if _seg_dist_m(end_vertiport, landing_entry) > 0.5:
+                if bool(landing_transition_meta.get("optimized_transition_actual", False)):
+                    gx.scatter([landing_entry[1]], [landing_entry[0]], s=90, facecolors="none",
+                               edgecolors=LANDING_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                               transform=ccrs.Geodetic(), label="Landing Stage1 Start", zorder=zorder)
+                else:
+                    gx.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                               c=LANDING_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="v",
+                               transform=ccrs.Geodetic(), label="Landing Transition Start", zorder=zorder)
 
     def _plot_safe_nodes_figure(
         fig_title,
@@ -4512,10 +11054,37 @@ def attempt_run_once():
                    marker="s", transform=ccrs.Geodetic(), label="Start Vertiport", zorder=7)
         gx.scatter([end_vertiport[1]], [end_vertiport[0]], s=120, c="crimson", edgecolors="k",
                    marker="D", transform=ccrs.Geodetic(), label="End Vertiport", zorder=7)
-        gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, c="blue",
-                   marker="^", transform=ccrs.Geodetic(), label="Takeoff_End", zorder=7)
-        gx.scatter([landing_entry[1]], [landing_entry[0]], s=90, c="green",
-                   marker="v", transform=ccrs.Geodetic(), label="Landing_End", zorder=7)
+        if not use_takeoff_landing_transition:
+            gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, c=TAKEOFF_TRANSITION_COLOR,
+                       marker="^", transform=ccrs.Geodetic(), label="Takeoff_End", zorder=7)
+            gx.scatter([landing_entry[1]], [landing_entry[0]], s=90, c=LANDING_TRANSITION_COLOR,
+                       marker="v", transform=ccrs.Geodetic(), label="Landing_End", zorder=7)
+        elif transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY:
+            gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                       c=TAKEOFF_TRANSITION_COLOR, marker="^", transform=ccrs.Geodetic(),
+                       label="Takeoff Transition End", zorder=7)
+            gx.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                       c=LANDING_TRANSITION_COLOR, marker="v", transform=ccrs.Geodetic(),
+                       label="Landing Transition Start", zorder=7)
+        elif use_two_stage_transition:
+            if _seg_dist_m(start_vertiport, takeoff_complete) > 0.5:
+                if bool(takeoff_transition_meta.get("optimized_transition_actual", False)):
+                    gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90, facecolors="none",
+                               edgecolors=TAKEOFF_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                               transform=ccrs.Geodetic(), label="Takeoff Stage1 End", zorder=7)
+                else:
+                    gx.scatter([takeoff_complete[1]], [takeoff_complete[0]], s=90,
+                               c=TAKEOFF_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="^",
+                               transform=ccrs.Geodetic(), label="Takeoff Transition End", zorder=7)
+            if _seg_dist_m(end_vertiport, landing_entry) > 0.5:
+                if bool(landing_transition_meta.get("optimized_transition_actual", False)):
+                    gx.scatter([landing_entry[1]], [landing_entry[0]], s=90, facecolors="none",
+                               edgecolors=LANDING_TRANSITION_COLOR, linewidths=1.4, marker="o",
+                               transform=ccrs.Geodetic(), label="Landing Stage1 Start", zorder=7)
+                else:
+                    gx.scatter([landing_entry[1]], [landing_entry[0]], s=90,
+                               c=LANDING_TRANSITION_COLOR, edgecolors="k", linewidths=0.7, marker="v",
+                               transform=ccrs.Geodetic(), label="Landing Transition Start", zorder=7)
 
         first_scatter = None
         for ki, seg_nodes in enumerate(safe_nodes_set):
@@ -4608,6 +11177,11 @@ def attempt_run_once():
         use_boundary_heading=rf_use_boundary_heading,
         rf_debug_level=rf_debug_level,
     )
+    output_rf_view_fn = partial(
+        _build_output_rf_view_v1,
+        transition_structure_mode=transition_structure_mode,
+        transition_enabled=use_takeoff_landing_transition,
+    )
     eval_cfg = dict(
         Norm_RT=Norm_RT,
         AirRisk=AirRisk,
@@ -4615,7 +11189,7 @@ def attempt_run_once():
         flight_dist_limit=flight_dist_limit,
         forbidden_zones=forbidden_zones,
         delta_z_max=delta_z_max,
-        altitude_levels=altitude_levels,
+        altitude_levels=risk_altitude_levels,
         cell_size=cell_size,
         refine_scales=refine_scales,
         air_risk_threshold=air_thr_global,
@@ -4635,6 +11209,7 @@ def attempt_run_once():
         vertiport=None,
         landing_entry=None,
         takeoff_complete=None,
+        transition_corridor_cfg=transition_corridor_cfg,
     )
     eval_corridor_fn = partial(_evaluate_corridor_objectives_path, eval_cfg=eval_cfg)
 
@@ -4648,10 +11223,17 @@ def attempt_run_once():
     _plot_standard_key_markers(gx2, include_waypoints=False, include_backbone=True, zorder=8)
     colors_sample = plt.cm.tab10(np.linspace(0, 1, n_sample))
     for si in range(n_sample):
-        rf = rf_apply_fn(init_pop[si])
-        rf_path = rf["path"]
-        gx2.plot(rf_path[:, 1], rf_path[:, 0], "-", color=colors_sample[si], linewidth=1.2,
-                 transform=ccrs.Geodetic(), label=f"Sol {si+1}", zorder=5)
+        rf = output_rf_view_fn(rf_apply_fn(init_pop[si]))
+        _plot_rf_segments_by_phase(
+            gx2, rf, cruise_color=colors_sample[si], tf_lw=1.2, rf_lw=1.6,
+            transform=ccrs.Geodetic(), zorder=5,
+            transition_labels=(si == 0), draw_rf_markers=False,
+        )
+        _plot_transition_phase_markers(
+            gx2, rf, transform=ccrs.Geodetic(), zorder=10, labels=(si == 0),
+            include_stage1=False, general_output=True,
+        )
+        gx2.plot([], [], "-", color=colors_sample[si], linewidth=1.2, label=f"Sol {si+1}")
     gx2.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, framealpha=0.9)
     fig2.savefig(out_dir / "fig2_sample_init.png", dpi=150, bbox_inches="tight")
     print(f"Saved {out_dir / 'fig2_sample_init.png'}")
@@ -4668,27 +11250,33 @@ def attempt_run_once():
 
     for si in range(n_sample):
         col = colors_sample[si]
-        if use_takeoff_landing_transition:
-            path_before = np.vstack([start_vertiport, init_pop[si], end_vertiport]).astype(float)
-        else:
-            path_before = np.vstack([takeoff_complete, init_pop[si], landing_entry]).astype(float)
-        rf = rf_apply_fn(init_pop[si])
-        path_after = rf["path"]
+        path_before = np.asarray(init_pop[si], dtype=float).reshape(-1, 3)
+        rf_before = _profile_rf_segments_for_transition(
+            {
+                "path": path_before,
+                "segments": [{"type": "TF", "points": path_before}],
+                "feasible": True,
+            },
+            TRANSITION_CONTEXT if TRANSITION_CONTEXT is not None else {"enabled": False},
+        )
+        rf_before = output_rf_view_fn(rf_before)
+        rf = output_rf_view_fn(rf_apply_fn(init_pop[si]))
 
-        gx2b.plot(
-            path_before[:, 1], path_before[:, 0], "--", color=col, linewidth=1.1,
+        _plot_rf_segments_by_phase(
+            gx2b, rf_before, cruise_color=col, tf_lw=1.1, rf_lw=1.1,
             transform=ccrs.Geodetic(), zorder=5,
-            label=(f"Sol {si+1} Before RF" if si == 0 else None),
-        )
-        gx2b.scatter(
-            path_before[:, 1], path_before[:, 0], s=18, color=col, marker="o",
-            edgecolors="k", linewidths=0.3, transform=ccrs.Geodetic(), zorder=6,
+            transition_labels=(si == 0), draw_rf_markers=False,
+            linestyle="--", include_fixed_stage1=False,
         )
 
-        gx2b.plot(
-            path_after[:, 1], path_after[:, 0], "-", color=col, linewidth=1.7,
+        _plot_rf_segments_by_phase(
+            gx2b, rf, cruise_color=col, tf_lw=1.7, rf_lw=2.1,
             transform=ccrs.Geodetic(), zorder=7,
-            label=(f"Sol {si+1} After RF" if si == 0 else None),
+            transition_labels=False, draw_rf_markers=False,
+        )
+        _plot_transition_phase_markers(
+            gx2b, rf, transform=ccrs.Geodetic(), zorder=10, labels=(si == 0),
+            include_stage1=False, general_output=True,
         )
 
     gx2b.plot([], [], "--", color="black", linewidth=1.1, label="Before RF (all samples)")
@@ -4699,6 +11287,22 @@ def attempt_run_once():
     plt.close(fig2b)
 
     print("Running NSGA-III ...")
+    _tracked_progress(55, "Running NSGA-III corridor optimization.", "optimization")
+
+    def _report_nsga_generation(**generation_info):
+        generation = int(generation_info["generation"])
+        total_generations = max(1, int(generation_info["total_generations"]))
+        progress = 55 + int(round(30.0 * generation / total_generations))
+        _tracked_progress(
+            min(85, progress),
+            f"NSGA-III generation {generation}/{total_generations} completed "
+            f"(constraints {generation_info['constraint_feasible']}/"
+            f"{generation_info['population_size']}, RF {generation_info['rf_feasible']}/"
+            f"{generation_info['population_size']}).",
+            "optimization_generation",
+            **generation_info,
+        )
+
     pop, fvals, gen_history = run_nsga3(
         nodes_pool=nodes_pool,
         node_risk_pool=node_risk_pool,
@@ -4709,7 +11313,7 @@ def attempt_run_once():
         mandatory_backbone=backbone,
         Norm_RT=Norm_RT, AirRisk=AirRisk, use_map=use_heading_map,
         f_limit=flight_dist_limit, f_zones=forbidden_zones,
-        alt=altitude_levels, cs=cell_size, scales=refine_scales,
+        alt=risk_altitude_levels, cs=cell_size, scales=refine_scales,
         air_thr=air_thr_global, dz=delta_z_max,
         w_d=w_dist, w_g=w_ground, w_a=w_air,
         lat_lim=lat_lim, lon_lim=lon_lim,
@@ -4721,11 +11325,12 @@ def attempt_run_once():
         look_ahead_threshold_m=look_ahead_threshold_m,
         look_ahead_min_scale=look_ahead_min_scale,
         look_ahead_window=look_ahead_window,
+        use_boundary_heading=rf_use_boundary_heading,
         W_half=W_half, check_corridor_nfz=check_corridor_nfz, check_corridor_moc=check_corridor_moc,
         check_corridor_self_overlap=check_corridor_self_overlap,
         MOCRisk=MOCRisk,
-        start_vertiport=start_vertiport,
-        end_vertiport=end_vertiport,
+        start_vertiport=rf_corridor_start,
+        end_vertiport=rf_corridor_end,
         landing_entry=landing_entry,
         takeoff_complete=takeoff_complete,
         airspace_center_latlon=airspace_center_lla[:2],
@@ -4733,6 +11338,8 @@ def attempt_run_once():
         airspace_alt_min_m=airspace_alt_min_m,
         airspace_alt_max_m=airspace_alt_max_m,
         min_corridor_distance_m=min_corridor_distance_m,
+        transition_corridor_cfg=transition_corridor_cfg,
+        generation_progress_callback=_report_nsga_generation,
     )
 
     _save_generation_snapshots(
@@ -4749,10 +11356,21 @@ def attempt_run_once():
         end_vertiport=end_vertiport,
         takeoff_complete=takeoff_complete,
         landing_entry=landing_entry,
+        use_takeoff_landing_transition=use_takeoff_landing_transition,
+        use_two_stage_transition=use_two_stage_transition,
+        transition_structure_mode=transition_structure_mode,
+        takeoff_optimized_transition_actual=bool(
+            takeoff_transition_meta.get("optimized_transition_actual", False)
+        ),
+        landing_optimized_transition_actual=bool(
+            landing_transition_meta.get("optimized_transition_actual", False)
+        ),
         objective_names=objective_names,
         altitude_levels=altitude_levels,
         apply_rf_corridor_fn=rf_apply_fn,
+        output_rf_view_fn=output_rf_view_fn,
         W_half=W_half,
+        transition_corridor_cfg=transition_corridor_cfg,
         moc_plot_2d=moc_plot_2d,
         lat_lim=lat_lim,
         lon_lim=lon_lim,
@@ -4767,12 +11385,16 @@ def attempt_run_once():
         airspace_alt_min_m=airspace_alt_min_m,
         airspace_alt_max_m=airspace_alt_max_m,
         min_corridor_distance_m=min_corridor_distance_m,
+        transition_corridor_cfg=transition_corridor_cfg,
     )
     print(f"Final feasible (constraints): {feasible_count}/{len(pop)}")
     print(f"RF geometric no-clamp: {rf_no_clamp_count}/{len(pop)}")
 
     if feasible_count == 0:
         print("No feasible solution. Retrying ...")
+        _tracked_progress(86, "The evolved population has no feasible route; retrying.", "retry")
+        if return_run_dir:
+            return False, 0, out_dir
         return False, 0
 
     reps = pick_representatives(pop, fvals) if pop and fvals.size > 0 else []
@@ -4806,7 +11428,9 @@ def attempt_run_once():
         if reps:
             for ri, rep in enumerate(reps):
                 rf_rep = rf_apply_fn(rep)
-                f_rep, _ = eval_corridor_fn(rf_rep["path"])
+                f_rep, _ = eval_corridor_fn(
+                    rf_rep["path"], rf_rep.get("flight_phases")
+                )
                 rep_labels_3 = objective_names + ["Balanced"]
                 lab = rep_labels_3[ri] if ri < len(rep_labels_3) else f"Rep{ri}"
                 is_balanced = (ri == len(reps) - 1)
@@ -4826,14 +11450,20 @@ def attempt_run_once():
     print(f"Saved {out_dir / 'fig3_pareto.png'}")
     plt.close(fig3)
 
-    f_initial_backbone, _ = eval_corridor_fn(bb_full)
+    rf_initial_backbone = rf_apply_fn(backbone)
+    f_initial_backbone, _ = eval_corridor_fn(
+        rf_initial_backbone["path"],
+        rf_initial_backbone.get("flight_phases"),
+    )
 
     init_rep_objectives = None
     if init_pop:
         init_fvals = np.zeros((len(init_pop), len(objective_names)), dtype=float)
         for i_init, p_init in enumerate(init_pop):
             rf_init = rf_apply_fn(p_init)
-            f_init_vec, _ = eval_corridor_fn(rf_init["path"])
+            f_init_vec, _ = eval_corridor_fn(
+                rf_init["path"], rf_init.get("flight_phases")
+            )
             init_fvals[i_init, :] = np.asarray(f_init_vec, dtype=float)
 
         init_rep_objectives = [
@@ -4852,11 +11482,13 @@ def attempt_run_once():
     _plot_representative_corridor_figures(
         reps=reps,
         apply_rf_corridor_fn=rf_apply_fn,
+        output_rf_view_fn=output_rf_view_fn,
         eval_corridor_objectives_fn=eval_corridor_fn,
         objective_names=objective_names,
         altitude_levels=altitude_levels,
         start_vertiport=start_vertiport,
         W_half=W_half,
+        transition_corridor_cfg=transition_corridor_cfg,
         out_dir=out_dir,
         request=request,
         map_extent=map_extent,
@@ -4873,33 +11505,47 @@ def attempt_run_once():
         landing_entry=landing_entry,
         init_rep_objectives=init_rep_objectives,
         f_initial_backbone=f_initial_backbone,
-        takeoff_transition_profile=takeoff_transition_profile,
-        landing_transition_profile_desc=landing_transition_profile_desc,
         use_takeoff_landing_transition=use_takeoff_landing_transition,
+        transition_structure_mode=transition_structure_mode,
         setup_corridor_axes_fn=_setup_corridor_axes,
         plot_standard_key_markers_fn=_plot_standard_key_markers,
     )
 
+    rf_best = None
+    rf_best_output = None
     best_rep = reps[-1] if reps else (pop[0] if pop else None)
     if best_rep is not None:
         rf_best = rf_apply_fn(best_rep)
+        rf_best_output = output_rf_view_fn(rf_best)
         R_turn = rf_best["turn_radius_m"]
-        segs_best = rf_best["segments"]
+        segs_best = rf_best_output["segments"]
         g_mps2_local = 9.80665
         phi_local = np.deg2rad(bank_angle_deg)
 
         rows = []
         point_idx = 0
 
-        def _is_same_point(p1, p2, tol_m=0.5):
+        def _is_same_point(p1, p2, tol_m=0.05):
             return _seg_dist_3d_m(np.asarray(p1, dtype=float), np.asarray(p2, dtype=float)) <= float(tol_m)
 
         last_point = None
 
         def _append_vertiport_row(point, segment_label):
             nonlocal point_idx, last_point
+            point = np.asarray(point, dtype=float).reshape(3)
+            if last_point is not None and _is_same_point(point, last_point):
+                # The profiled RF segments already include transition-on
+                # vertiports. Reclassify that endpoint instead of duplicating it.
+                rows[-1]["Type"] = "Vertiport"
+                rows[-1]["Segment"] = segment_label
+                rows[-1]["Flight_Phase"] = FLIGHT_PHASE_VERTIPORT
+                rows[-1]["Ground_Speed_mps"] = 0.0
+                rows[-1]["Bank_Angle_deg"] = 0.0
+                last_point = point
+                return
             rows.append({
                 "Point_No": point_idx, "Type": "Vertiport", "Segment": segment_label,
+                "Flight_Phase": FLIGHT_PHASE_VERTIPORT,
                 "Lat": float(point[0]), "Lon": float(point[1]), "Altitude_MSL_m": float(point[2]),
                 "Altitude_AGL_m": float(point[2] - start_vertiport[2]),
                 "TF_Start": "", "TF_End": "", "RF_Start": "", "RF_End": "",
@@ -4908,77 +11554,54 @@ def attempt_run_once():
                 "Ground_Speed_mps": 0.0, "Bank_Angle_deg": 0.0,
             })
             point_idx += 1
-            last_point = np.asarray(point, dtype=float)
+            last_point = point
 
-        def _append_transition(profile, segment_label, type_label, speed_mps, skip_first=False, skip_last=False):
-            nonlocal point_idx, last_point
-            prof = np.asarray(profile, dtype=float)
-            if prof.ndim == 1:
-                prof = prof.reshape(1, -1)
-            if prof.size == 0:
-                return
-            start_idx = 1 if skip_first else 0
-            end_idx = prof.shape[0] - 1 if skip_last else prof.shape[0]
-            if end_idx <= start_idx:
-                return
-            for pi in range(start_idx, end_idx):
-                cur_pt = np.asarray(prof[pi], dtype=float)
-                if last_point is not None and _is_same_point(cur_pt, last_point, tol_m=0.5):
-                    if rows and pi == start_idx:
-                        rows[-1]["TF_Start"] = "O"
-                    continue
-                is_start = "O" if pi == start_idx else ""
-                is_end = "O" if pi == end_idx - 1 else ""
-                rows.append({
-                    "Point_No": point_idx, "Type": type_label, "Segment": segment_label,
-                    "Lat": cur_pt[0], "Lon": cur_pt[1], "Altitude_MSL_m": cur_pt[2],
-                    "Altitude_AGL_m": float(cur_pt[2] - start_vertiport[2]),
-                    "TF_Start": is_start, "TF_End": is_end,
-                    "RF_Start": "", "RF_End": "",
-                    "Arc_Center_Lat": "", "Arc_Center_Lon": "",
-                    "Turn_Radius_m": "", "Turn_Angle_deg": "",
-                    "LookAhead_Radius_Scale": "", "Ground_Speed_mps": float(speed_mps),
-                    "Bank_Angle_deg": 0.0,
-                })
-                point_idx += 1
-                last_point = cur_pt
+        if not fixed_transition_general_output_suppressed:
+            _append_vertiport_row(start_vertiport, "Start")
 
-        _append_vertiport_row(start_vertiport, "Start")
-        if use_takeoff_landing_transition:
-            _append_transition(
-                takeoff_transition_profile,
-                "Takeoff_Transition",
-                "Takeoff_TF_Point",
-                transition_speed_takeoff_mps,
-                skip_first=True,
-                skip_last=False,
-            )
-
-        # Segments (RF only on core)
+        # rf_best already contains fixed stage-1 TF segments and the profiled
+        # optimized TF/RF span, in full flight order.
         seg_counter = 0
         for seg in segs_best:
             seg_counter += 1
-            pts = seg["points"]
+            pts = np.asarray(seg["points"], dtype=float).reshape(-1, 3)
             stype = seg["type"]
+            point_phases = np.asarray(
+                seg.get("point_phases", np.full(pts.shape[0], FLIGHT_PHASE_CRUISE)),
+                dtype=object,
+            ).reshape(-1)
+            if point_phases.size != pts.shape[0]:
+                raise RuntimeError(
+                    f"RF segment phase count mismatch: points={pts.shape[0]}, "
+                    f"phases={point_phases.size}."
+                )
 
             if stype == "TF":
                 for pi in range(pts.shape[0]):
                     cur_pt = np.asarray(pts[pi], dtype=float)
-                    if last_point is not None and _is_same_point(cur_pt, last_point, tol_m=0.5):
-                        if rows and pi == 0:
+                    if pi == 0 and last_point is not None and _is_same_point(cur_pt, last_point):
+                        if rows:
                             rows[-1]["TF_Start"] = "O"
                         continue
+                    phase = str(point_phases[pi])
                     is_start = "O" if pi == 0 else ""
                     is_end = "O" if pi == pts.shape[0] - 1 else ""
+                    if phase in (FLIGHT_PHASE_TAKEOFF_STAGE1, FLIGHT_PHASE_TAKEOFF_STAGE2):
+                        speed_mps = float(transition_speed_takeoff_mps)
+                    elif phase in (FLIGHT_PHASE_LANDING_STAGE2, FLIGHT_PHASE_LANDING_STAGE1):
+                        speed_mps = float(transition_speed_landing_mps)
+                    else:
+                        speed_mps = float(ground_speed_mps)
                     rows.append({
                         "Point_No": point_idx, "Type": "TF_Point", "Segment": f"Seg{seg_counter}",
+                        "Flight_Phase": phase,
                         "Lat": cur_pt[0], "Lon": cur_pt[1], "Altitude_MSL_m": cur_pt[2],
                         "Altitude_AGL_m": float(cur_pt[2] - start_vertiport[2]),
                         "TF_Start": is_start, "TF_End": is_end,
                         "RF_Start": "", "RF_End": "",
                         "Arc_Center_Lat": "", "Arc_Center_Lon": "",
                         "Turn_Radius_m": "", "Turn_Angle_deg": "",
-                        "LookAhead_Radius_Scale": "", "Ground_Speed_mps": ground_speed_mps, "Bank_Angle_deg": 0.0,
+                        "LookAhead_Radius_Scale": "", "Ground_Speed_mps": speed_mps, "Bank_Angle_deg": 0.0,
                     })
                     point_idx += 1
                     last_point = cur_pt
@@ -4990,16 +11613,18 @@ def attempt_run_once():
                 speed_i = float(np.sqrt(max(0.0, turn_radius_i * g_mps2_local * np.tan(phi_local))))
                 for pi in range(pts.shape[0]):
                     cur_pt = np.asarray(pts[pi], dtype=float)
-                    if last_point is not None and _is_same_point(cur_pt, last_point, tol_m=0.5):
-                        if rows and pi == 0:
+                    if pi == 0 and last_point is not None and _is_same_point(cur_pt, last_point):
+                        if rows:
                             rows[-1]["RF_Start"] = "O"
                         continue
+                    phase = str(point_phases[pi])
                     is_start = "O" if pi == 0 else ""
                     is_end = "O" if pi == pts.shape[0] - 1 else ""
                     arc_label = f"Arc_{pi+1}/{pts.shape[0]}"
                     rows.append({
                         "Point_No": point_idx, "Type": f"RF_Arc ({arc_label})",
                         "Segment": f"Seg{seg_counter}",
+                        "Flight_Phase": phase,
                         "Lat": cur_pt[0], "Lon": cur_pt[1], "Altitude_MSL_m": cur_pt[2],
                         "Altitude_AGL_m": float(cur_pt[2] - start_vertiport[2]),
                         "TF_Start": "", "TF_End": "",
@@ -5012,23 +11637,81 @@ def attempt_run_once():
                     point_idx += 1
                     last_point = cur_pt
 
-        if use_takeoff_landing_transition:
-            _append_transition(
-                landing_transition_profile_desc,
-                "Landing_Transition",
-                "Landing_TF_Point",
-                transition_speed_landing_mps,
-                skip_first=False,
-                skip_last=True,
-            )
-        _append_vertiport_row(end_vertiport, "End")
+        if not fixed_transition_general_output_suppressed:
+            _append_vertiport_row(end_vertiport, "End")
 
+        if use_takeoff_landing_transition:
+            row_path = np.asarray([
+                [row["Lat"], row["Lon"], row["Altitude_MSL_m"]]
+                for row in rows
+            ], dtype=float)
+            rf_path = np.asarray(rf_best_output["path"], dtype=float).reshape(-1, 3)
+            row_phases = np.asarray([row["Flight_Phase"] for row in rows], dtype=object)
+            rf_phases = np.asarray(
+                rf_best_output.get("flight_phases", []), dtype=object
+            ).reshape(-1)
+            if row_path.shape != rf_path.shape or row_phases.shape != rf_phases.shape:
+                raise RuntimeError(
+                    "Exported route is not aligned with the profiled RF path: "
+                    f"rows={row_path.shape[0]}, path={rf_path.shape[0]}, "
+                    f"row_phases={row_phases.size}, path_phases={rf_phases.size}."
+                )
+            point_errors_m = np.asarray([
+                _seg_dist_3d_m(row_path[i], rf_path[i])
+                for i in range(rf_path.shape[0])
+            ], dtype=float)
+            if np.any(point_errors_m > 0.05) or not np.array_equal(row_phases, rf_phases):
+                raise RuntimeError("Exported route points/phases differ from rf_best path/phases.")
+
+            _, overall_constraint_ok, overall_constraint_reason = (
+                evaluate_objectives_with_constraints_gp(
+                    rf_best["path"],
+                    return_reason=True,
+                    flight_phases=rf_best.get("flight_phases"),
+                    **eval_cfg,
+                )
+            )
+            airspace_ok, airspace_reason, transition_airspace_audit = (
+                _is_path_inside_airspace_envelope_v1(
+                rf_best["path"],
+                rf_best.get("flight_phases"),
+                airspace_center_lla[:2],
+                airspace_radius_m,
+                alt_min_m=airspace_alt_min_m,
+                alt_max_m=airspace_alt_max_m,
+                transition_corridor_cfg=transition_corridor_cfg,
+                )
+            )
+            rf_best["transition_airspace_validation"] = transition_airspace_audit
+            transition_3d_validation = _build_transition_3d_validation_v1(
+                rf=rf_best,
+                cruise_half_width_m=W_half,
+                transition_corridor_cfg=transition_corridor_cfg,
+                moc_risk=MOCRisk,
+                moc_enforced=check_corridor_moc,
+                lat_lim=lat_lim,
+                lon_lim=lon_lim,
+                forbidden_zones=forbidden_zones,
+                check_corridor_nfz=check_corridor_nfz,
+                check_corridor_self_overlap=check_corridor_self_overlap,
+                airspace_audit=transition_airspace_audit,
+            )
+            rf_best["transition_3d_validation"] = transition_3d_validation
+            params_dict["transition_3d_validation"] = transition_3d_validation
+            min_distance_ok = bool(
+                min_corridor_distance_m <= 0.0
+                or _path_total_3d_distance_m(rf_best["path"]) + 1e-6
+                >= min_corridor_distance_m
+            )
+        _tracked_progress(88, "Writing the authoritative Excel route and figures.", "exporting")
         _export_route_outputs(
             rows=rows,
             rf_best=rf_best,
+            rf_output=rf_best_output,
             Norm_RT=Norm_RT,
             AirRisk=AirRisk,
             altitude_levels=altitude_levels,
+            risk_altitude_levels=risk_altitude_levels,
             use_heading_map=use_heading_map,
             air_thr_global=air_thr_global,
             lat_lim=lat_lim,
@@ -5049,7 +11732,7 @@ def attempt_run_once():
                 flight_dist_limit=flight_dist_limit,
                 forbidden_zones=forbidden_zones,
                 delta_z_max=delta_z_max,
-                altitude_levels=altitude_levels,
+                altitude_levels=risk_altitude_levels,
                 cell_size=cell_size,
                 refine_scales=refine_scales,
                 air_risk_threshold=air_thr_global,
@@ -5069,6 +11752,7 @@ def attempt_run_once():
                 vertiport=None,
                 landing_entry=None,
                 takeoff_complete=None,
+                transition_corridor_cfg=transition_corridor_cfg,
             ),
             start_vertiport=start_vertiport,
             airspace_center_lla=airspace_center_lla,
@@ -5086,6 +11770,178 @@ def attempt_run_once():
             waypoint_alt_fixed_m=waypoint_alt_fixed_m,
         )
 
+        if use_takeoff_landing_transition:
+            try:
+                moc_transition_visualization = _save_moc_transition_snapshots_v1(
+                    rf=rf_best,
+                    out_dir=out_dir,
+                    request=request,
+                    map_extent=map_extent,
+                    moc_risk=MOCRisk,
+                    moc_enforced=check_corridor_moc,
+                    half_width_m=transition_corridor_half_width_m,
+                    cruise_half_width_m=W_half,
+                    transition_corridor_cfg=transition_corridor_cfg,
+                    lat_lim=lat_lim,
+                    lon_lim=lon_lim,
+                    airspace_center_lla=airspace_center_lla,
+                    airspace_radius_m=airspace_radius_m,
+                    forbidden_zones=forbidden_zones,
+                    start_vertiport=start_vertiport,
+                    end_vertiport=end_vertiport,
+                    overall_constraint_ok=overall_constraint_ok,
+                    overall_constraint_reason=overall_constraint_reason,
+                    airspace_ok=airspace_ok,
+                    check_corridor_nfz=check_corridor_nfz,
+                    check_corridor_self_overlap=check_corridor_self_overlap,
+                    min_distance_enforced=min_corridor_distance_m > 0.0,
+                    min_distance_ok=min_distance_ok,
+                    rf_min_allowed_radius_m=look_ahead_min_turn_radius_m,
+                )
+            except Exception as exc:
+                moc_transition_visualization = {
+                    "enabled": True,
+                    "generated": False,
+                    "transition_structure_mode": str(transition_structure_mode),
+                    "audit_only_fixed_transition_geometry": bool(
+                        transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+                    ),
+                    "moc_audit_includes_fixed_transition": bool(
+                        any(
+                            bool(seg.get("is_fixed_transition_stage1", False))
+                            for seg in rf_best.get("segments", [])
+                        )
+                    ),
+                    "output_policy_notice": (
+                        "audit-only fixed transition geometry; omitted from general corridor outputs"
+                        if transition_structure_mode == TRANSITION_STRUCTURE_FIXED_ONLY
+                        else None
+                    ),
+                    "reason": "generation_error",
+                    "folder": None,
+                    "partial_folder": (
+                        "_moc_transition_snapshots_incomplete"
+                        if (
+                            out_dir / "_moc_transition_snapshots_incomplete"
+                        ).exists() else None
+                    ),
+                    "files": [],
+                    "moc_enforced": bool(check_corridor_moc),
+                    "status": "FAIL",
+                    "sample_count": 0,
+                    "tested_count": 0,
+                    "hit_count": 0,
+                    "out_of_grid_count": 0,
+                    "corridor_half_width_m": float(transition_corridor_half_width_m),
+                    "transition_corridor_half_width_m": float(
+                        transition_corridor_half_width_m
+                    ),
+                    "configured_downward_clearance_m": float(
+                        transition_corridor_half_width_m
+                    ),
+                    "transition_vertical_clearance_m": float(
+                        transition_corridor_half_width_m
+                    ),
+                    "cruise_corridor_half_width_m": float(W_half),
+                    "transition_3d_status": str(
+                        transition_3d_validation.get("status", "FAIL")
+                    ),
+                    "transition_3d_corridor_policy": transition_3d_corridor_policy,
+                    "transition_3d_validation": transition_3d_validation,
+                    "directions": {},
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                print(
+                    "Warning: MOC transition snapshots were not completed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _warning(
+                    "moc_transition_snapshot_generation_failed",
+                    "MOC transition audit snapshots were not completed; core route "
+                    "optimization and constraint results remain available.",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            params_dict["moc_transition_visualization"] = (
+                moc_transition_visualization
+            )
+
+    cruise_risk_idx = int(np.argmin(
+        np.abs(np.asarray(risk_altitude_levels, dtype=float) - float(altitude_levels[0]))
+    ))
+    noise_cruise_db = np.asarray(
+        noise_3d_db_after_floor[:, :, cruise_risk_idx:cruise_risk_idx + 1], dtype=float
+    ).copy()
+    noise_cruise_vmax = float(np.max(noise_cruise_db)) if noise_cruise_db.size else 0.0
+    noise_cruise_norm = (
+        noise_cruise_db / noise_cruise_vmax
+        if noise_cruise_vmax > 1e-12 else np.zeros_like(noise_cruise_db)
+    )
+    moc_cruise = np.asarray(
+        MOCRisk[:, :, cruise_moc_idx:cruise_moc_idx + 1]
+    ).copy()
+    noise_meta_cruise = dict(noise_meta)
+    selected_noise_indices = list(noise_meta.get("selected_layer_idx", []))
+    noise_meta_cruise["selected_layer_idx"] = (
+        [int(selected_noise_indices[cruise_risk_idx])]
+        if cruise_risk_idx < len(selected_noise_indices) else []
+    )
+    noise_meta_cruise["noise_max_db_after_floor"] = noise_cruise_vmax
+    moc_meta_cruise = dict(moc_meta)
+    moc_meta_cruise["requested_agl_m"] = [
+        float(altitude_levels[0] - MOC_REFERENCE_MSL_M)
+    ]
+    moc_meta_cruise["selected_agl_m"] = [int(MOC_AGL_LEVELS_M[cruise_moc_idx])]
+    moc_meta_cruise["selected_ones_ratio_on_evaluation_grid"] = float(np.mean(moc_cruise))
+
+    balanced_path = np.empty((0, 3), dtype=float)
+    balanced_flight_phases = np.empty((0,), dtype=object)
+    route_data_path = np.empty((0, 3), dtype=float)
+    route_data_flight_phases = np.empty((0,), dtype=object)
+    balanced_transition_meta = {}
+    takeoff_stage1_end_result = None
+    landing_stage1_start_result = None
+    takeoff_transition_end_result = None
+    landing_transition_start_result = None
+    if rf_best is not None:
+        balanced_path = np.asarray(
+            rf_best_output.get("path", np.empty((0, 3))), dtype=float
+        ).reshape(-1, 3).copy()
+        balanced_flight_phases = np.asarray(
+            rf_best_output.get("flight_phases", np.empty((0,), dtype=object)), dtype=object
+        ).reshape(-1).copy()
+        route_data_path = np.asarray([
+            [row["Lat"], row["Lon"], row["Altitude_MSL_m"]]
+            for row in rows
+        ], dtype=float).reshape(-1, 3)
+        route_data_flight_phases = np.asarray([
+            row["Flight_Phase"] for row in rows
+        ], dtype=object).reshape(-1)
+        balanced_transition_meta = dict(rf_best.get("transition_meta", {}))
+        if (
+            np.any(balanced_flight_phases == FLIGHT_PHASE_TAKEOFF_STAGE1)
+            and rf_best.get("takeoff_stage1_end") is not None
+        ):
+            takeoff_stage1_end_result = np.asarray(
+                rf_best["takeoff_stage1_end"], dtype=float
+            ).copy()
+        if (
+            np.any(balanced_flight_phases == FLIGHT_PHASE_LANDING_STAGE1)
+            and rf_best.get("landing_stage1_start") is not None
+        ):
+            landing_stage1_start_result = np.asarray(
+                rf_best["landing_stage1_start"], dtype=float
+            ).copy()
+        if rf_best.get("takeoff_transition_end") is not None:
+            takeoff_transition_end_result = np.asarray(
+                rf_best["takeoff_transition_end"], dtype=float
+            ).copy()
+        if rf_best.get("landing_transition_start") is not None:
+            landing_transition_start_result = np.asarray(
+                rf_best["landing_transition_start"], dtype=float
+            ).copy()
+
     result = {
         "objective_names": objective_names,
         "backbone": backbone,
@@ -5096,8 +11952,14 @@ def attempt_run_once():
         "start_vertiport": start_vertiport,
         "end_vertiport": end_vertiport,
         "vertiport": start_vertiport,
-        "takeoff_complete": takeoff_complete,
-        "landing_entry": landing_entry,
+        "takeoff_complete": (
+            takeoff_transition_end_result
+            if takeoff_transition_end_result is not None else takeoff_complete
+        ),
+        "landing_entry": (
+            landing_transition_start_result
+            if landing_transition_start_result is not None else landing_entry
+        ),
         "forbidden_zones": forbidden_zones,
         "emergency_points": emergency_points,
         "airspace_center_lla": airspace_center_lla,
@@ -5107,28 +11969,230 @@ def attempt_run_once():
         "lat_lim": lat_lim,
         "lon_lim": lon_lim,
         "W_half": W_half,
+        "transition_corridor_half_width_m": float(transition_corridor_half_width_m),
+        "transition_vertical_clearance_m": float(transition_corridor_half_width_m),
+        "transition_3d_corridor_policy": transition_3d_corridor_policy,
+        "transition_3d_validation": transition_3d_validation,
         "ground_speed_mps": ground_speed_mps,
         "bank_angle_deg": bank_angle_deg,
         "bird_airrisk_path": str(bird_airrisk_path),
-        "moc_meta": moc_meta,
+        "moc_meta": moc_meta_cruise,
+        "moc_meta_all_agl": moc_meta,
         "check_corridor_moc": bool(check_corridor_moc),
+        "moc_transition_visualization": moc_transition_visualization,
         "check_corridor_self_overlap": bool(check_corridor_self_overlap),
         "noise_npy_path": str(noise_npy_path),
         "noise_floor_db": noise_floor_db,
         "w_noise": w_noise,
-        "noise_meta": noise_meta,
-        "noise_map_3d_normalized": noise_3d_norm,
-        "noise_map_3d_db_after_floor": noise_3d_db_after_floor,
-        "MOCRisk": MOCRisk,
+        "noise_meta": noise_meta_cruise,
+        "noise_meta_all_msl": noise_meta,
+        # Preserve the legacy one-layer result shapes at cruise altitude.
+        "noise_map_3d_normalized": noise_cruise_norm,
+        "noise_map_3d_db_after_floor": noise_cruise_db,
+        "MOCRisk": moc_cruise,
+        # v1 altitude-aware stacks and their explicit vertical coordinates.
+        "noise_map_3d_normalized_all_msl": np.asarray(noise_3d_norm, dtype=float).copy(),
+        "noise_map_3d_db_after_floor_all_msl": np.asarray(
+            noise_3d_db_after_floor, dtype=float
+        ).copy(),
+        "risk_altitude_levels_msl_m": np.asarray(risk_altitude_levels, dtype=float).copy(),
+        "MOCRisk_all_agl": np.asarray(MOCRisk).copy(),
+        "moc_agl_levels_m": np.asarray(MOC_AGL_LEVELS_M, dtype=float).copy(),
+        "moc_altitude_levels_msl_m": np.asarray(moc_altitude_levels_msl, dtype=float).copy(),
+        "balanced_path": balanced_path,
+        "balanced_flight_phases": balanced_flight_phases,
+        "route_data_path": route_data_path,
+        "route_data_flight_phases": route_data_flight_phases,
+        "balanced_path_flight_phase_counts": {
+            phase: int(np.count_nonzero(balanced_flight_phases == phase))
+            for phase in (
+                FLIGHT_PHASE_VERTIPORT,
+                FLIGHT_PHASE_TAKEOFF_STAGE1,
+                FLIGHT_PHASE_TAKEOFF_STAGE2,
+                FLIGHT_PHASE_CRUISE,
+                FLIGHT_PHASE_LANDING_STAGE2,
+                FLIGHT_PHASE_LANDING_STAGE1,
+            )
+        },
+        "route_data_flight_phase_counts": {
+            phase: int(np.count_nonzero(route_data_flight_phases == phase))
+            for phase in (
+                FLIGHT_PHASE_VERTIPORT,
+                FLIGHT_PHASE_TAKEOFF_STAGE1,
+                FLIGHT_PHASE_TAKEOFF_STAGE2,
+                FLIGHT_PHASE_CRUISE,
+                FLIGHT_PHASE_LANDING_STAGE2,
+                FLIGHT_PHASE_LANDING_STAGE1,
+            )
+        },
+        "balanced_transition_meta": balanced_transition_meta,
+        "sector_mode_enabled": bool(sector_mode_enabled),
+        "sector_auto_selection_active": bool(sector_auto_selection_active),
+        "sector_season": str(sector_season),
+        "takeoff_sector_user": int(takeoff_sector_user),
+        "landing_sector_user": int(landing_sector_user),
+        "takeoff_sector_selected": int(takeoff_sector_selected),
+        "landing_sector_selected": int(landing_sector_selected),
+        "takeoff_sector": int(takeoff_sector_selected),
+        "landing_sector": int(landing_sector_selected),
+        "sector_selection_analysis": sector_selection_analysis,
+        "use_takeoff_landing_transition": bool(use_takeoff_landing_transition),
+        "transition_structure_mode": str(transition_structure_mode),
+        "transition_structure_mode_effective": (
+            str(transition_structure_mode)
+            if use_takeoff_landing_transition else "off"
+        ),
+        "use_two_stage_transition": bool(use_two_stage_transition),
+        "use_two_stage_transition_deprecated_alias_is_lossy": True,
+        "effective_two_stage_transition": bool(
+            use_takeoff_landing_transition and use_two_stage_transition
+        ),
+        "fixed_transition_general_output_suppressed": bool(
+            fixed_transition_general_output_suppressed
+        ),
+        "fixed_transition_evaluated_but_not_exported": bool(
+            fixed_transition_general_output_suppressed
+        ),
+        "moc_audit_includes_fixed_transition": bool(
+            takeoff_transition_meta.get("fixed_straight_actual", False)
+            or landing_transition_meta.get("fixed_straight_actual", False)
+        ),
+        "transition_mode": str(transition_mode),
+        "transition_mode_effective": (
+            str(takeoff_transition_meta.get("transition_mode", "off"))
+            if use_takeoff_landing_transition else "off"
+        ),
+        "takeoff_total_transition_horizontal_distance_m": (
+            None
+            if takeoff_total_transition_horizontal_distance_m is None
+            else (
+                float(takeoff_total_transition_horizontal_distance_m)
+                if total_distance_input_active
+                else takeoff_total_transition_horizontal_distance_m
+            )
+        ),
+        "landing_total_transition_horizontal_distance_m": (
+            None
+            if landing_total_transition_horizontal_distance_m is None
+            else (
+                float(landing_total_transition_horizontal_distance_m)
+                if total_distance_input_active
+                else landing_total_transition_horizontal_distance_m
+            )
+        ),
+        "takeoff_total_transition_horizontal_distance_actual_m": float(
+            takeoff_transition_meta.get("total_horizontal_distance_m", 0.0)
+        ),
+        "landing_total_transition_horizontal_distance_actual_m": float(
+            landing_transition_meta.get("total_horizontal_distance_m", 0.0)
+        ),
+        "takeoff_actual_climb_angle_deg": float(
+            takeoff_transition_meta.get("angle_deg", 0.0)
+        ),
+        "landing_actual_descent_angle_deg": float(
+            landing_transition_meta.get("angle_deg", 0.0)
+        ),
+        "takeoff_fixed_prefix_requested_distance_m": float(
+            takeoff_transition_meta.get("stage1_requested_straight_distance_m", 0.0)
+        ),
+        "landing_fixed_prefix_requested_distance_m": float(
+            landing_transition_meta.get("stage1_requested_straight_distance_m", 0.0)
+        ),
+        "takeoff_fixed_prefix_effective_distance_m": float(
+            takeoff_transition_meta.get("stage1_straight_distance_m", 0.0)
+        ),
+        "landing_fixed_prefix_effective_distance_m": float(
+            landing_transition_meta.get("stage1_straight_distance_m", 0.0)
+        ),
+        "takeoff_fixed_straight_actual": bool(
+            takeoff_transition_meta.get("fixed_straight_actual", False)
+        ),
+        "landing_fixed_straight_actual": bool(
+            landing_transition_meta.get("fixed_straight_actual", False)
+        ),
+        "takeoff_optimized_transition_actual": bool(
+            takeoff_transition_meta.get("optimized_transition_actual", False)
+        ),
+        "landing_optimized_transition_actual": bool(
+            landing_transition_meta.get("optimized_transition_actual", False)
+        ),
+        "takeoff_stage2_collapsed_at_cruise": bool(
+            takeoff_transition_meta.get("stage2_collapsed_at_cruise", False)
+        ),
+        "landing_stage2_collapsed_at_cruise": bool(
+            landing_transition_meta.get("stage2_collapsed_at_cruise", False)
+        ),
+        "takeoff_fixed_prefix_clamped_to_cruise": bool(
+            takeoff_transition_meta.get("stage1_clamped_to_cruise", False)
+        ),
+        "landing_fixed_prefix_clamped_to_cruise": bool(
+            landing_transition_meta.get("stage1_clamped_to_cruise", False)
+        ),
+        "evaluation_full_path_distance_2d_m": float(
+            params_dict.get("evaluation_full_path_distance_2d_m", 0.0)
+        ),
+        "evaluation_full_path_distance_3d_m": float(
+            params_dict.get("evaluation_full_path_distance_3d_m", 0.0)
+        ),
+        "evaluation_full_path_point_count": int(
+            params_dict.get("evaluation_full_path_point_count", 0)
+        ),
+        "public_corridor_distance_2d_m": float(
+            params_dict.get("public_corridor_distance_2d_m", 0.0)
+        ),
+        "public_corridor_distance_3d_m": float(
+            params_dict.get("public_corridor_distance_3d_m", 0.0)
+        ),
+        "public_corridor_point_count": int(
+            params_dict.get("public_corridor_point_count", 0)
+        ),
+        "takeoff_stage1_straight_distance_m": (
+            float(takeoff_stage1_straight_distance_m)
+            if fixed_prefix_input_active else takeoff_stage1_straight_distance_m
+        ),
+        "landing_stage1_straight_distance_m": (
+            float(landing_stage1_straight_distance_m)
+            if fixed_prefix_input_active else landing_stage1_straight_distance_m
+        ),
+        "takeoff_climb_angle_deg": (
+            float(takeoff_climb_angle_deg)
+            if angle_input_active else takeoff_climb_angle_deg
+        ),
+        "landing_descent_angle_deg": (
+            float(landing_descent_angle_deg)
+            if angle_input_active else landing_descent_angle_deg
+        ),
+        "transition_feasible": bool(
+            rf_best.get("transition_feasible", True) if rf_best is not None else True
+        ),
+        "transition_fail_reason": str(
+            rf_best.get("transition_fail_reason", "ok") if rf_best is not None else "ok"
+        ),
+        "transition_fail_reasons": (
+            [str(v) for v in rf_best.get("transition_fail_reasons", [])]
+            if rf_best is not None else []
+        ),
+        "takeoff_stage1_end": takeoff_stage1_end_result,
+        "takeoff_transition_end": takeoff_transition_end_result,
+        "landing_transition_start": landing_transition_start_result,
+        "landing_transition_end": landing_transition_start_result,
+        "landing_stage1_start": landing_stage1_start_result,
         "rf_use_boundary_heading": bool(rf_use_boundary_heading),
         "rf_debug_level": str(rf_debug_level),
     }
+
+    params_dict["moc_transition_visualization"] = moc_transition_visualization
+    with open(out_dir / "params.json", "w", encoding="utf-8") as _pf:
+        json.dump(params_dict, _pf, indent=2, ensure_ascii=False)
 
     out = out_dir / "results.pkl"
     with open(out, "wb") as f:
         pickle.dump(result, f)
     print(f"Saved {out}")
 
+    _tracked_progress(100, "Optimization and export completed.", "completed", run_dir=str(out_dir))
+    if return_run_dir:
+        return True, feasible_count, out_dir
     return True, feasible_count
 
 

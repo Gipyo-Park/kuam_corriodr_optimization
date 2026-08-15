@@ -37,7 +37,6 @@ python MAIN_uam_corridor_optimizer.py
 | `evaluate_objectives_GP.py` | 예전/기본 목적함수 평가 코드로 보임. 현재 메인은 `evaluate_objectives_with_constraints_GP.py`를 직접 사용 | 단독 실행 산출물 없음 | 보류 또는 archive 후보 |
 | `evaluate_objectives_uniform.py` | uniform 평가 방식 실험 코드로 보임. 현재 메인 직접 import 없음 | 단독 실행 산출물 없음 | archive 후보 |
 | `rf_turn.py` | waypoint 경로에 RF turn을 붙여 TF/RF segment로 변환. 회전반경, tangent clamp, look-ahead scaling 계산 | 단독 실행 산출물 없음. 메인/엔진에서 import | 보존 |
-| `takeoff_landing_sector.py` | 계절별 이륙/착륙 허용 섹터 mask와 섹터 검증 함수 | 단독 실행 산출물 없음. 메인/엔진에서 import | 보존 |
 | `debug_rf.py` | RF turn 디버깅용 스크립트로 보임 | 실행 시 디버그 출력/그림이 생길 수 있음. 메인 직접 의존 없음 | 보류 또는 archive 후보 |
 
 ## 데이터 폴더
@@ -162,4 +161,3 @@ python -m api_service.api_server
 | archive 유지 권장 | `archive/main_JS_1218_v*.py` | 현재 실행에는 필요 없지만 과거 비교/복구용 |
 | 신중히 보존 | `260608_MOC`, `ground_risk_data`, `noise_data/noise_lden_grid.npy`, `air_risk_data/bird_riskmap_springfall_3d.npy` | 현재 메인/API 핵심 입력 데이터 |
 | 코드 핵심 보존 | `MAIN_uam_corridor_optimizer.py`, NSGA/RF/helper 모듈, `api_service/path_engine.py` | 현재 실행 경로에 직접 필요 |
-

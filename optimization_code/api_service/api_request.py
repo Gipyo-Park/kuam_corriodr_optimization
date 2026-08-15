@@ -14,16 +14,11 @@ LOG_DIR = str(API_SERVICE_DIR / "logs")
 
 payload_optimal_corridor = {
     "start_vertiport": {
-        "lla": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
+        "lla": {"lat": 35.603386, "lon": 129.078025, "alt_m": 150.0},
     },
     "end_vertiport": {
-        "lla": {"lat": 35.6033361, "lon": 129.0776917, "alt_m": 150.0},
+        "lla": {"lat": 35.603386, "lon": 129.078025, "alt_m": 150.0},
     },
-    # Optional; None keeps the automatic transition endpoint.
-    # "takeoff_end": {"lla": {"lat": 35.59468397, "lon": 129.07515721}},
-    # "landing_end": {"lla": {"lat": 35.59701567, "lon": 129.08585995}},
-    "takeoff_end": None,
-    "landing_end": None,
     "airspace_info": {
         "center": {"lat": 35.6033361, "lon": 129.0776917},
         "radius_km": 5.0,
@@ -33,21 +28,10 @@ payload_optimal_corridor = {
         # {"bbox": [129.0700, 129.0820, 35.5980, 35.6100]},  
     ],
     # optional middle waypoints (missing/null/empty uses no middle waypoints)
-    "corridor_points": [
-        {"lat": 35.6165628, "lon": 129.1174075, "alt_m": 600.0},
-        {"lat": 35.6125953, "lon": 129.1271681, "alt_m": 600.0},
-        {"lat": 35.5709934, "lon": 129.1042811, "alt_m": 600.0},
-        {"lat": 35.5693508, "lon": 129.0849280, "alt_m": 600.0},
-        {"lat": 35.5980918, "lon": 129.1098345, "alt_m": 600.0},
-        {"lat": 35.6009654, "lon": 129.0968764, "alt_m": 600.0},
-        {"lat": 35.5777004, "lon": 129.0787014, "alt_m": 600.0},
-        {"lat": 35.5901549, "lon": 129.0696139, "alt_m": 600.0},
-        {"lat": 35.6156051, "lon": 129.0442026, "alt_m": 600.0},
-        {"lat": 35.6329778, "lon": 129.0531218, "alt_m": 600.0},
-        {"lat": 35.6213509, "lon": 129.0687725, "alt_m": 600.0},
-    ],
+    "corridor_points": [],
     "cruise_altitude_m": 600.0,
-    "min_corridor_distance_km": 30.0,
+    "takeoff_climb_angle_deg": 6.0,
+    "landing_descent_angle_deg": 6.0,
 }
 
 # tmp_trajectory.txt 전체 waypoint를 예시로 사용
@@ -78,6 +62,10 @@ def post_and_log(endpoint, payload):
         wps = body.get("waypoints", [])
         if wps:
             print(f"waypoints: {len(wps)}개, start={wps[0]}, end={wps[-1]}")
+            print(
+                f"transition_structure_mode={body.get('transition_structure_mode')} | "
+                f"path_scope={body.get('path_scope')}"
+            )
         else:
             print("waypoints: 0개")
         return body
@@ -161,6 +149,12 @@ def post_optimized_path_stream(payload):
                     print(f"[server/progress] {percent}% {stage}{count_text}: {ev.get('message', '')}")
                 elif event_type == "diagnostic":
                     _print_diagnostic_event(ev)
+                elif event_type == "warning":
+                    print(
+                        f"[server/warning] code={ev.get('code')} "
+                        f"stage={ev.get('stage')} progress={ev.get('percent')}%: "
+                        f"{ev.get('message', '')}"
+                    )
                 elif event_type == "error":
                     print(
                         f"[server/error] status={ev.get('status_code')} "
@@ -168,6 +162,11 @@ def post_optimized_path_stream(payload):
                         f"progress={ev.get('percent')}% id={ev.get('error_id')}: "
                         f"{ev.get('message', '')}"
                     )
+                    for detail in ev.get("details", []) or []:
+                        print(
+                            f"  - {detail.get('field')}: {detail.get('message')} "
+                            f"[{detail.get('type')}]"
+                        )
                 elif event_type == "status":
                     stage = ev.get("stage")
                     percent = ev.get("percent")
@@ -183,6 +182,11 @@ def post_optimized_path_stream(payload):
                         wps = response.get("waypoints", [])
                         if wps:
                             print(f"[server/result] success, waypoints={len(wps)}, start={wps[0]}, end={wps[-1]}")
+                            print(
+                                "[server/result] "
+                                f"transition_structure_mode={response.get('transition_structure_mode')} | "
+                                f"path_scope={response.get('path_scope')}"
+                            )
                         else:
                             print("[server/result] success, waypoints=0")
                     else:
