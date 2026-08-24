@@ -36,9 +36,6 @@ from crossover_GP import crossover_gp
 from mutation_GP import mutation_gp
 from fast_non_dominated_sort import fast_non_dominated_sort
 from generate_initial_population_GP import generate_initial_population_gp
-from generate_reference_points import generate_reference_points
-from normalize_objectives import normalize_objectives
-from niching_selection import niching_selection
 from evaluate_objectives_with_constraints_GP import (
     evaluate_objectives_with_constraints_gp as _evaluate_constraints_shared,
     _corridor_violates_nfz_with_width as _corridor_violates_nfz_with_width_shared,
@@ -2076,7 +2073,61 @@ def collect_waypoints_from_clicks(
     return np.array(clicked_latlon, dtype=float)
 
 
-def selection_nsga3(population, f_vals, feasible, N, ref_points):
+def _validate_objective_weights_v1(objective_weights, objective_count=None):
+    """Validate non-negative preference weights and return normalized weights."""
+    weights = np.asarray(objective_weights, dtype=float).reshape(-1)
+    if objective_count is not None and weights.size != int(objective_count):
+        raise ValueError(
+            "objective_weight_length_mismatch: "
+            f"objectives={int(objective_count)}, weights={weights.size}"
+        )
+    if weights.size == 0:
+        raise ValueError("invalid_objective_weights: at least one active weight is required")
+    if not np.all(np.isfinite(weights)):
+        raise ValueError("invalid_objective_weights: every active weight must be finite")
+    if np.any(weights < 0.0):
+        raise ValueError("invalid_objective_weights: every active weight must be >= 0")
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0.0:
+        raise ValueError("invalid_objective_weights: active weights must not all be zero")
+    return weights, weights / weight_sum
+
+
+def _weighted_normalized_objective_analysis_v1(f_vals, objective_weights):
+    """Return per-objective min-max values, contributions, and weighted score J."""
+    values = np.asarray(f_vals, dtype=float)
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
+        raise ValueError("invalid_objective_values: expected a non-empty N x M array")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("invalid_objective_values: all values must be finite")
+    configured_weights, normalized_weights = _validate_objective_weights_v1(
+        objective_weights, values.shape[1]
+    )
+    minimum = np.min(values, axis=0)
+    maximum = np.max(values, axis=0)
+    value_range = maximum - minimum
+    normalized = np.zeros_like(values, dtype=float)
+    varying = value_range >= 1e-10
+    if np.any(varying):
+        normalized[:, varying] = (
+            values[:, varying] - minimum[varying]
+        ) / value_range[varying]
+    contributions = normalized * normalized_weights[np.newaxis, :]
+    scores = np.sum(contributions, axis=1)
+    return {
+        "configured_weights": configured_weights,
+        "normalized_weights": normalized_weights,
+        "minimum": minimum,
+        "maximum": maximum,
+        "range": value_range,
+        "normalized_values": normalized,
+        "weighted_contributions": contributions,
+        "scores": scores,
+    }
+
+
+def selection_nsga3(population, f_vals, feasible, N, objective_weights):
+    """Pareto-front selection with weighted preference on the truncated front."""
     fronts = fast_non_dominated_sort(f_vals)
     next_idx = []
     for front in fronts:
@@ -2089,9 +2140,13 @@ def selection_nsga3(population, f_vals, feasible, N, ref_points):
             rem = N - len(next_idx)
             lf = np.array(valid, dtype=int)
             if lf.size > 0 and rem > 0:
-                nf = normalize_objectives(f_vals[lf])
-                sel = niching_selection(nf, ref_points, rem)
-                next_idx.extend(lf[sel].tolist())
+                preference = _weighted_normalized_objective_analysis_v1(
+                    np.asarray(f_vals, dtype=float)[lf], objective_weights
+                )
+                # Stable index tie-break keeps repeated runs deterministic when
+                # two candidates have the same normalized weighted score.
+                order = np.lexsort((lf, preference["scores"]))
+                next_idx.extend(lf[order[:rem]].tolist())
             break
     return [population[i] for i in next_idx[:N]]
 
@@ -2166,14 +2221,18 @@ def _evaluate_objectives_altitude_aware_v1(
     noise_floor_db=0.0,
     w_noise=1.0,
 ):
-    """v1 objective evaluation with metre distance and per-sample MSL layers."""
+    """Return raw objectives; user weights are applied once during preference selection."""
     p = np.asarray(path, dtype=float).reshape(-1, 3)
     levels = np.asarray(altitude_levels, dtype=float).ravel()
+    active_weights = [w_dist, w_ground, w_air]
+    if NoiseRisk is not None and np.size(NoiseRisk) > 0:
+        active_weights.append(w_noise)
+    _validate_objective_weights_v1(active_weights, len(active_weights))
     if p.shape[0] < 2 or levels.size == 0:
         n_obj = 4 if NoiseRisk is not None and np.size(NoiseRisk) > 0 else 3
         return np.full(n_obj, 1e6, dtype=float)
 
-    total_dist = float(_path_total_3d_distance_m(p) * float(w_dist))
+    total_dist = float(_path_total_3d_distance_m(p))
     total_ground = 0.0
     total_air = 0.0
     total_noise = 0.0
@@ -2253,7 +2312,7 @@ def _evaluate_objectives_altitude_aware_v1(
         total_air,
     ]
     if noise is not None:
-        values.append(total_noise * float(w_noise))
+        values.append(total_noise)
     return np.asarray(values, dtype=float)
 
 
@@ -3183,11 +3242,12 @@ def _is_path_inside_airspace_envelope_v1(
     flight_phases,
     center_latlon,
     radius_m,
+    cruise_half_width_m,
     alt_min_m=None,
     alt_max_m=None,
     transition_corridor_cfg=None,
 ):
-    """Check legacy cruise centerlines and the complete transition lower envelope."""
+    """Check the phase-specific horizontal corridor and transition lower envelope."""
     points = np.asarray(path, dtype=float).reshape(-1, 3)
     audit = {
         "status": "FAIL",
@@ -3224,14 +3284,16 @@ def _is_path_inside_airspace_envelope_v1(
             (transition_corridor_cfg or {}).get("enabled", False)
             and direction is not None
         )
-        if is_transition:
-            horizontal_points = _edge_lateral_boundary_points_v1(
-                p1,
-                p2,
-                float(transition_corridor_cfg["half_width_m"]),
-            )
-        else:
-            horizontal_points = np.vstack([p1[:2], p2[:2]])
+        edge_half_width_m = _edge_corridor_half_width_v1(
+            phase,
+            cruise_half_width_m,
+            transition_corridor_cfg,
+        )
+        horizontal_points = _edge_lateral_boundary_points_v1(
+            p1,
+            p2,
+            edge_half_width_m,
+        )
         max_distance_m = float(np.max(_dist_to_center_m(horizontal_points, center_latlon)))
         horizontal_margin_m = float(radius_m) - max_distance_m
         horizontal_margins.append(horizontal_margin_m)
@@ -3256,11 +3318,12 @@ def _is_path_inside_airspace_envelope_v1(
 
         edge_ok = True
         edge_reason = "ok"
-        if horizontal_margin_m < -1e-6:
+        if horizontal_margin_m <= 1e-6:
             edge_ok = False
             edge_reason = (
                 f"{direction}_transition_airspace_horizontal_envelope_outside"
-                if direction is not None else "airspace_horizontal_centerline_outside"
+                if direction is not None
+                else "cruise_airspace_horizontal_envelope_contact_or_outside"
             )
         elif lower_margin_m < -1e-6:
             edge_ok = False
@@ -4366,7 +4429,6 @@ def _automatic_sector_selection_v1(
     transition_corridor_cfg,
     output_png_path,
     request=None,
-    warning_callback=None,
 ):
     """Evaluate 24 directional sectors, rank 132 pairs, and save one diagnostic PNG."""
     if not np.isclose(float(wind_tail_weight) + float(wind_cross_weight), 1.0):
@@ -4596,12 +4658,6 @@ def _automatic_sector_selection_v1(
     )
     analysis["diagnostic_figure_used_osm"] = bool(plot_status["used_osm"])
     analysis["diagnostic_figure_fallback_reason"] = plot_status["fallback_reason"]
-    if not bool(plot_status["used_osm"]) and warning_callback is not None:
-        warning_callback(
-            "osm_background_fallback",
-            "OSM background was unavailable; the sector diagnostic used a neutral background.",
-            fallback_reason=plot_status["fallback_reason"],
-        )
     analysis["direction_metrics"] = [
         {key: value for key, value in row.items() if not str(key).startswith("_")}
         for row in direction_metrics
@@ -5009,6 +5065,7 @@ def run_nsga3(
     alt, cs, scales, air_thr, dz,
     w_d, w_g, w_a, lat_lim, lon_lim,
     NoiseRisk, noise_floor_db, w_n,
+    objective_weights,
     ground_speed_mps, bank_angle_deg, num_arc_points,
     look_ahead, look_ahead_threshold_m, look_ahead_min_scale, look_ahead_window,
     use_boundary_heading,
@@ -5019,7 +5076,6 @@ def run_nsga3(
     airspace_alt_min_m, airspace_alt_max_m,
     min_corridor_distance_m,
     transition_corridor_cfg,
-    generation_progress_callback=None,
 ):
     """NSGA-III with RF-turn preprocessing."""
 
@@ -5036,8 +5092,7 @@ def run_nsga3(
         transition_corridor_cfg=transition_corridor_cfg,
     )
     num_obj = len(temp_f)
-    H = num_obj + 1
-    ref_points = generate_reference_points(num_obj, H)
+    _validate_objective_weights_v1(objective_weights, num_obj)
 
     def _evaluate_one(chromo):
         chromo = _enforce_mandatory_wp_order(chromo, mandatory_backbone)
@@ -5060,6 +5115,7 @@ def run_nsga3(
             rf.get("flight_phases"),
             airspace_center_latlon,
             airspace_radius_m,
+            cruise_half_width_m=W_half,
             alt_min_m=airspace_alt_min_m,
             alt_max_m=airspace_alt_max_m,
             transition_corridor_cfg=transition_corridor_cfg,
@@ -5118,7 +5174,9 @@ def run_nsga3(
         else:
             print(f"[Gen {gen}] parent_selection_feasible(constraint only): {sel_feas}/{Np}")
 
-        new_pop = selection_nsga3(pop, f_vals, selection_mask, N_pop, ref_points)
+        new_pop = selection_nsga3(
+            pop, f_vals, selection_mask, N_pop, objective_weights
+        )
         carry_over_used = False
 
         if new_pop:
@@ -5127,17 +5185,6 @@ def run_nsga3(
             new_pop = list(last_success_pop)
             carry_over_used = True
             print(f"[Gen {gen}] no parent-selectable solution in current generation; carrying over {len(new_pop)} previous feasible parent(s).")
-
-        if generation_progress_callback is not None:
-            generation_progress_callback(
-                generation=int(gen),
-                total_generations=int(Nmax),
-                constraint_feasible=int(num_feas),
-                rf_feasible=int(rf_feas),
-                parent_selection_feasible=int(sel_feas),
-                population_size=int(Np),
-                carry_over_used=bool(carry_over_used),
-            )
 
         if not new_pop:
             return [], np.empty((0, num_obj)), gen_history
@@ -5197,22 +5244,119 @@ def run_nsga3(
     return pop, f_final, gen_history
 
 
-def pick_representatives(population, f_vals):
+def _representative_indices_v1(f_vals, objective_weights, feasible=None):
+    values = np.asarray(f_vals, dtype=float)
+    if values.ndim != 2 or values.shape[0] == 0:
+        return []
+    if feasible is None:
+        valid_indices = np.arange(values.shape[0], dtype=int)
+    else:
+        feasible_mask = np.asarray(feasible, dtype=bool).reshape(-1)
+        if feasible_mask.size != values.shape[0]:
+            raise ValueError(
+                "objective_feasibility_length_mismatch: "
+                f"objectives={values.shape[0]}, feasible={feasible_mask.size}"
+            )
+        valid_indices = np.flatnonzero(feasible_mask)
+    if valid_indices.size == 0:
+        return []
+
+    valid_values = values[valid_indices]
+    representative_indices = [
+        int(valid_indices[int(np.argmin(valid_values[:, objective_idx]))])
+        for objective_idx in range(values.shape[1])
+    ]
+    local_fronts = fast_non_dominated_sort(valid_values)
+    if local_fronts and local_fronts[0]:
+        front_local = np.asarray(local_fronts[0], dtype=int)
+        front_global = valid_indices[front_local]
+        preference = _weighted_normalized_objective_analysis_v1(
+            values[front_global], objective_weights
+        )
+        balanced_local = int(np.argmin(preference["scores"]))
+        representative_indices.append(int(front_global[balanced_local]))
+    else:
+        representative_indices.append(representative_indices[0])
+    return representative_indices
+
+
+def _balanced_objective_audit_v1(
+    f_vals,
+    objective_weights,
+    objective_names,
+    feasible,
+    balanced_index,
+):
+    """Build JSON-safe audit data for the final weighted Balanced selection."""
+    values = np.asarray(f_vals, dtype=float)
+    feasible_mask = np.asarray(feasible, dtype=bool).reshape(-1)
+    valid_indices = np.flatnonzero(feasible_mask)
+    if valid_indices.size == 0 or balanced_index is None:
+        return {
+            "status": "NOT AVAILABLE",
+            "formula": "sum(normalized_weight_i * minmax_normalized_objective_i)",
+        }
+    valid_values = values[valid_indices]
+    local_fronts = fast_non_dominated_sort(valid_values)
+    front_local = np.asarray(local_fronts[0], dtype=int)
+    front_global = valid_indices[front_local]
+    preference = _weighted_normalized_objective_analysis_v1(
+        values[front_global], objective_weights
+    )
+    selected_matches = np.flatnonzero(front_global == int(balanced_index))
+    if selected_matches.size != 1:
+        raise ValueError("balanced_index_not_in_first_pareto_front")
+    selected_local = int(selected_matches[0])
+    names = [str(value) for value in objective_names]
+    return {
+        "status": "APPLIED",
+        "formula": "sum(normalized_weight_i * minmax_normalized_objective_i)",
+        "normalization_scope": "final_feasible_first_pareto_front",
+        "objective_values_are_raw": True,
+        "objective_names": names,
+        "configured_weights": {
+            name: float(preference["configured_weights"][idx])
+            for idx, name in enumerate(names)
+        },
+        "normalized_weights": {
+            name: float(preference["normalized_weights"][idx])
+            for idx, name in enumerate(names)
+        },
+        "normalization_minimum": {
+            name: float(preference["minimum"][idx])
+            for idx, name in enumerate(names)
+        },
+        "normalization_maximum": {
+            name: float(preference["maximum"][idx])
+            for idx, name in enumerate(names)
+        },
+        "selected_raw_objectives": {
+            name: float(values[int(balanced_index), idx])
+            for idx, name in enumerate(names)
+        },
+        "selected_normalized_objectives": {
+            name: float(preference["normalized_values"][selected_local, idx])
+            for idx, name in enumerate(names)
+        },
+        "selected_weighted_contributions": {
+            name: float(preference["weighted_contributions"][selected_local, idx])
+            for idx, name in enumerate(names)
+        },
+        "weighted_normalized_objective_score": float(
+            preference["scores"][selected_local]
+        ),
+        "balanced_population_index": int(balanced_index),
+        "pareto_front_population_indices": [int(value) for value in front_global],
+    }
+
+
+def pick_representatives(population, f_vals, objective_weights, feasible=None):
     if not population or f_vals.size == 0:
         return []
-    n_obj = f_vals.shape[1]
-    reps = []
-    for i in range(n_obj):
-        reps.append(population[int(np.argmin(f_vals[:, i]))])
-    fronts = fast_non_dominated_sort(f_vals)
-    if fronts and fronts[0]:
-        f1 = np.array(fronts[0], dtype=int)
-        nf = normalize_objectives(f_vals[f1])
-        bal = int(np.argmin(np.linalg.norm(nf, axis=1)))
-        reps.append(population[int(f1[bal])])
-    else:
-        reps.append(reps[0])
-    return reps
+    indices = _representative_indices_v1(
+        f_vals, objective_weights, feasible=feasible
+    )
+    return [population[index] for index in indices]
 
 
 def _plot_rf_segments_by_phase(
@@ -7569,6 +7713,7 @@ def _save_generation_snapshots(
     takeoff_optimized_transition_actual,
     landing_optimized_transition_actual,
     objective_names,
+    objective_weights,
     altitude_levels,
     apply_rf_corridor_fn,
     output_rf_view_fn,
@@ -7589,7 +7734,12 @@ def _save_generation_snapshots(
         if not gpop or gf.size == 0:
             continue
 
-        greps = pick_representatives(gpop, gf)
+        greps = pick_representatives(
+            gpop,
+            gf,
+            objective_weights,
+            feasible=gh.get("feasible"),
+        )
 
         figg = plt.figure(f"Generation {gno}: Evolved Corridor", figsize=(14, 10))
         figg.subplots_adjust(left=0.05, right=0.72)
@@ -7695,6 +7845,7 @@ def _compute_final_feasibility(
     airspace_alt_min_m,
     airspace_alt_max_m,
     min_corridor_distance_m,
+    cruise_half_width_m,
     transition_corridor_cfg,
 ):
     """Evaluate final feasibility mask and RF no-clamp count for a population."""
@@ -7712,6 +7863,7 @@ def _compute_final_feasibility(
             flight_phases,
             airspace_center_lla[:2],
             airspace_radius_m,
+            cruise_half_width_m=cruise_half_width_m,
             alt_min_m=airspace_alt_min_m,
             alt_max_m=airspace_alt_max_m,
             transition_corridor_cfg=transition_corridor_cfg,
@@ -7854,6 +8006,7 @@ def _evaluate_initial_candidates(
     airspace_alt_min_m,
     airspace_alt_max_m,
     min_corridor_distance_m,
+    cruise_half_width_m,
     transition_corridor_cfg,
 ):
     """Evaluate RF + constraints for initial candidates and return summary stats."""
@@ -7900,6 +8053,7 @@ def _evaluate_initial_candidates(
                 flight_phases,
                 airspace_center_lla[:2],
                 airspace_radius_m,
+                cruise_half_width_m=cruise_half_width_m,
                 alt_min_m=airspace_alt_min_m,
                 alt_max_m=airspace_alt_max_m,
                 transition_corridor_cfg=transition_corridor_cfg,
@@ -8161,6 +8315,60 @@ def _export_route_outputs(
         flight_phases=evaluation_flight_phases,
         **evaluate_objectives_kwargs,
     )
+    objective_weighting_result = dict(
+        params_dict.get("objective_weighting_result", {})
+    )
+    objective_names_audit = [
+        str(value)
+        for value in objective_weighting_result.get("objective_names", [])
+    ]
+    objective_summary_rows = []
+    for objective_name in objective_names_audit:
+        metric_name = objective_name.replace(" ", "_")
+        objective_summary_rows.extend([
+            {
+                "Metric": f"Objective_Weight_{metric_name}",
+                "Value": objective_weighting_result.get(
+                    "configured_weights", {}
+                ).get(objective_name),
+            },
+            {
+                "Metric": f"Objective_Normalized_Weight_{metric_name}",
+                "Value": objective_weighting_result.get(
+                    "normalized_weights", {}
+                ).get(objective_name),
+            },
+            {
+                "Metric": f"Objective_Normalization_Min_{metric_name}",
+                "Value": objective_weighting_result.get(
+                    "normalization_minimum", {}
+                ).get(objective_name),
+            },
+            {
+                "Metric": f"Objective_Normalization_Max_{metric_name}",
+                "Value": objective_weighting_result.get(
+                    "normalization_maximum", {}
+                ).get(objective_name),
+            },
+            {
+                "Metric": f"Balanced_Raw_Objective_{metric_name}",
+                "Value": objective_weighting_result.get(
+                    "selected_raw_objectives", {}
+                ).get(objective_name),
+            },
+            {
+                "Metric": f"Balanced_Normalized_Objective_{metric_name}",
+                "Value": objective_weighting_result.get(
+                    "selected_normalized_objectives", {}
+                ).get(objective_name),
+            },
+            {
+                "Metric": f"Balanced_Weighted_Contribution_{metric_name}",
+                "Value": objective_weighting_result.get(
+                    "selected_weighted_contributions", {}
+                ).get(objective_name),
+            },
+        ])
 
     transition_3d_validation = dict(
         rf_best.get(
@@ -8184,6 +8392,10 @@ def _export_route_outputs(
         {"Metric": "Total_Air_Risk", "Value": total_air_risk},
         {"Metric": "Total_Noise_Risk", "Value": total_noise_risk_norm},
         {"Metric": "Total_Combined_Risk", "Value": total_combined_all_risk},
+        {"Metric": "Objective_Values_Are_Raw", "Value": True},
+        {"Metric": "Objective_Weighting_Formula", "Value": objective_weighting_result.get("formula")},
+        {"Metric": "Objective_Normalization_Scope", "Value": objective_weighting_result.get("normalization_scope")},
+        {"Metric": "Weighted_Normalized_Objective_Score", "Value": objective_weighting_result.get("weighted_normalized_objective_score")},
         {"Metric": "Transition_Enabled", "Value": bool(use_takeoff_landing_transition)},
         {"Metric": "Sector_Mode_Enabled", "Value": bool(params_dict.get("sector_mode_enabled", False))},
         {"Metric": "Sector_Selection_Mode", "Value": str(sector_selection.get("mode", "unknown"))},
@@ -8257,7 +8469,7 @@ def _export_route_outputs(
         {"Metric": "Phase_Count_Cruise", "Value": phase_counts[FLIGHT_PHASE_CRUISE]},
         {"Metric": "Phase_Count_Landing_Stage2", "Value": phase_counts[FLIGHT_PHASE_LANDING_STAGE2]},
         {"Metric": "Phase_Count_Landing_Stage1", "Value": phase_counts[FLIGHT_PHASE_LANDING_STAGE1]},
-    ])
+    ] + objective_summary_rows)
 
     params_dict.update({
         "evaluation_full_path_distance_2d_m": float(total_corridor_dist_2d_km * 1000.0),
@@ -8269,7 +8481,10 @@ def _export_route_outputs(
         "noise_result_summary": {
             "total_noise_risk_normalized": float(total_noise_risk_norm),
             "total_noise_lden_db_after_floor": float(total_noise_db_after_floor),
-            "objective_noise_risk_weighted": (float(f_best[3]) if len(f_best) > 3 else None),
+            "objective_noise_risk_raw": (float(f_best[3]) if len(f_best) > 3 else None),
+            "objective_noise_risk_weighted": (
+                float(f_best[3]) * float(w_noise) if len(f_best) > 3 else None
+            ),
             "w_noise": float(w_noise),
             "noise_floor_db": float(noise_floor_db),
         },
@@ -8500,21 +8715,24 @@ def _export_route_outputs(
             "Lon": float(end_vertiport[1]),
             "Alt_m": float(end_vertiport[2]),
         },
-        {
-            "Point_Name": "Takeoff_Point",
-            "Flight_Phase": takeoff_transition_boundary_phase,
-            "Lat": float(takeoff_output_point[0]),
-            "Lon": float(takeoff_output_point[1]),
-            "Alt_m": float(takeoff_output_point[2]),
-        },
-        {
-            "Point_Name": "Landing_Point",
-            "Flight_Phase": FLIGHT_PHASE_CRUISE,
-            "Lat": float(landing_output_point[0]),
-            "Lon": float(landing_output_point[1]),
-            "Alt_m": float(landing_output_point[2]),
-        },
     ]
+    if not bool(use_takeoff_landing_transition):
+        input_rows.extend([
+            {
+                "Point_Name": "Takeoff_Point",
+                "Flight_Phase": takeoff_transition_boundary_phase,
+                "Lat": float(takeoff_output_point[0]),
+                "Lon": float(takeoff_output_point[1]),
+                "Alt_m": float(takeoff_output_point[2]),
+            },
+            {
+                "Point_Name": "Landing_Point",
+                "Flight_Phase": FLIGHT_PHASE_CRUISE,
+                "Lat": float(landing_output_point[0]),
+                "Lon": float(landing_output_point[1]),
+                "Alt_m": float(landing_output_point[2]),
+            },
+        ])
     for point_name, point, phase in (
         ("Takeoff_Stage1_End", takeoff_stage1_end, FLIGHT_PHASE_TAKEOFF_STAGE1),
         ("Landing_Stage1_Start", landing_stage1_start, FLIGHT_PHASE_LANDING_STAGE2),
@@ -8529,14 +8747,32 @@ def _export_route_outputs(
                 "Lon": float(point[1]),
                 "Alt_m": float(point[2]),
             })
-    n_wp_default = min(int(np.size(corridor_lat_default)), int(np.size(corridor_lon_default)))
-    for i_wp in range(n_wp_default):
+    waypoint_records = list(params_dict.get("backbone_waypoints") or [])
+    if not waypoint_records:
+        n_wp_default = min(
+            int(np.size(corridor_lat_default)),
+            int(np.size(corridor_lon_default)),
+        )
+        waypoint_records = [
+            {
+                "lat": float(corridor_lat_default[i_wp]),
+                "lon": float(corridor_lon_default[i_wp]),
+                "alt_m": float(waypoint_alt_fixed_m),
+            }
+            for i_wp in range(n_wp_default)
+        ]
+    waypoint_prefix = (
+        "WP_Clicked"
+        if str(params_dict.get("waypoint_source", "")).strip().lower() == "clicked_map"
+        else "WP_Default"
+    )
+    for i_wp, waypoint in enumerate(waypoint_records):
         input_rows.append({
-            "Point_Name": f"WP_Default_{i_wp+1:03d}",
+            "Point_Name": f"{waypoint_prefix}_{i_wp+1:03d}",
             "Flight_Phase": FLIGHT_PHASE_CRUISE,
-            "Lat": float(corridor_lat_default[i_wp]),
-            "Lon": float(corridor_lon_default[i_wp]),
-            "Alt_m": float(waypoint_alt_fixed_m),
+            "Lat": float(waypoint["lat"]),
+            "Lon": float(waypoint["lon"]),
+            "Alt_m": float(waypoint.get("alt_m", waypoint_alt_fixed_m)),
         })
     df_input_points = pd.DataFrame(input_rows, columns=[
         "Point_Name", "Flight_Phase", "Lat", "Lon", "Alt_m"
@@ -8956,111 +9192,8 @@ def _plot_representative_corridor_figures(
 # MAIN ENTRY: one complete optimization attempt
 # ======================================================================
 # Main optimization pipeline: one end-to-end run attempt
-def attempt_run_once(
-    *,
-    start_vertiport_override=None,
-    end_vertiport_override=None,
-    airspace_info_override=None,
-    forbidden_zones_override=None,
-    corridor_points_override=None,
-    cruise_altitude_m_override=None,
-    takeoff_climb_angle_deg_override=None,
-    landing_descent_angle_deg_override=None,
-    project_root=None,
-    use_clicked_waypoints_override=None,
-    progress_callback=None,
-    return_run_dir=False,
-):
-    """Run one optimization attempt, optionally with API-owned input overrides.
-
-    No override is used by the standalone script.  The API adapter supplies only
-    request-owned geometry and keeps every optimization parameter authoritative
-    in this file.
-    """
-    runtime_root = None if project_root is None else Path(project_root).resolve()
-
-    def _runtime_path(*parts):
-        relative = Path(*parts)
-        return relative if runtime_root is None else runtime_root / relative
-
-    def _progress(progress, message, stage, **details):
-        if progress_callback is None:
-            return
-        event = {
-            "progress": int(max(0, min(100, progress))),
-            "message": str(message),
-            "stage": str(stage),
-        }
-        if details:
-            event["details"] = details
-        progress_callback(event)
-
-    def _warning(code, message, **details):
-        if progress_callback is None:
-            return
-        event = {
-            "event": "warning",
-            "percent": int(_last_progress_percent[0]),
-            "stage": str(_last_progress_stage[0]),
-            "code": str(code),
-            "message": str(message),
-        }
-        if details:
-            event["details"] = details
-        progress_callback(event)
-
-    def _initial_population_diagnostic(
-        *, current, state, candidate_count, rf_count, feasible_count,
-        reason_counts=None,
-    ):
-        if progress_callback is None:
-            return
-        blockers = []
-        for reason, failed in sorted(
-            dict(reason_counts or {}).items(), key=lambda item: (-item[1], item[0])
-        )[:5]:
-            blockers.append({
-                "code": str(reason),
-                "failed": int(failed),
-                "evaluated": int(candidate_count),
-            })
-        progress_callback({
-            "event": "diagnostic",
-            "percent": int(min(42, 30 + 12 * float(current) / max(1, max_init_retries))),
-            "stage": "initial_population",
-            "state": str(state),
-            "current": int(current),
-            "total": int(max_init_retries),
-            "candidate_count": int(candidate_count),
-            "checks": {
-                "rf_feasible": {
-                    "passed": int(rf_count),
-                    "evaluated": int(candidate_count),
-                },
-                "overall_feasible": {
-                    "passed": int(feasible_count),
-                    "evaluated": int(candidate_count),
-                    "target": int(min_feasible_init_solutions),
-                },
-            },
-            "blockers": blockers,
-            "message": (
-                "Initial feasible population found."
-                if state == "completed"
-                else "Initial population feasibility diagnostic."
-            ),
-        })
-
-    _last_progress_percent = [0]
-    _last_progress_stage = ["accepted"]
-
-    def _tracked_progress(progress, message, stage, **details):
-        _last_progress_percent[0] = int(max(0, min(100, progress)))
-        _last_progress_stage[0] = str(stage)
-        _progress(progress, message, stage, **details)
-
-    _tracked_progress(2, "Optimization request accepted.", "initializing")
-    _tracked_progress(4, "Validating optimizer and transition configuration.", "configuration_validation")
+def attempt_run_once():
+    """Run one complete standalone optimization attempt."""
     # ==================== Core Parameters ====================
     W_half = 296.0                   # 순항 회랑의 중심선 기준 좌·우 반폭(m); 총폭은 2*W_half
     transition_corridor_half_width_m = 100.0  # 전이구간 전용 좌·우 반폭(m)이자 최대 하방 MOC 이격거리(m)
@@ -9082,6 +9215,8 @@ def attempt_run_once(
 
     check_corridor_nfz = True
     check_corridor_moc = True
+
+    # True이면 전체 회랑의 자기겹침 검사를 적용하고, False이면 적용하지 않는다.
     check_corridor_self_overlap = False
 
     N_init = 1000    # target initial candidates before feasibility filtering
@@ -9119,9 +9254,7 @@ def attempt_run_once(
     use_wp_skip_generator = False   # True: WP-skip 초기해 생성기 혼용
     init_pop_skip_mix_ratio = 0.5   # skip 생성기 혼용 비율(0~1)
     wp_skip_prob = 0.00             # 중간 WP skip 확률 (0~1)
-    airspace_radius_km = float(
-        (airspace_info_override or {}).get("radius_km", 5.0)
-    )  # 공역 반경 제한(km); API 공역 설정이 있으면 그 값 사용
+    airspace_radius_km = 5.0         # 공역 반경 제한(km)
     min_corridor_distance_km = 0.0  # 전체 회랑 최소 거리 제한 (km), 0이면 비활성
     emergency_strip_m = 500.0       # emergency 포함 완화 strip 폭
     min_seg_for_extra_nodes_m = 1500.0  # 짧은 세그먼트 extra node 생성 억제 길이
@@ -9159,10 +9292,12 @@ def attempt_run_once(
     look_ahead_min_equiv_speed_kmh = look_ahead_min_equiv_speed_mps * 3.6
     look_ahead_min_turn_radius_m = rf_base_turn_radius_m * look_ahead_min_scale
 
-    w_dist, w_ground, w_air, w_noise = 0.1, 1.0, 2.0, 0.1
-    altitude_levels = np.array([
-        600.0 if cruise_altitude_m_override is None else float(cruise_altitude_m_override)
-    ], dtype=float)  # 순항 고도(MSL, m); API 요청값이 있으면 그 값만 덮어쓴다.
+    # 아래 네 값은 후보별 원목적을 0~1로 정규화한 뒤 계산하는 Balanced 선호 가중치다.
+    w_dist = 0.1    # 실제 3D 거리 목적의 상대 중요도
+    w_ground = 0.3  # 지상위험 목적의 상대 중요도
+    w_air = 0.5     # 공중위험 목적의 상대 중요도
+    w_noise = 0.1   # 소음위험 목적의 상대 중요도
+    altitude_levels = np.array([600.0], dtype=float)  # 순항 고도(MSL, m)
     risk_altitude_levels = np.arange(0.0, 1000.0, 100.0, dtype=float)  # 위험자료 MSL 층
     use_heading_map = True
 
@@ -9177,7 +9312,7 @@ def attempt_run_once(
     sector_wind_risk_weight = 1.0 / 3.0    # 자동선정 최종점수의 바람위험 비율
     sector_ground_risk_weight = 1.0 / 3.0  # 자동선정 최종점수의 지상위험 비율
     sector_air_risk_weight = 1.0 / 3.0     # 자동선정 최종점수의 공중위험 비율
-    sector_wind_data_dir = _runtime_path("wind_data")  # 월별 AirRisk_Data_1~12.mat 바람자료 폴더
+    sector_wind_data_dir = Path("wind_data")  # 월별 AirRisk_Data_1~12.mat 바람자료 폴더
 
     takeoff_sector_user = _validate_sector_1based_v1(
         takeoff_sector_user, label="takeoff_sector_user"
@@ -9232,14 +9367,8 @@ def attempt_run_once(
     landing_total_transition_horizontal_distance_m = None  # distance 모드의 착륙 전체 밑변(m); angle/optimized_only에서는 무시
     takeoff_stage1_straight_distance_m = 300.0  # 혼합 구조에서 최적화 전 이륙 고정 직선 prefix 거리(m); 다른 구조에서는 무시
     landing_stage1_straight_distance_m = 300.0  # 혼합 구조에서 최적화 후 착륙 고정 직선 prefix 거리(m); 다른 구조에서는 무시
-    takeoff_climb_angle_deg = (
-        6.0 if takeoff_climb_angle_deg_override is None
-        else float(takeoff_climb_angle_deg_override)
-    )  # angle 모드의 이륙 권위 각도; API에서 선택 입력 가능
-    landing_descent_angle_deg = (
-        6.0 if landing_descent_angle_deg_override is None
-        else float(landing_descent_angle_deg_override)
-    )  # angle 모드의 착륙 권위 각도; API에서 선택 입력 가능
+    takeoff_climb_angle_deg = 6.0  # angle 모드의 이륙 권위 각도(deg)
+    landing_descent_angle_deg = 6.0  # angle 모드의 착륙 권위 각도(deg)
     transition_mode = str(transition_mode).strip().lower()
     fixed_transition_geometry_active = bool(
         use_takeoff_landing_transition
@@ -9339,10 +9468,7 @@ def attempt_run_once(
     # 예: 밑변 2000 m, 간격 100 m이면 양 끝점을 포함하여 약 21개 점이 생성된다.
     transition_sample_spacing_m = 100.0  # 고정 직선 Stage1 표본 간격(m); MOC의 80m 검사 간격과는 별도
 
-    use_clicked_waypoints = (
-        True if use_clicked_waypoints_override is None
-        else bool(use_clicked_waypoints_override)
-    )  # API는 False를 주입하여 클릭 입력을 항상 끈다.
+    use_clicked_waypoints = False  # True: 지도 클릭으로 중간 WP 입력
     enforce_mandatory_wp_order = True  # True: takeoff -> 입력 WP 순서 -> landing 강제
     
     min_clicked_waypoints = 0   # 클릭 입력 WP 최소 개수 (takeoff/landing 제외)
@@ -9364,46 +9490,35 @@ def attempt_run_once(
     delta_z_max = max(100.0, float(np.max(np.abs(altitude_levels - 150.0))) + 5.0)
     flight_dist_limit = 100000.0 
     objective_names = ["Distance", "Ground Risk", "Air Risk", "Noise Risk"]
+    objective_weights, objective_weights_normalized = _validate_objective_weights_v1(
+        [w_dist, w_ground, w_air, w_noise], len(objective_names)
+    )
     airspace_radius_m = float(airspace_radius_km) * 1000.0
-    airspace_alt_min_m = float(
-        (airspace_info_override or {}).get("alt_min_m", 100.0)
-    )  # 공역 최소 고도(MSL, m)
-    airspace_alt_max_m = float(
-        (airspace_info_override or {}).get("alt_max_m", 1000.0)
-    )  # 공역 최대 고도(MSL, m)
+    airspace_alt_min_m = 100.0  # 공역 최소 고도(MSL, m)
+    airspace_alt_max_m = 1000.0  # 공역 최대 고도(MSL, m)
     min_corridor_distance_m = float(min_corridor_distance_km) * 1000.0
 
-    noise_npy_path = _runtime_path("noise_data", "noise_lden_grid.npy")
+    noise_npy_path = Path("noise_data", "noise_lden_grid.npy")
     noise_floor_db = 0.0
 
     #
 
-    ground_risk_path = _runtime_path("ground_risk_data", "Modified_high_res_affected_population_GRC.npy")
+    ground_risk_path = Path("ground_risk_data", "Modified_high_res_affected_population_GRC.npy")
 
-    bird_airrisk_path = _runtime_path("air_risk_data", "bird_riskmap_springfall_3d.npy")
-    moc_airrisk_dir = _runtime_path("260608_MOC")
+    bird_airrisk_path = Path("air_risk_data", "bird_riskmap_springfall_3d.npy")
+    moc_airrisk_dir = Path("260608_MOC")
     lat_lim = [35.535, 35.652]
     lon_lim = [129.020, 129.150]
 
     import datetime as _dt
     _run_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = _runtime_path("runs") / _run_ts
+    out_dir = Path("runs") / _run_ts
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # start_vertiport_default = np.array([35.6033361, 129.0776917, 150.0], dtype=float) # 26년 5월 28일 변경전 버티포트 좌표
     # end_vertiport_default = np.array([35.6033361, 129.0776917, 150.0], dtype=float)   # 26년 5월 28일 변경전 버티포트 좌표
-    start_vertiport_default = np.array(
-        [35.603386, 129.078025, 150.0]
-        if start_vertiport_override is None else start_vertiport_override,
-        dtype=float,
-    ).reshape(-1)  # API 생략 시 최신 메인의 기본 버티포트
-    end_vertiport_default = np.array(
-        [35.603386, 129.078025, 150.0]
-        if end_vertiport_override is None else end_vertiport_override,
-        dtype=float,
-    ).reshape(-1)  # API 생략 시 최신 메인의 기본 버티포트
-    if start_vertiport_default.size != 3 or end_vertiport_default.size != 3:
-        raise ValueError("Both start/end vertiport overrides must be [lat, lon, alt].")
+    start_vertiport_default = np.array([35.603386, 129.078025, 150.0], dtype=float)
+    end_vertiport_default = np.array([35.603386, 129.078025, 150.0], dtype=float)
     takeoff_end_lla = np.array([35.59468397, 129.07515721, float(altitude_levels[0])], dtype=float) # 이륙 끝 지점, 고도를 순항 고도와 일치하도록 설정
     landing_end_lla = np.array([35.59701567, 129.08585995, float(altitude_levels[0])], dtype=float) #  착륙 끝 지점, 고도를 순항 고도와 일치하도록 설정
     start_ref_alt_m = float(start_vertiport_default[2])
@@ -9606,6 +9721,17 @@ def attempt_run_once(
         "w_ground": w_ground,
         "w_air": w_air,
         "w_noise": w_noise,
+        "objective_values_are_raw": True,
+        "objective_weighting_formula": (
+            "sum(normalized_weight_i * minmax_normalized_objective_i)"
+        ),
+        "objective_weighting_applies_to": [
+            "truncated_generation_front", "final_balanced_selection"
+        ],
+        "objective_weights_normalized": {
+            str(objective_names[idx]): float(objective_weights_normalized[idx])
+            for idx in range(len(objective_names))
+        },
         "sector_mode_enabled": bool(sector_mode_enabled),
         "sector_auto_selection_active": bool(sector_auto_selection_active),
         "sector_season": str(sector_season),
@@ -9764,7 +9890,6 @@ def attempt_run_once(
         json.dump(params_dict, _pf, indent=2, ensure_ascii=False)
     print(f"Output folder : {out_dir}")
 
-    _tracked_progress(8, "Loading ground, air, MOC, noise, and wind inputs.", "loading_risk_data")
     pop_risk_raw = np.load(str(ground_risk_path), allow_pickle=True)
     selected = pop_risk_raw[:, :, 0, 3:]
     Ny, Nx, H_time = selected.shape
@@ -9862,17 +9987,6 @@ def attempt_run_once(
                 f"npy_lat_lim={_lat_lim_meta}, npy_lon_lim={_lon_lim_meta}, "
                 "v18_lat_lim=[35.535, 35.652], v18_lon_lim=[129.020, 129.150]"
             )
-            _warning(
-                "noise_extent_mismatch",
-                "Noise-map extent differs from the optimizer evaluation extent; "
-                "the optimizer extent remains authoritative.",
-                npy_lat_lim=list(_lat_lim_meta),
-                npy_lon_lim=list(_lon_lim_meta),
-                evaluation_lat_lim=[35.535, 35.652],
-                evaluation_lon_lim=[129.020, 129.150],
-            )
-
-    _tracked_progress(14, "Validating vertiports and airspace constraints.", "airspace_validation")
     # start_vertiport = np.array([35.6033361, 129.0776917, 150.0], dtype=float)
     # end_vertiport = np.array([35.6249109, 129.0586710, 150.0], dtype=float)
     # start_vertiport = np.array([35.6033361, 129.0776917, 150.0], dtype=float)
@@ -9885,12 +9999,7 @@ def attempt_run_once(
     params_dict["altitude_reference"]["cruise_altitude_agl_m"] = float(altitude_levels[0] - start_vertiport[2])
 
     # airspace_center_lla = None
-    _airspace_center_override = (airspace_info_override or {}).get("center")
-    airspace_center_lla = (
-        np.array([35.6033361, 129.0776917, 150.0], dtype=float)
-        if _airspace_center_override is None
-        else np.asarray(_airspace_center_override, dtype=float).reshape(-1)
-    )
+    airspace_center_lla = np.array([35.603386, 129.078025, 150.0], dtype=float)
 
     if airspace_center_lla is None:
         airspace_center_lla = np.array([
@@ -9928,7 +10037,6 @@ def attempt_run_once(
     request = cimgt.OSM()
 
     if sector_auto_selection_active:
-        _tracked_progress(18, "Evaluating automatic takeoff and landing sectors.", "sector_selection")
         sector_diagnostic_path = out_dir / "sector_selection_diagnostics.png"
         sector_selection_analysis = _automatic_sector_selection_v1(
             start_vertiport=start_vertiport,
@@ -9960,7 +10068,6 @@ def attempt_run_once(
             transition_corridor_cfg=transition_corridor_cfg,
             output_png_path=sector_diagnostic_path,
             request=request,
-            warning_callback=_warning,
         )
         sector_selection_analysis.update({
             "configured_user_takeoff_sector": int(takeoff_sector_user),
@@ -9977,8 +10084,6 @@ def attempt_run_once(
             f"takeoff=S{takeoff_sector_selected}, landing=S{landing_sector_selected}, "
             f"status={sector_selection_analysis['status']}"
         )
-    else:
-        _tracked_progress(18, "Using the configured manual takeoff and landing sectors.", "sector_selection")
 
     takeoff_heading_deg = float(np.rad2deg(_sector_angle(takeoff_sector_selected)))
     landing_heading_deg = float(np.rad2deg(_sector_angle(landing_sector_selected)))
@@ -9998,62 +10103,16 @@ def attempt_run_once(
     with open(out_dir / "params.json", "w", encoding="utf-8") as _pf:
         json.dump(params_dict, _pf, indent=2, ensure_ascii=False)
 
-    _tracked_progress(22, "Validating client corridor waypoints.", "waypoint_validation")
-    _corridor_points_api = [] if corridor_points_override is None else list(corridor_points_override)
-    if _corridor_points_api:
-        _corridor_points_array = np.asarray(_corridor_points_api, dtype=float)
-        if _corridor_points_array.ndim != 2 or _corridor_points_array.shape[1] not in (2, 3):
-            raise ValueError("corridor_points_override must contain [lat, lon] or [lat, lon, alt] rows.")
-        corridor_lat_default = _corridor_points_array[:, 0].astype(float)
-        corridor_lon_default = _corridor_points_array[:, 1].astype(float)
-    else:
-        corridor_lat_default = np.array([], dtype=float)
-        corridor_lon_default = np.array([], dtype=float)
+    # 클릭 입력을 끈 경우 사용할 중간 WP: 같은 인덱스의 위도/경도가 한 점을 이룬다.
+    # 예: WP01=(corridor_lat_default[0], corridor_lon_default[0])
+    corridor_lat_default = np.array([
+        35.5612842, 35.5933937,
+    ], dtype=float)
+    corridor_lon_default = np.array([
+        129.0884254, 129.1296023,
+    ], dtype=float)
 
 
-    # WP set (alt=750m), msl 750일때, agl = 600 일때 위경도값, 이거 사용시 altitude_levels를 750으로 고정해야 함
-    # corridor_lat_default = np.array([
-    #     35.5936890, 35.6061149, 35.6128448, 35.6316511, 35.6102565, 35.6266480,
-    #     35.6128448, 35.5810885, 35.5662415, 35.5772907, 35.5873027, 35.6012828,
-    # ], dtype=float)
-    # corridor_lon_default = np.array([
-    #     129.0607646, 129.0580053, 129.0395394, 129.0535480, 129.0976965, 129.1066111,
-    #     129.1227422, 129.1148889, 129.0758345, 129.0660709, 129.0987577, 129.1044885,
-    # ], dtype=float)
-
-
-
-    # WP set (alt=450m), msl 450일때, agl = 300 일때 위경도값, 이거 사용시 altitude_levels를 450으로 고정해야 함
-    # corridor_lat_default = np.array([
-    #     35.5924808, 35.6073229, 35.6143978, 35.6131899,
-    #     35.6235425, 35.6219897, 35.6052521, 35.6055972,
-    #     35.6171586, 35.6118095, 35.5897192, 35.5750464,
-    #     35.5671048, 35.5655509, 35.5757370, 35.5810885,
-    #     35.5955875, 35.5900644,
-    # ], dtype=float)
-    # corridor_lon_default = np.array([
-    #     129.0628871, 129.0684057, 129.0620381, 129.0448457,
-    #     129.0524868, 129.0734997, 129.0866594, 129.1078846,
-    #     129.1153134, 129.1261383, 129.1246525, 129.1106439,
-    #     129.0970597, 129.0817776, 129.0764712, 129.0979087,
-    #     129.1157379, 129.0913289,
-    # ], dtype=float)
-
-    # WP set (alt=600m), msl 600일때, agl = 450 일때 위경도값, 이거 사용시 altitude_levels를 600으로 고정해야 함
-    # corridor_lat_default = np.array([
-    #     35.5924808, 35.6073229, 35.6143978, 35.6131899,
-    #     35.6235425, 35.6219897, 35.6052521, 35.6055972,
-    #     35.6171586, 35.6118095, 35.5897192, 35.5750464,
-    #     35.5671048, 35.5655509, 35.5757370, 35.5810885,
-    #     35.5955875, 35.5900644,
-    # ], dtype=float)
-    # corridor_lon_default = np.array([
-    #     129.0628871, 129.0684057, 129.0620381, 129.0448457,
-    #     129.0524868, 129.0734997, 129.0866594, 129.1078846,
-    #     129.1153134, 129.1261383, 129.1246525, 129.1106439,
-    #     129.0970597, 129.0817776, 129.0764712, 129.0979087,
-    #     129.1157379, 129.0913289,
-    # ], dtype=float)
 
     waypoint_alt_fixed_m = float(altitude_levels[0])  # 중간 경유 WP 고정 고도(MSL, m)
     clicked_wp_json_path = None
@@ -10062,7 +10121,6 @@ def attempt_run_once(
     corridor_lat = corridor_lat_default.copy()
     corridor_lon = corridor_lon_default.copy()
 
-    _tracked_progress(24, "Building takeoff and landing transition geometry.", "transition_geometry")
     if use_takeoff_landing_transition:
         preview_takeoff, takeoff_transition_profile, takeoff_transition_meta = build_stage1_transition_profile(
             start_vertiport,
@@ -10214,11 +10272,7 @@ def attempt_run_once(
     #     [129.12, 129.13, 35.59, 35.60],
     # ], dtype=float)
 
-    _tracked_progress(26, "Validating NFZ and spatial constraint inputs.", "constraint_input_validation")
-    forbidden_zones_input = np.asarray(
-        [] if forbidden_zones_override is None else forbidden_zones_override,
-        dtype=float,
-    )
+    forbidden_zones_input = np.array([], dtype=float).reshape(0, 4)
 
     if (not use_forbidden_zones) or forbidden_zones_input is None or np.size(forbidden_zones_input) == 0:
         forbidden_zones = np.array([], dtype=float).reshape(0, 4)
@@ -10278,6 +10332,20 @@ def attempt_run_once(
 
     if corridor_lat.shape[0] != corridor_lon.shape[0]:
         raise ValueError("corridor_lat_default and corridor_lon_default must have same length.")
+    if not np.all(np.isfinite(corridor_lat)) or not np.all(np.isfinite(corridor_lon)):
+        raise ValueError("Waypoint latitude/longitude values must all be finite.")
+    if np.any((corridor_lat < -90.0) | (corridor_lat > 90.0)):
+        raise ValueError(
+            "Waypoint latitude is outside [-90, 90]. "
+            "Check that corridor_lat_default contains only latitudes and "
+            "corridor_lon_default contains only longitudes."
+        )
+    if np.any((corridor_lon < -180.0) | (corridor_lon > 180.0)):
+        raise ValueError(
+            "Waypoint longitude is outside [-180, 180]. "
+            "Check that corridor_lat_default contains only latitudes and "
+            "corridor_lon_default contains only longitudes."
+        )
 
     waypoint_alts = np.full(corridor_lat.shape[0], waypoint_alt_fixed_m, dtype=float)  # MSL
     waypoints = np.column_stack([corridor_lat, corridor_lon, waypoint_alts]) if corridor_lat.size > 0 else np.empty((0, 3), dtype=float)
@@ -10308,7 +10376,6 @@ def attempt_run_once(
         f"end=({landing_entry[0]:.8f}, {landing_entry[1]:.8f}, {landing_entry[2]:.1f}m)"
     )
 
-    _tracked_progress(28, "Validating the route backbone against the airspace.", "route_validation")
     backbone = np.vstack([takeoff_complete, waypoints, landing_entry])
     if not is_path_inside_airspace(
         backbone,
@@ -10718,7 +10785,6 @@ def attempt_run_once(
         f"(max {max_init_retries} retries, N_init={N_init}, "
         f"min_feasible_init_solutions={min_feasible_init_solutions}) ..."
     )
-    _tracked_progress(30, "Searching for a constraint-feasible initial population.", "initial_population")
     rf_corridor_start = np.asarray(takeoff_complete, dtype=float)
     rf_corridor_end = np.asarray(landing_entry, dtype=float)
     _apply_rf_for_init = partial(
@@ -10802,14 +10868,6 @@ def attempt_run_once(
         _cand_n = len(_candidate)
         _last_init_candidate_count = int(_cand_n)
         if not _candidate:
-            _initial_population_diagnostic(
-                current=_retry,
-                state="retry",
-                candidate_count=0,
-                rf_count=0,
-                feasible_count=0,
-                reason_counts={"initial_horizontal_airspace": int(N_init)},
-            )
             if _retry % 50 == 0:
                 print(f"  [Init retry {_retry}/{max_init_retries}] candidate_after_initial_airspace: 0/{N_init}")
             continue
@@ -10825,6 +10883,7 @@ def attempt_run_once(
             airspace_alt_min_m=airspace_alt_min_m,
             airspace_alt_max_m=airspace_alt_max_m,
             min_corridor_distance_m=min_corridor_distance_m,
+            cruise_half_width_m=W_half,
             transition_corridor_cfg=transition_corridor_cfg,
         )
         _rf_cnt = int(_init_eval["rf_cnt"])
@@ -10838,18 +10897,6 @@ def attempt_run_once(
         _last_init_rf_count = int(_rf_cnt)
         _last_init_feasible_count = int(_both_cnt)
         _last_init_reason_counts = dict(_reason_counts)
-
-        _initial_population_diagnostic(
-            current=_retry,
-            state=(
-                "completed"
-                if _both_cnt >= min_feasible_init_solutions else "retry"
-            ),
-            candidate_count=_cand_n,
-            rf_count=_rf_cnt,
-            feasible_count=_both_cnt,
-            reason_counts=_reason_counts,
-        )
 
         if _retry % 50 == 0 or _rf_cnt > 0:
             _reason_txt = "none"
@@ -10882,17 +10929,6 @@ def attempt_run_once(
             f"  Warning: feasible init pop < target ({min_feasible_init_solutions}) "
             f"after {max_init_retries} retries. Restarting run."
         )
-        _initial_population_diagnostic(
-            current=max_init_retries,
-            state="failed",
-            candidate_count=_last_init_candidate_count,
-            rf_count=_last_init_rf_count,
-            feasible_count=_last_init_feasible_count,
-            reason_counts=_last_init_reason_counts,
-        )
-        _tracked_progress(42, "No feasible initial population was found; retrying.", "retry")
-        if return_run_dir:
-            return False, 0, out_dir
         return False, 0
     print(f"  -> {len(init_pop)} feasible initial solutions ready.")
 
@@ -11287,22 +11323,6 @@ def attempt_run_once(
     plt.close(fig2b)
 
     print("Running NSGA-III ...")
-    _tracked_progress(55, "Running NSGA-III corridor optimization.", "optimization")
-
-    def _report_nsga_generation(**generation_info):
-        generation = int(generation_info["generation"])
-        total_generations = max(1, int(generation_info["total_generations"]))
-        progress = 55 + int(round(30.0 * generation / total_generations))
-        _tracked_progress(
-            min(85, progress),
-            f"NSGA-III generation {generation}/{total_generations} completed "
-            f"(constraints {generation_info['constraint_feasible']}/"
-            f"{generation_info['population_size']}, RF {generation_info['rf_feasible']}/"
-            f"{generation_info['population_size']}).",
-            "optimization_generation",
-            **generation_info,
-        )
-
     pop, fvals, gen_history = run_nsga3(
         nodes_pool=nodes_pool,
         node_risk_pool=node_risk_pool,
@@ -11318,6 +11338,7 @@ def attempt_run_once(
         w_d=w_dist, w_g=w_ground, w_a=w_air,
         lat_lim=lat_lim, lon_lim=lon_lim,
         NoiseRisk=NoiseRisk, noise_floor_db=noise_floor_db, w_n=w_noise,
+        objective_weights=objective_weights,
         ground_speed_mps=ground_speed_mps,
         bank_angle_deg=bank_angle_deg,
         num_arc_points=num_arc_points,
@@ -11339,7 +11360,6 @@ def attempt_run_once(
         airspace_alt_max_m=airspace_alt_max_m,
         min_corridor_distance_m=min_corridor_distance_m,
         transition_corridor_cfg=transition_corridor_cfg,
-        generation_progress_callback=_report_nsga_generation,
     )
 
     _save_generation_snapshots(
@@ -11366,6 +11386,7 @@ def attempt_run_once(
             landing_transition_meta.get("optimized_transition_actual", False)
         ),
         objective_names=objective_names,
+        objective_weights=objective_weights,
         altitude_levels=altitude_levels,
         apply_rf_corridor_fn=rf_apply_fn,
         output_rf_view_fn=output_rf_view_fn,
@@ -11385,6 +11406,7 @@ def attempt_run_once(
         airspace_alt_min_m=airspace_alt_min_m,
         airspace_alt_max_m=airspace_alt_max_m,
         min_corridor_distance_m=min_corridor_distance_m,
+        cruise_half_width_m=W_half,
         transition_corridor_cfg=transition_corridor_cfg,
     )
     print(f"Final feasible (constraints): {feasible_count}/{len(pop)}")
@@ -11392,12 +11414,26 @@ def attempt_run_once(
 
     if feasible_count == 0:
         print("No feasible solution. Retrying ...")
-        _tracked_progress(86, "The evolved population has no feasible route; retrying.", "retry")
-        if return_run_dir:
-            return False, 0, out_dir
         return False, 0
 
-    reps = pick_representatives(pop, fvals) if pop and fvals.size > 0 else []
+    representative_indices = (
+        _representative_indices_v1(
+            fvals, objective_weights, feasible=feas_mask
+        )
+        if pop and fvals.size > 0 else []
+    )
+    reps = [pop[index] for index in representative_indices]
+    balanced_population_index = (
+        int(representative_indices[-1]) if representative_indices else None
+    )
+    objective_weighting_result = _balanced_objective_audit_v1(
+        fvals,
+        objective_weights,
+        objective_names,
+        feas_mask,
+        balanced_population_index,
+    )
+    params_dict["objective_weighting_result"] = objective_weighting_result
 
     obj_pairs = [(i, j) for i in range(len(objective_names)) for j in range(i + 1, len(objective_names))]
     n_pair = len(obj_pairs)
@@ -11466,18 +11502,13 @@ def attempt_run_once(
             )
             init_fvals[i_init, :] = np.asarray(f_init_vec, dtype=float)
 
+        init_rep_indices = _representative_indices_v1(
+            init_fvals, objective_weights
+        )
         init_rep_objectives = [
-            np.asarray(init_fvals[int(np.argmin(init_fvals[:, oi]))], dtype=float)
-            for oi in range(init_fvals.shape[1])
+            np.asarray(init_fvals[index], dtype=float)
+            for index in init_rep_indices
         ]
-        fronts_init = fast_non_dominated_sort(init_fvals)
-        if fronts_init and fronts_init[0]:
-            f1_init = np.array(fronts_init[0], dtype=int)
-            nf_init = normalize_objectives(init_fvals[f1_init])
-            bal_init = int(np.argmin(np.linalg.norm(nf_init, axis=1)))
-            init_rep_objectives.append(np.asarray(init_fvals[int(f1_init[bal_init])], dtype=float))
-        elif init_rep_objectives:
-            init_rep_objectives.append(np.asarray(init_rep_objectives[0], dtype=float))
 
     _plot_representative_corridor_figures(
         reps=reps,
@@ -11677,6 +11708,7 @@ def attempt_run_once(
                 rf_best.get("flight_phases"),
                 airspace_center_lla[:2],
                 airspace_radius_m,
+                cruise_half_width_m=W_half,
                 alt_min_m=airspace_alt_min_m,
                 alt_max_m=airspace_alt_max_m,
                 transition_corridor_cfg=transition_corridor_cfg,
@@ -11703,7 +11735,6 @@ def attempt_run_once(
                 or _path_total_3d_distance_m(rf_best["path"]) + 1e-6
                 >= min_corridor_distance_m
             )
-        _tracked_progress(88, "Writing the authoritative Excel route and figures.", "exporting")
         _export_route_outputs(
             rows=rows,
             rf_best=rf_best,
@@ -11856,13 +11887,6 @@ def attempt_run_once(
                     "Warning: MOC transition snapshots were not completed: "
                     f"{type(exc).__name__}: {exc}"
                 )
-                _warning(
-                    "moc_transition_snapshot_generation_failed",
-                    "MOC transition audit snapshots were not completed; core route "
-                    "optimization and constraint results remain available.",
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                )
             params_dict["moc_transition_visualization"] = (
                 moc_transition_visualization
             )
@@ -11981,9 +12005,14 @@ def attempt_run_once(
         "check_corridor_moc": bool(check_corridor_moc),
         "moc_transition_visualization": moc_transition_visualization,
         "check_corridor_self_overlap": bool(check_corridor_self_overlap),
+        "objective_values_are_raw": True,
+        "w_dist": float(w_dist),
+        "w_ground": float(w_ground),
+        "w_air": float(w_air),
         "noise_npy_path": str(noise_npy_path),
         "noise_floor_db": noise_floor_db,
         "w_noise": w_noise,
+        "objective_weighting_result": objective_weighting_result,
         "noise_meta": noise_meta_cruise,
         "noise_meta_all_msl": noise_meta,
         # Preserve the legacy one-layer result shapes at cruise altitude.
@@ -12190,9 +12219,6 @@ def attempt_run_once(
         pickle.dump(result, f)
     print(f"Saved {out}")
 
-    _tracked_progress(100, "Optimization and export completed.", "completed", run_dir=str(out_dir))
-    if return_run_dir:
-        return True, feasible_count, out_dir
     return True, feasible_count
 
 

@@ -19,16 +19,6 @@ payload_optimal_corridor = {
     "end_vertiport": {
         "lla": {"lat": 35.603386, "lon": 129.078025, "alt_m": 150.0},
     },
-    "airspace_info": {
-        "center": {"lat": 35.6033361, "lon": 129.0776917},
-        "radius_km": 5.0,
-    },
-    # [lon_min, lon_max, lat_min, lat_max] # optional (default: [])
-    "no_fly_zones": [                  
-        # {"bbox": [129.0700, 129.0820, 35.5980, 35.6100]},  
-    ],
-    # optional middle waypoints (missing/null/empty uses no middle waypoints)
-    "corridor_points": [],
     "cruise_altitude_m": 600.0,
     "takeoff_climb_angle_deg": 6.0,
     "landing_descent_angle_deg": 6.0,

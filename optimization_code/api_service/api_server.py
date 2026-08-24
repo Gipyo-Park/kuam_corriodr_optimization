@@ -39,44 +39,23 @@ app = FastAPI(
 
 # --- 데이터 모델 정의 (Pydantic) ---
 class LLA(BaseModel):
-    lat: float
-    lon: float
-    alt_m: float
+    lat: float = Field(ge=-90.0, le=90.0, allow_inf_nan=False)
+    lon: float = Field(ge=-180.0, le=180.0, allow_inf_nan=False)
+    alt_m: float = Field(allow_inf_nan=False)
 
-
-class LatLon(BaseModel):
-    lat: float
-    lon: float
-
-
-class WaypointLLA(BaseModel):
-    lat: float
-    lon: float
-    alt_m: Optional[float] = None
+    model_config = ConfigDict(extra="forbid")
 
 
 class Vertiport(BaseModel):
     lla: LLA
 
-
-class AirspaceInfo(BaseModel):
-    center: LatLon
-    radius_km: float = Field(gt=0.0, allow_inf_nan=False)
+    model_config = ConfigDict(extra="forbid")
 
 
 class PathRequest(BaseModel):
     """API 요청 본문 모델 (api_request.py 스키마)"""
-    start_vertiport: Optional[Vertiport] = None
-    end_vertiport: Optional[Vertiport] = None
-    airspace_info: Optional[AirspaceInfo] = None
-    # Preferred NFZ format: {"bbox": [lon_min, lon_max, lat_min, lat_max]}
-    # Backward compatible: {"center": {lat, lon}, "radius_km": 1.0}
-    no_fly_zones: List[Any] = Field(default_factory=list)
-    # Optional middle waypoints. Missing/null/empty runs without middle waypoints.
-    corridor_points: List[WaypointLLA] = Field(default_factory=list)
-    # Backward-compatible alias for corridor_points.
-    waypoints: Optional[List[WaypointLLA]] = None
-    # Required explicit cruise altitude used by planner altitude_levels.
+    start_vertiport: Vertiport
+    end_vertiport: Vertiport
     cruise_altitude_m: float = Field(allow_inf_nan=False)
     takeoff_climb_angle_deg: float = Field(
         default=6.0, gt=0.0, lt=90.0, allow_inf_nan=False
@@ -87,6 +66,7 @@ class PathRequest(BaseModel):
 
     # OpenAPI /docs display example only. Runtime defaults live in path_engine.py.
     model_config = ConfigDict(
+        extra="forbid",
         json_schema_extra={
             "example": {
                 "start_vertiport": {
@@ -95,15 +75,7 @@ class PathRequest(BaseModel):
                 "end_vertiport": {
                     "lla": {"lat": 35.603386, "lon": 129.078025, "alt_m": 150.0}
                 },
-                "airspace_info": {
-                    "center": {"lat": 35.6033361, "lon": 129.0776917},
-                    "radius_km": 5.0
-                },
                 "cruise_altitude_m": 600.0,
-                "no_fly_zones": [
-                    {"bbox": [129.0600, 129.0700, 35.5950, 35.6050]}
-                ],
-                "corridor_points": [],
                 "takeoff_climb_angle_deg": 6.0,
                 "landing_descent_angle_deg": 6.0
             }
@@ -175,49 +147,16 @@ def _validation_error_details(error: ValidationError) -> List[Dict[str, str]]:
     return details
 
 
-def _normalize_no_fly_zones(no_fly_zones: List[Any]) -> List[Any]:
-    normalized: List[Any] = []
-    for i, zone in enumerate(no_fly_zones, start=1):
-        if isinstance(zone, dict):
-            bbox = zone.get("bbox")
-            if isinstance(bbox, list) and len(bbox) != 4:
-                raise ValueError(
-                    f"no_fly_zones[{i}].bbox must be [lon_min, lon_max, lat_min, lat_max]."
-                )
-            normalized.append(zone)
-            continue
-
-        if isinstance(zone, (list, tuple)):
-            if len(zone) != 4:
-                raise ValueError(
-                    f"no_fly_zones[{i}] list must be [lon_min, lon_max, lat_min, lat_max]."
-                )
-            normalized.append([float(v) for v in zone])
-            continue
-
-        raise ValueError(
-            f"Invalid no_fly_zones[{i}] format. Use dict with bbox or 4-length list."
-        )
-    return normalized
 
 
 def _build_engine_request(request: PathRequest) -> Dict[str, Any]:
-    corridor_points = request.corridor_points or []
-    legacy_waypoints = request.waypoints or []
-    points = corridor_points if corridor_points else legacy_waypoints
     engine_request: Dict[str, Any] = {
-        "no_fly_zones": _normalize_no_fly_zones(request.no_fly_zones),
-        "corridor_points": [p.model_dump(exclude_none=True) for p in points],
+        "start_vertiport": {"lla": request.start_vertiport.lla.model_dump()},
+        "end_vertiport": {"lla": request.end_vertiport.lla.model_dump()},
         "cruise_altitude_m": float(request.cruise_altitude_m),
         "takeoff_climb_angle_deg": float(request.takeoff_climb_angle_deg),
         "landing_descent_angle_deg": float(request.landing_descent_angle_deg),
     }
-    if request.start_vertiport is not None:
-        engine_request["start_vertiport"] = {"lla": request.start_vertiport.lla.model_dump()}
-    if request.end_vertiport is not None:
-        engine_request["end_vertiport"] = {"lla": request.end_vertiport.lla.model_dump()}
-    if request.airspace_info is not None:
-        engine_request["airspace_info"] = request.airspace_info.model_dump()
     return engine_request
 
 
